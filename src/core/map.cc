@@ -14,6 +14,16 @@ void Map::addLandmark(std::shared_ptr<Landmark> lm) {
     landmarks_[lm->id_] = lm;
 }
 
+void Map::removeKeyframe(std::shared_ptr<Keyframe> kf) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    keyframes_.erase(kf->id_);
+}
+
+void Map::removeLandmark(std::shared_ptr<Landmark> lm) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    landmarks_.erase(lm->id_);
+}
+
 const std::map<unsigned long, std::shared_ptr<Keyframe>>& Map::getAllKeyframes() const {
     return keyframes_;
 }

@@ -1,4 +1,5 @@
 build/
+build_sys*/
 .vscode/
 .idea/
 *.swp
@@ -6,3 +7,15 @@ build/
 .DS_Store
 bin/
 lib/
+datasets/
+*.mp4
+*.avi
+*.bin
+
+# Local ORB vocabulary (must not be distributed)
+ORBvoc.txt
+data/ORBvoc.txt
+data/*.bin
+
+# Keep slam_result.jpg
+!slam_result.jpg

@@ -1,4 +1,6 @@
 #include "backend/local_mapping.h"
+#include "backend/optimizer.h"
+#include "loop_closing/loop_closing.h"
 #include "core/landmark.h"
 #include "core/keyframe.h"
 #include <opencv2/calib3d.hpp>
@@ -8,6 +10,10 @@
 namespace svslam {
 
 LocalMapping::LocalMapping(Map::Ptr map) : map_(map) {}
+
+void LocalMapping::setLoopClosing(std::shared_ptr<LoopClosing> loop_closing) {
+    loop_closing_ = loop_closing;
+}
 
 void LocalMapping::insertKeyframe(Keyframe::Ptr kf) {
     std::unique_lock<std::mutex> lock(mutex_new_keyframes_);
@@ -38,7 +44,7 @@ void LocalMapping::run() {
             mapPointCulling();
             createNewMapPoints();
             
-            // optimization(); // TODO: Implement Local BA
+            optimization(); 
         }
     }
     std::cout << "LocalMapping thread stopped." << std::endl;
@@ -62,13 +68,62 @@ void LocalMapping::processNewKeyframe() {
     // Add to Map if not already added
     map_->addKeyframe(current_processed_kf_);
     
+    // Pass to Loop Closing
+    if (loop_closing_) {
+        loop_closing_->insertKeyframe(current_processed_kf_);
+    }
+    
     std::cout << "LocalMapping: Processed Keyframe " << current_processed_kf_->id_ 
               << ". Connected KFs: " << current_processed_kf_->connected_keyframes_.size() << std::endl;
 }
 
 void LocalMapping::mapPointCulling() {
     // Remove bad map points
-    // For now, stub
+    // 1. Check recent map points
+    auto recent_landmarks = map_->getAllLandmarks(); // This gets ALL, inefficient. 
+    // Ideally we should track "recently created" landmarks.
+    
+    // For now, let's just scan landmarks connected to current KF.
+    std::vector<Landmark::Ptr> landmarks_to_check;
+    for (auto& lm : current_processed_kf_->landmarks_) {
+        if (lm && !lm->isBad()) {
+            landmarks_to_check.push_back(lm);
+        }
+    }
+    
+    int culled = 0;
+    for (auto& lm : landmarks_to_check) {
+        if (lm->isBad()) continue;
+        
+        // Policy:
+        // 1. If observation count < 2 (only created and never seen again?)
+        //    Maybe give it a grace period (e.g. by frame ID or creation time)
+        // 2. Or if ratio of found/visible is low (we don't track visible count yet)
+        
+        if (lm->observations_.size() < 2) {
+            // If it was created more than 2 frames ago and still has < 2 obs, remove it
+            // We need creation time in Landmark. Assuming ID correlates with time.
+            
+            // Stub: just remove strict ones for now to keep map clean?
+            // Actually, newly created points will have 2 obs (Current + Neighbor).
+            // So < 2 shouldn't happen unless connection broken.
+            
+            // Let's cull if observations == 1 (orphaned)
+            if (lm->observations_.size() == 1) {
+                // Determine if we should delete
+                // auto obs = lm->observations_.begin();
+                // auto kf = obs->first.lock();
+                
+                // For simplicity in this mono slam:
+                lm->setBad();
+                map_->removeLandmark(lm);
+                culled++;
+            }
+        }
+    }
+    
+    if (culled > 0)
+        std::cout << "LocalMapping: Culled " << culled << " map points." << std::endl;
 }
 
 void LocalMapping::createNewMapPoints() {
@@ -187,7 +242,32 @@ void LocalMapping::createNewMapPoints() {
 
 void LocalMapping::optimization() {
     // Local Bundle Adjustment
-    // Stub
+    // 1. Setup local keyframes: current KF and its neighbors
+    std::vector<Keyframe::Ptr> local_keyframes;
+    local_keyframes.push_back(current_processed_kf_);
+    
+    auto neighbors = current_processed_kf_->getBestCovisibilityKeyframes(20);
+    for (auto& kf : neighbors) {
+        if (!kf) continue;
+        local_keyframes.push_back(kf);
+    }
+    
+    // 2. Setup local map points: all points observed by local keyframes
+    std::set<Landmark::Ptr> local_landmarks_set;
+    for (auto& kf : local_keyframes) {
+        for (auto& lm : kf->landmarks_) {
+            if (lm && !lm->isBad()) {
+                local_landmarks_set.insert(lm);
+            }
+        }
+    }
+    std::vector<Landmark::Ptr> local_landmarks(local_landmarks_set.begin(), local_landmarks_set.end());
+    
+    std::cout << "LocalMapping: BA on " << local_keyframes.size() << " KFs and " << local_landmarks.size() << " LMs." << std::endl;
+    
+    if (local_keyframes.size() < 2 || local_landmarks.size() < 10) return;
+    
+    Optimizer::bundleAdjustment(local_keyframes, local_landmarks, 5);
 }
 
 }
