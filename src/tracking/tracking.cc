@@ -234,7 +234,7 @@ bool Tracking::trackLocalMap() {
              const auto& kp = current_frame_->keypoints_[i];
              double dist_spatial = (kp.pt.x - px[0])*(kp.pt.x - px[0]) + (kp.pt.y - px[1])*(kp.pt.y - px[1]);
              
-             if (dist_spatial < 400.0) { // 20 pixels radius squared
+             if (dist_spatial < 2500.0) { // 50 pixels radius squared
                  // Check descriptor distance
                  double dist_desc = cv::norm(current_frame_->descriptors_.row(i), lm->descriptor_, cv::NORM_HAMMING);
                  if (dist_desc < best_dist) {
