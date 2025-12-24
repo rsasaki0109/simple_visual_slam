@@ -40,6 +40,11 @@ int main(int argc, char** argv) {
 
     // Initialize Map
     Map::Ptr map = std::make_shared<Map>();
+    
+    // Optional: Load map if exists
+    // if (MapIO::loadMap("map.bin", map)) {
+    //     std::cout << "Loaded map from map.bin" << std::endl;
+    // }
 
     // Initialize Local Mapping
     LocalMapping::Ptr local_mapping = std::make_shared<LocalMapping>(map);
@@ -96,6 +101,14 @@ int main(int argc, char** argv) {
     // Stop Local Mapping
     local_mapping->requestStop();
     local_mapping_thread.join();
+    
+    // Save Map
+    std::cout << "Saving map to map.bin..." << std::endl;
+    if (MapIO::saveMap("map.bin", map)) {
+        std::cout << "Map saved successfully." << std::endl;
+    } else {
+        std::cerr << "Failed to save map." << std::endl;
+    }
 
     // Plan comments for future steps
     /*
