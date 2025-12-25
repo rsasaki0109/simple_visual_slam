@@ -25,8 +25,22 @@ make
 ## 使用方法
 
 ```bash
-./run_mono <path_to_video_or_camera_index>
+# ビデオファイルの場合
+./run_mono path/to/video.mp4
+
+# カメラの場合 (ID指定)
+./run_mono 0
 ```
+
+### サンプル実行
+
+リポジトリにはサンプル動画 `tree.avi` (OpenCV sample) を使用した実行結果が含まれています。
+
+```bash
+./run_mono tree.avi
+```
+
+実行後、`slam_result.jpg` が生成されます。
 
 ## 機能 (計画)
 
