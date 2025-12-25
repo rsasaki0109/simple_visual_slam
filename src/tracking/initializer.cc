@@ -56,6 +56,10 @@ bool Initializer::initialize(Frame::Ptr frame_cur, float sigma, int max_iteratio
     if (use_H && H_found) {
         std::cout << "Initializer: Selecting Homography" << std::endl;
         success = reconstructH(inliers_H, H21, K, T_c1_c2_, triangulated_points_, is_triangulated_, 1.0, 50);
+        if (!success && F_found) {
+            std::cout << "Initializer: Homography reconstruction failed, falling back to Fundamental Matrix" << std::endl;
+            success = reconstructF(inliers_F, F21, K, T_c1_c2_, triangulated_points_, is_triangulated_, 1.0, 50);
+        }
     } else if (F_found) {
         std::cout << "Initializer: Selecting Fundamental Matrix" << std::endl;
         success = reconstructF(inliers_F, F21, K, T_c1_c2_, triangulated_points_, is_triangulated_, 1.0, 50);
@@ -151,14 +155,23 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
     // Normalize rotation to satisfy Sophus orthogonality check
     Eigen::Quaterniond q(R_eig);
     q.normalize();
+
+    // Normalize translation scale to avoid degenerate tiny-baseline reconstructions.
+    // Triangulation depth is proportional to translation magnitude, so we keep ||t|| = 1.
+    const double t_norm = t_eig.norm();
+    if (t_norm > 1e-9) {
+        t_eig /= t_norm;
+        t /= t_norm;
+    }
     
     T_c2_c1 = SE3(q, t_eig); // T_c2_c1 transforms point from 1 to 2.
 
     // Triangulate
-    // For simplicity, re-triangulate all inliers of recoverPose
-    points.resize(matches_.size());
+    // Keep output arrays aligned with matches_ indices.
+    points.assign(matches_.size(), cv::Point3f(0.f, 0.f, 0.f));
     triangulated.assign(matches_.size(), false);
     is_triangulated_ = triangulated;
+    triangulated_points_.assign(matches_.size(), cv::Point3f(0.f, 0.f, 0.f));
     
     // Get Projection Matrices
     cv::Mat P1 = cv::Mat::eye(3, 4, CV_64F); // P1 = [I|0]
@@ -175,28 +188,80 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
     // Let's iterate original matches and check inliers AND recoverPose mask
     
     int compact_idx = 0;
+    int tri_good = 0;
+    int rej_w_small = 0;
+    int rej_nonfinite = 0;
+    int rej_z1 = 0;
+    int rej_z2 = 0;
     for(size_t i=0; i<matches_.size(); ++i) {
         if(!inliers[i]) continue;
         
         if (mask.at<unsigned char>(compact_idx)) {
              // Triangulate single point
              cv::Mat pts4D;
-             std::vector<cv::Point2f> pt1 = {kps_ref_[i]};
-             std::vector<cv::Point2f> pt2 = {kps_cur_[i]};
+             std::vector<cv::Point2d> pt1 = {cv::Point2d(kps_ref_[i].x, kps_ref_[i].y)};
+             std::vector<cv::Point2d> pt2 = {cv::Point2d(kps_cur_[i].x, kps_cur_[i].y)};
              cv::triangulatePoints(P1, P2, pt1, pt2, pts4D);
+
+             if (pts4D.type() != CV_64F) {
+                 pts4D.convertTo(pts4D, CV_64F);
+             }
              
              // Convert to 3D
-             pts4D /= pts4D.at<double>(3,0);
-             cv::Point3f p3d(pts4D.at<double>(0,0), pts4D.at<double>(1,0), pts4D.at<double>(2,0));
-             
-             // Check Parallax and Depth positive
-             if (p3d.z > 0) {
-                 triangulated_points_.push_back(p3d);
-                 is_triangulated_[i] = true;
+             const double w = pts4D.at<double>(3,0);
+             if (std::abs(w) < 1e-12) {
+                 rej_w_small++;
+                 compact_idx++;
+                 continue;
              }
+             pts4D /= w;
+             const double x = pts4D.at<double>(0,0);
+             const double y = pts4D.at<double>(1,0);
+             const double z = pts4D.at<double>(2,0);
+             if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+                 rej_nonfinite++;
+                 compact_idx++;
+                 continue;
+             }
+
+             // Chirality check in both cameras
+             if (z <= 0.0) {
+                 rej_z1++;
+                 compact_idx++;
+                 continue;
+             }
+
+             cv::Mat p3d_mat(3, 1, CV_64F);
+             p3d_mat.at<double>(0,0) = x;
+             p3d_mat.at<double>(1,0) = y;
+             p3d_mat.at<double>(2,0) = z;
+             cv::Mat p3d_c2 = R * p3d_mat + t;
+             if (p3d_c2.at<double>(2,0) <= 0.0) {
+                 rej_z2++;
+                 compact_idx++;
+                 continue;
+             }
+
+             cv::Point3f p3d(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+             points[i] = p3d;
+             triangulated_points_[i] = p3d;
+             triangulated[i] = true;
+             is_triangulated_[i] = true;
+             tri_good++;
         }
         compact_idx++;
     }
+
+    std::cout << "Initializer: Triangulation(F) tri_good=" << tri_good
+              << " rej_w_small=" << rej_w_small
+              << " rej_nonfinite=" << rej_nonfinite
+              << " rej_z1=" << rej_z1
+              << " rej_z2=" << rej_z2
+              << " inlier_mask_size=" << mask.rows
+              << std::endl;
+
+    points = triangulated_points_;
+    triangulated = is_triangulated_;
 
     return true;
 }
@@ -218,6 +283,11 @@ bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat
     for (int i=0; i<solutions; ++i) {
         cv::Mat R = Rs[i];
         cv::Mat t = ts[i];
+
+        const double t_norm = cv::norm(t);
+        if (t_norm > 1e-9) {
+            t = t / t_norm;
+        }
         
         cv::Mat T2 = cv::Mat::eye(3, 4, CV_64F);
         R.copyTo(T2.rowRange(0,3).colRange(0,3));
@@ -225,22 +295,29 @@ bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat
         cv::Mat P2 = K * T2;
         
         std::vector<bool> current_triangulated(matches_.size(), false);
-        std::vector<cv::Point3f> current_points(matches_.size());
+        std::vector<cv::Point3f> current_points(matches_.size(), cv::Point3f(0.f, 0.f, 0.f));
         int n_good = 0;
         
         for(size_t j=0; j<matches_.size(); ++j) {
             if(!inliers[j]) continue;
             
-            std::vector<cv::Point2f> pt1 = {kps_ref_[j]};
-            std::vector<cv::Point2f> pt2 = {kps_cur_[j]};
+            std::vector<cv::Point2d> pt1 = {cv::Point2d(kps_ref_[j].x, kps_ref_[j].y)};
+            std::vector<cv::Point2d> pt2 = {cv::Point2d(kps_cur_[j].x, kps_cur_[j].y)};
             cv::Mat pts4D;
             cv::triangulatePoints(P1, P2, pt1, pt2, pts4D);
+
+            if (pts4D.type() != CV_64F) {
+                pts4D.convertTo(pts4D, CV_64F);
+            }
             
             // Convert to 3D and check depth
-            if(pts4D.at<double>(3,0) == 0) continue;
-            cv::Point3f p3d(pts4D.at<double>(0,0)/pts4D.at<double>(3,0),
-                            pts4D.at<double>(1,0)/pts4D.at<double>(3,0),
-                            pts4D.at<double>(2,0)/pts4D.at<double>(3,0));
+            const double w = pts4D.at<double>(3,0);
+            if (std::abs(w) < 1e-12) continue;
+            const double x = pts4D.at<double>(0,0) / w;
+            const double y = pts4D.at<double>(1,0) / w;
+            const double z = pts4D.at<double>(2,0) / w;
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+            cv::Point3f p3d(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
                             
             if (p3d.z > 0) {
                 // Check depth in second camera
@@ -277,6 +354,12 @@ bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat
         Eigen::Quaterniond q(R_eig);
         q.normalize();
         
+        // Normalize translation scale to avoid degenerate tiny-baseline reconstructions.
+        double t_norm = t_eig.norm();
+        if (t_norm > 1e-9) {
+            t_eig /= t_norm;
+        }
+
         // Explicitly construct SO3
         Sophus::SO3d so3(q);
         T_c2_c1 = SE3(so3, t_eig);
@@ -285,7 +368,7 @@ bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat
         points = best_points;
         is_triangulated_ = triangulated;
         triangulated_points_ = points;
-        
+
         return true;
     }
 

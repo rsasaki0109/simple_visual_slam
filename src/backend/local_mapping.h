@@ -10,6 +10,8 @@
 
 namespace svslam {
 
+class LoopClosing; // Forward decl
+
 class LocalMapping {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -17,6 +19,8 @@ public:
     
     LocalMapping(Map::Ptr map);
     
+    void setLoopClosing(std::shared_ptr<LoopClosing> loop_closing);
+
     void insertKeyframe(Keyframe::Ptr kf);
     void run(); // Main loop
     void requestStop();
@@ -34,6 +38,8 @@ private:
     
     std::deque<Keyframe::Ptr> new_keyframes_;
     Keyframe::Ptr current_processed_kf_;
+    
+    std::shared_ptr<LoopClosing> loop_closing_;
     
     std::mutex mutex_new_keyframes_;
     std::condition_variable cv_new_keyframes_;
