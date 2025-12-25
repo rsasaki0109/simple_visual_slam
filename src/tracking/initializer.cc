@@ -1,6 +1,7 @@
 #include "tracking/initializer.h"
 #include <iostream>
 #include <opencv2/calib3d.hpp>
+#include <opencv2/core/eigen.hpp>
 
 namespace svslam {
 
@@ -147,7 +148,11 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
     cv::cv2eigen(R, R_eig);
     cv::cv2eigen(t, t_eig);
     
-    T_c2_c1 = SE3(R_eig, t_eig); // T_c2_c1 transforms point from 1 to 2.
+    // Normalize rotation to satisfy Sophus orthogonality check
+    Eigen::Quaterniond q(R_eig);
+    q.normalize();
+    
+    T_c2_c1 = SE3(q, t_eig); // T_c2_c1 transforms point from 1 to 2.
 
     // Triangulate
     // For simplicity, re-triangulate all inliers of recoverPose
@@ -198,22 +203,92 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
 
 bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat& K,
                   SE3& T_c2_c1, std::vector<cv::Point3f>& points, std::vector<bool>& triangulated, float min_parallax, int min_triangulated) {
-    // Simplified: Just use recoverPose from H logic or findHomography decomposition
-    // OpenCV has decomposeHomographyMat but it returns multiple solutions.
-    // For simplicity, skipping full H decomposition logic for this stub and fallback to F or fail.
-    // Or implementing a basic one.
-    
-    // NOTE: Implementing robust H decomposition is complex. 
-    // Often it's easier to just compute F from H matches and use recoverPose with F if we are lazy.
-    // Or we can use decomposeHomographyMat and test solutions.
     
     std::vector<cv::Mat> Rs, ts, normals;
     int solutions = cv::decomposeHomographyMat(H21, K, Rs, ts, normals);
     
-    // We need to check which solution is valid (points in front of both cameras).
-    // This part is quite involved.
+    cv::Mat T1 = cv::Mat::eye(3, 4, CV_64F);
+    cv::Mat P1 = K * T1;
     
-    std::cout << "Homography decomposition not fully implemented in this minimal version. Falling back to fail." << std::endl;
+    double best_good_points = 0;
+    int best_solution = -1;
+    std::vector<bool> best_triangulated;
+    std::vector<cv::Point3f> best_points;
+    
+    for (int i=0; i<solutions; ++i) {
+        cv::Mat R = Rs[i];
+        cv::Mat t = ts[i];
+        
+        cv::Mat T2 = cv::Mat::eye(3, 4, CV_64F);
+        R.copyTo(T2.rowRange(0,3).colRange(0,3));
+        t.copyTo(T2.rowRange(0,3).col(3));
+        cv::Mat P2 = K * T2;
+        
+        std::vector<bool> current_triangulated(matches_.size(), false);
+        std::vector<cv::Point3f> current_points(matches_.size());
+        int n_good = 0;
+        
+        for(size_t j=0; j<matches_.size(); ++j) {
+            if(!inliers[j]) continue;
+            
+            std::vector<cv::Point2f> pt1 = {kps_ref_[j]};
+            std::vector<cv::Point2f> pt2 = {kps_cur_[j]};
+            cv::Mat pts4D;
+            cv::triangulatePoints(P1, P2, pt1, pt2, pts4D);
+            
+            // Convert to 3D and check depth
+            if(pts4D.at<double>(3,0) == 0) continue;
+            cv::Point3f p3d(pts4D.at<double>(0,0)/pts4D.at<double>(3,0),
+                            pts4D.at<double>(1,0)/pts4D.at<double>(3,0),
+                            pts4D.at<double>(2,0)/pts4D.at<double>(3,0));
+                            
+            if (p3d.z > 0) {
+                // Check depth in second camera
+                cv::Mat p3d_mat(3, 1, CV_64F);
+                p3d_mat.at<double>(0,0) = p3d.x;
+                p3d_mat.at<double>(1,0) = p3d.y;
+                p3d_mat.at<double>(2,0) = p3d.z;
+                
+                cv::Mat p3d_c2 = R * p3d_mat + t;
+                if (p3d_c2.at<double>(2,0) > 0) {
+                    current_triangulated[j] = true;
+                    current_points[j] = p3d;
+                    n_good++;
+                }
+            }
+        }
+        
+        if (n_good > best_good_points && n_good > min_triangulated) {
+            best_good_points = n_good;
+            best_solution = i;
+            best_triangulated = current_triangulated;
+            best_points = current_points;
+        }
+    }
+    
+    if (best_solution != -1) {
+        // Output result
+        Eigen::Matrix3d R_eig;
+        Eigen::Vector3d t_eig;
+        cv::cv2eigen(Rs[best_solution], R_eig);
+        cv::cv2eigen(ts[best_solution], t_eig);
+        
+        // Normalize rotation to satisfy Sophus orthogonality check
+        Eigen::Quaterniond q(R_eig);
+        q.normalize();
+        
+        // Explicitly construct SO3
+        Sophus::SO3d so3(q);
+        T_c2_c1 = SE3(so3, t_eig);
+        
+        triangulated = best_triangulated;
+        points = best_points;
+        is_triangulated_ = triangulated;
+        triangulated_points_ = points;
+        
+        return true;
+    }
+
     return false;
 }
 

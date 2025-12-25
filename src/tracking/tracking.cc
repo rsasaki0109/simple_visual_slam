@@ -63,6 +63,8 @@ bool Tracking::initialize() {
             current_frame_->setPose(initializer_->T_c1_c2_);
             kf_cur->T_cw_ = current_frame_->getPose();
             
+            std::cout << "Tracking: Initialized Pose T_c2_c1: \n" << current_frame_->getPose().matrix() << std::endl;
+            
             // 2. Create MapPoints
             for (size_t i = 0; i < initializer_->is_triangulated_.size(); ++i) {
                 if (initializer_->is_triangulated_[i]) {
@@ -84,8 +86,12 @@ bool Tracking::initialize() {
                     lm->descriptor_ = initial_frame_->descriptors_.row(idx_ref).clone();
 
                     // Add landmarks to keyframes
-                    kf_init->landmarks_.push_back(lm); // This vector usage is vague in my header, let's fix later
-                    kf_cur->landmarks_.push_back(lm);
+                    kf_init->landmarks_[idx_ref] = lm;
+                    kf_cur->landmarks_[idx_cur] = lm;
+                    
+                    // Update Frames as well so they are tracked
+                    initial_frame_->landmarks_[idx_ref] = lm;
+                    current_frame_->landmarks_[idx_cur] = lm;
                     
                     // Add to map
                     if (map_) map_->addLandmark(lm);
@@ -193,8 +199,11 @@ bool Tracking::trackLocalMap() {
     std::vector<std::shared_ptr<Landmark>> matched_landmarks; // Keep track of LM for each point
     std::vector<int> matched_kp_indices; // Keep track of KP index for each point
     
+    std::cout << "TrackLocalMap: Landmarks to check: " << landmarks.size() << std::endl;
+
     // 2. Project and Match
     int matches_found = 0;
+    int visible_points = 0;
     for (auto& pair : landmarks) {
         auto lm = pair.second;
         if (!lm) continue;
@@ -212,6 +221,8 @@ bool Tracking::trackLocalMap() {
         if (px[0] < 0 || px[0] >= current_frame_->image_.cols ||
             px[1] < 0 || px[1] >= current_frame_->image_.rows) continue;
             
+        visible_points++;
+        
         // Search for match in current frame features
         // Simple search: look for features near px
         int best_idx = -1;
@@ -244,7 +255,7 @@ bool Tracking::trackLocalMap() {
         }
     }
     
-    std::cout << "TrackLocalMap: Found " << matches_found << " matches." << std::endl;
+    std::cout << "TrackLocalMap: Visible: " << visible_points << ", Matches: " << matches_found << std::endl;
     
     if (object_points.size() < 10) return false;
     
@@ -322,10 +333,56 @@ bool Tracking::trackReferenceKeyframe() {
     if (good_matches.size() < 10) {
         return false;
     }
+    
+    // Optimization: Pose from 3D-2D
+    std::vector<cv::Point3f> object_points;
+    std::vector<cv::Point2f> image_points;
+    
+    for (const auto& m : good_matches) {
+        // Query is current, Train is last
+        int idx_last = m.trainIdx;
+        int idx_curr = m.queryIdx;
+        
+        if (last_frame_->landmarks_[idx_last]) {
+            // Found a map point
+            Vec3 pos = last_frame_->landmarks_[idx_last]->getPos();
+            object_points.push_back(cv::Point3f(pos.x(), pos.y(), pos.z()));
+            image_points.push_back(current_frame_->keypoints_[idx_curr].pt);
+        }
+    }
+    
+    if (object_points.size() >= 10) {
+        cv::Mat rvec, tvec;
+        std::vector<int> inliers;
+        
+        // Initial guess
+        Eigen::Vector3d t = current_frame_->getPose().translation();
+        Eigen::Matrix3d R = current_frame_->getPose().rotationMatrix();
+        cv::Mat R_cv, t_cv;
+        cv::eigen2cv(R, R_cv);
+        cv::Rodrigues(R_cv, rvec);
+        tvec = t_cv;
+        
+        bool success = cv::solvePnPRansac(object_points, image_points, current_frame_->camera_->K(), cv::Mat(),
+                                          rvec, tvec, true, 100, 8.0, 0.99, inliers);
+                                          
+        if (success) {
+             std::cout << "TrackReferenceKeyframe: PnP Success, inliers: " << inliers.size() << std::endl;
+             // Update pose
+             cv::Mat R_new;
+             cv::Rodrigues(rvec, R_new);
+             Eigen::Matrix3d R_eig;
+             Eigen::Vector3d t_eig;
+             cv::cv2eigen(R_new, R_eig);
+             cv::cv2eigen(tvec, t_eig);
+             current_frame_->setPose(SE3(R_eig, t_eig));
+             return true;
+        }
+    }
 
-    // Optimization would go here (Pose from 3D-2D or 2D-2D essential matrix)
-    // For now, we trust the motion model or just accept the matches.
-
+    // If PnP fails (e.g. no 3D points in last frame yet), we rely on motion model.
+    // But since we are here, we probably have some tracking.
+    
     return true;
 }
 

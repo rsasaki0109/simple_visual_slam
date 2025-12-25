@@ -83,6 +83,12 @@ int main(int argc, char** argv) {
         cv::imshow("SimpleVisualSLAM", img_show);
         char k = cv::waitKey(10);
         if (k == 27) break;
+        
+        // Save the 100th frame as a sample result
+        if (frame_id == 100) {
+            cv::imwrite("slam_result.jpg", img_show);
+            std::cout << "Saved slam_result.jpg" << std::endl;
+        }
     }
     
     std::cout << "Finished processing." << std::endl;
