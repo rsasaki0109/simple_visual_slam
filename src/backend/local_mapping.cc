@@ -216,24 +216,39 @@ void LocalMapping::createNewMapPoints() {
                              pt_4d.at<double>(1, 0) / pt_4d.at<double>(3, 0),
                              pt_4d.at<double>(2, 0) / pt_4d.at<double>(3, 0));
                              
-            // Simple depth check
+            // Depth and validity checks
             Vec3 P(pt_w.x, pt_w.y, pt_w.z);
+
+            // Check for invalid coordinates
+            if (!std::isfinite(P.x()) || !std::isfinite(P.y()) || !std::isfinite(P.z())) {
+                continue;
+            }
+
+            // Check position bounds (reasonable for indoor scenes)
+            const double max_pos = 50.0;
+            if (std::abs(P.x()) > max_pos || std::abs(P.y()) > max_pos || std::abs(P.z()) > max_pos) {
+                continue;
+            }
+
             double d1 = (T_cw1 * P)[2];
             double d2 = (T_cw2 * P)[2];
-            
-            if (d1 > 0 && d2 > 0) {
+
+            // Check positive depth in both views and reasonable depth range
+            const double min_depth = 0.1;
+            const double max_depth = 20.0;  // Reasonable for indoor scenes
+            if (d1 > min_depth && d1 < max_depth && d2 > min_depth && d2 < max_depth) {
                  // Success - create map point
                  static unsigned long lm_id_counter = 10000; // TODO: Global ID
                  auto lm = std::make_shared<Landmark>(lm_id_counter++, P);
-                 
+
                  lm->addObservation(current_processed_kf_, idx1);
                  lm->addObservation(neighbor, idx2);
                  lm->descriptor_ = current_processed_kf_->descriptors_.row(idx1).clone();
-                 
+
                  // Add to keyframes
                  current_processed_kf_->landmarks_[idx1] = lm;
                  neighbor->landmarks_[idx2] = lm;
-                 
+
                  map_->addLandmark(lm);
             }
         }
@@ -245,13 +260,13 @@ void LocalMapping::optimization() {
     // 1. Setup local keyframes: current KF and its neighbors
     std::vector<Keyframe::Ptr> local_keyframes;
     local_keyframes.push_back(current_processed_kf_);
-    
+
     auto neighbors = current_processed_kf_->getBestCovisibilityKeyframes(20);
     for (auto& kf : neighbors) {
         if (!kf) continue;
         local_keyframes.push_back(kf);
     }
-    
+
     // 2. Setup local map points: all points observed by local keyframes
     std::set<Landmark::Ptr> local_landmarks_set;
     for (auto& kf : local_keyframes) {
@@ -262,12 +277,17 @@ void LocalMapping::optimization() {
         }
     }
     std::vector<Landmark::Ptr> local_landmarks(local_landmarks_set.begin(), local_landmarks_set.end());
-    
+
     std::cout << "LocalMapping: BA on " << local_keyframes.size() << " KFs and " << local_landmarks.size() << " LMs." << std::endl;
-    
+
     if (local_keyframes.size() < 2 || local_landmarks.size() < 10) return;
-    
+
     Optimizer::bundleAdjustment(local_keyframes, local_landmarks, 5);
+
+    // Notify Tracking that BA is complete so it can recompute current frame pose
+    if (on_ba_completed_) {
+        on_ba_completed_();
+    }
 }
 
 }

@@ -1,6 +1,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <iomanip>
+#include <tuple>
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/videoio.hpp>
@@ -142,6 +145,13 @@ int main(int argc, char** argv) {
     tracker->setMap(map);
     tracker->setLocalMapping(local_mapping);
 
+    // Register BA completion callback to recompute current frame pose
+    local_mapping->on_ba_completed_ = [tracker]() {
+        tracker->onBACompleted();
+    };
+
+    // Trajectory storage
+    std::vector<std::tuple<double, double, double, double>> trajectory; // timestamp, x, y, z
 
     // Main Loop
     cv::Mat img;
@@ -169,10 +179,16 @@ int main(int argc, char** argv) {
         // Track
         tracker->addFrame(frame);
 
-        std::cout << "Frame " << frame->id_ 
+        // Save trajectory (camera position in world frame)
+        // T_cw transforms world to camera, so camera position = -R^T * t = T_wc.translation()
+        SE3 T_wc = frame->getPose().inverse();
+        Eigen::Vector3d pos = T_wc.translation();
+        trajectory.push_back({timestamp, pos.x(), pos.y(), pos.z()});
+
+        std::cout << "Frame " << frame->id_
                   << ": " << frame->keypoints_.size() << " kps"
-                  << " | State: " << (int)tracker->state_ 
-                  << " | Pose: " << frame->getPose().translation().transpose() 
+                  << " | State: " << (int)tracker->state_
+                  << " | Pose: " << pos.transpose()
                   << std::endl;
 
         // Visualization
@@ -209,6 +225,18 @@ int main(int argc, char** argv) {
         std::cout << "Map saved successfully." << std::endl;
     } else {
         std::cerr << "Failed to save map." << std::endl;
+    }
+
+    // Save Trajectory
+    std::ofstream traj_file("trajectory.txt");
+    if (traj_file.is_open()) {
+        traj_file << "# timestamp x y z\n";
+        for (const auto& [ts, x, y, z] : trajectory) {
+            traj_file << std::fixed << std::setprecision(6) << ts << " "
+                      << std::setprecision(9) << x << " " << y << " " << z << "\n";
+        }
+        traj_file.close();
+        std::cout << "Trajectory saved to trajectory.txt (" << trajectory.size() << " poses)" << std::endl;
     }
 
     // Plan comments for future steps
