@@ -12,9 +12,8 @@ if(DEFINED ENV{CONDA_PREFIX})
 endif()
 
 # Dependencies
-set(OpenCV_DIR "/usr/lib/x86_64-linux-gnu/cmake/opencv4")
-find_package(OpenCV 4.5 REQUIRED) # Request specific version to avoid picking up 4.12 in /usr/local
-find_package(CURL REQUIRED)
+find_package(OpenCV 4.5 REQUIRED)
+find_package(CURL QUIET)  # Optional on Windows
 message(STATUS "OpenCV_INCLUDE_DIRS: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "OpenCV_LIBS: ${OpenCV_LIBS}")
 
@@ -63,30 +62,42 @@ if(NOT Sophus_FOUND)
     FetchContent_MakeAvailable(Sophus)
 endif()
 
-# DBoW2
-find_package(DBoW2 QUIET)
-if(NOT DBoW2_FOUND)
+# DBoW2 for loop closing
+option(USE_DBOW2 "Enable DBoW2 for loop closing" ON)
+if(USE_DBOW2)
     include(FetchContent)
+
+    set(FETCHCONTENT_QUIET OFF)
     FetchContent_Declare(
         DBoW2
         GIT_REPOSITORY https://github.com/dorian3d/DBoW2.git
-        GIT_TAG master # Use master or a specific tag
+        GIT_TAG master
+        PATCH_COMMAND ${CMAKE_COMMAND} -E echo "Patching DBoW2..."
     )
-    
+
+    # Populate without configuring
     FetchContent_GetProperties(DBoW2)
     if(NOT dbow2_POPULATED)
         FetchContent_Populate(DBoW2)
-        
-        # Patch DBoW2 CMakeLists.txt to force STATIC lib and C++17
-        file(READ "${dbow2_SOURCE_DIR}/CMakeLists.txt" dbow2_cmake)
-        # Use regex to replace set(LIB_SHARED "SHARED") with set(LIB_SHARED "STATIC")
-        string(REGEX REPLACE "set\\(LIB_SHARED \"SHARED\"\\)" "set(LIB_SHARED \"STATIC\")" dbow2_cmake "${dbow2_cmake}")
-        # Replace standard 11 with 17
-        string(REGEX REPLACE "CXX_STANDARD 11" "CXX_STANDARD 17" dbow2_cmake "${dbow2_cmake}")
-        file(WRITE "${dbow2_SOURCE_DIR}/CMakeLists.txt" "${dbow2_cmake}")
-        
-        add_subdirectory(${dbow2_SOURCE_DIR} ${dbow2_BINARY_DIR})
     endif()
+
+    # Patch DBoW2 CMakeLists.txt for compatibility BEFORE add_subdirectory
+    file(READ "${dbow2_SOURCE_DIR}/CMakeLists.txt" dbow2_cmake)
+    # Fix cmake_minimum_required for CMake 4.x
+    string(REPLACE "cmake_minimum_required(VERSION 2.8)" "cmake_minimum_required(VERSION 3.14)" dbow2_cmake "${dbow2_cmake}")
+    # Force STATIC lib
+    string(REPLACE "set(LIB_SHARED \"SHARED\")" "set(LIB_SHARED \"STATIC\")" dbow2_cmake "${dbow2_cmake}")
+    # Update C++ standard
+    string(REPLACE "CXX_STANDARD 11" "CXX_STANDARD 17" dbow2_cmake "${dbow2_cmake}")
+    file(WRITE "${dbow2_SOURCE_DIR}/CMakeLists.txt" "${dbow2_cmake}")
+
+    # Now add the subdirectory
+    add_subdirectory(${dbow2_SOURCE_DIR} ${dbow2_BINARY_DIR})
+
+    add_definitions(-DUSE_DBOW2)
+    message(STATUS "DBoW2 enabled via FetchContent")
+else()
+    message(STATUS "DBoW2 disabled - loop closing not available")
 endif()
 
 # Core Library
@@ -110,25 +121,24 @@ target_include_directories(svslam_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<INSTALL_INTERFACE:include>
     ${OpenCV_INCLUDE_DIRS}
-    /usr/include/opencv4
-    ${dbow2_SOURCE_DIR}/include
 )
 
 target_link_libraries(svslam_core PUBLIC
     ${OpenCV_LIBS}
-    opencv_videoio
-    ${CURL_LIBRARIES}
     Ceres::ceres
     Sophus::Sophus
 )
 
-if(TARGET DBoW2)
-    target_link_libraries(svslam_core PUBLIC DBoW2)
+if(CURL_FOUND)
+    target_link_libraries(svslam_core PUBLIC ${CURL_LIBRARIES})
 endif()
+
+if(USE_DBOW2 AND TARGET DBoW2)
+    target_link_libraries(svslam_core PUBLIC DBoW2)
+    target_include_directories(svslam_core PUBLIC ${dbow2_SOURCE_DIR}/include)
+endif()
+
 
 # App
 add_executable(run_mono apps/run_mono.cc)
 target_link_libraries(run_mono PRIVATE svslam_core)
-if(TARGET DBoW2)
-    target_link_libraries(run_mono PRIVATE DBoW2)
-endif()

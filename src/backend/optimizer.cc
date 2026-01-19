@@ -71,19 +71,21 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         double* param = new double[7];
         Eigen::Vector3d t = kf->T_cw_.translation();
         Eigen::Quaterniond q = kf->T_cw_.unit_quaternion();
-        
+
         param[0] = t.x();
         param[1] = t.y();
         param[2] = t.z();
-        param[3] = q.x();
-        param[4] = q.y();
-        param[5] = q.z();
-        param[6] = q.w();
+        // Ceres QuaternionRotatePoint expects [w, x, y, z] order
+        param[3] = q.w();
+        param[4] = q.x();
+        param[5] = q.y();
+        param[6] = q.z();
         
         pose_params[kf->id_] = param;
         
-        // Construct Manifold for SE3 (Euclidean<3> x EigenQuaternion)
-        ceres::Manifold* manifold = new ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::EigenQuaternionManifold>();
+        // Construct Manifold for SE3 (Euclidean<3> x Quaternion)
+        // Using QuaternionManifold because we store quaternion in [w, x, y, z] order (Ceres convention)
+        ceres::Manifold* manifold = new ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::QuaternionManifold>();
         
         problem.AddParameterBlock(param, 7, manifold);
         
@@ -94,19 +96,41 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
     
     // 2. Landmarks
     std::map<unsigned long, double*> point_params;
-    
+
+    // Bounds for landmark positions to prevent divergence
+    const double position_bound = 100.0; // Reasonable bound for indoor scenes
+
     for (auto& lm : landmarks) {
         if (lm->isBad()) continue;
-        
-        double* param = new double[3];
+
         Vec3 pos = lm->getPos();
+
+        // Skip landmarks with already invalid positions
+        if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) {
+            lm->setBad();
+            continue;
+        }
+        if (std::abs(pos.x()) > position_bound || std::abs(pos.y()) > position_bound || std::abs(pos.z()) > position_bound) {
+            lm->setBad();
+            continue;
+        }
+
+        double* param = new double[3];
         param[0] = pos.x();
         param[1] = pos.y();
         param[2] = pos.z();
-        
+
         point_params[lm->id_] = param;
-        
+
         problem.AddParameterBlock(param, 3);
+
+        // Add bounds to prevent divergence
+        problem.SetParameterLowerBound(param, 0, -position_bound);
+        problem.SetParameterUpperBound(param, 0, position_bound);
+        problem.SetParameterLowerBound(param, 1, -position_bound);
+        problem.SetParameterUpperBound(param, 1, position_bound);
+        problem.SetParameterLowerBound(param, 2, 0.01); // Z must be positive (in front of camera)
+        problem.SetParameterUpperBound(param, 2, position_bound);
         
         // Add Residuals
         // Iterate observations
@@ -151,7 +175,8 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
     for (auto& kf : keyframes) {
         double* param = pose_params[kf->id_];
         Eigen::Vector3d t(param[0], param[1], param[2]);
-        Eigen::Quaterniond q(param[6], param[3], param[4], param[5]); // w, x, y, z
+        // param order is [t, w, x, y, z], Eigen Quaterniond constructor is (w, x, y, z)
+        Eigen::Quaterniond q(param[3], param[4], param[5], param[6]); // w, x, y, z
         
         kf->T_cw_ = SE3(q, t);
         
@@ -162,7 +187,17 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         if (point_params.count(lm->id_)) {
             double* param = point_params[lm->id_];
             Vec3 pos(param[0], param[1], param[2]);
-            lm->setPos(pos);
+
+            // Validate updated position before applying
+            bool valid = std::isfinite(pos.x()) && std::isfinite(pos.y()) && std::isfinite(pos.z());
+            valid = valid && (pos.z() > 0.0);
+            valid = valid && (std::abs(pos.x()) < position_bound && std::abs(pos.y()) < position_bound && std::abs(pos.z()) < position_bound);
+
+            if (valid) {
+                lm->setPos(pos);
+            } else {
+                lm->setBad();
+            }
             delete[] param;
         }
     }
