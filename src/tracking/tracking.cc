@@ -282,7 +282,7 @@ bool Tracking::needNewKeyframe() {
     }
 
     // 2. Track quality: if tracked features drop below threshold, insert KF
-    const int min_tracked_threshold = 50;
+    const int min_tracked_threshold = 40;
     if (num_tracked_features_ < min_tracked_threshold) {
         std::cout << "needNewKeyframe: Low tracked features (" << num_tracked_features_ << "), inserting KF." << std::endl;
         return true;
@@ -303,7 +303,7 @@ bool Tracking::needNewKeyframe() {
 
     if (ref_landmarks > 0) {
         double ratio = static_cast<double>(num_tracked_features_) / ref_landmarks;
-        if (ratio < 0.5) {
+        if (ratio < 0.45) {
             std::cout << "needNewKeyframe: Low tracking ratio (" << ratio << "), inserting KF." << std::endl;
             return true;
         }
@@ -380,8 +380,8 @@ bool Tracking::trackLocalMap() {
         // Search for match in current frame features
         // Simple search: look for features near px
         int best_idx = -1;
-        double best_dist = 50.0; // Stricter descriptor distance threshold (Hamming)
-        const double search_radius_sq = 100.0 * 100.0;  // Tighter search radius
+        double best_dist = 60.0; // Slightly more permissive descriptor distance threshold (Hamming)
+        const double search_radius_sq = 120.0 * 120.0;  // Slightly wider search radius
         
         // Radius search (naive O(N) per landmark)
         // Ideally should use grid search
@@ -444,8 +444,8 @@ bool Tracking::trackLocalMap() {
                 const auto& m2 = ms[1];
 
                 // Stricter Lowe ratio test (0.6) + tighter absolute distance gate (50)
-                if (m1.distance > 50.0f) continue;
-                if (m1.distance >= 0.6f * m2.distance) continue;
+                if (m1.distance > 65.0f) continue;
+                if (m1.distance >= 0.75f * m2.distance) continue;
 
                 if (m1.queryIdx < 0 || m1.queryIdx >= static_cast<int>(visible_lm_list.size())) continue;
                 if (m1.trainIdx < 0 || m1.trainIdx >= static_cast<int>(current_frame_->keypoints_.size())) continue;
@@ -478,7 +478,7 @@ bool Tracking::trackLocalMap() {
                 std::vector<Landmark::Ptr> lm_f;
                 std::vector<int> kp_f;
 
-                const double gate_sq = 50.0 * 50.0;  // Stricter gate (50px)
+                const double gate_sq = 70.0 * 70.0;  // Slightly looser gate (70px)
                 const SE3 T_cw_est = current_frame_->getPose();
 
                 for (size_t i = 0; i < object_points.size(); ++i) {
@@ -629,7 +629,7 @@ bool Tracking::trackLocalMap() {
 
     // Minimum inlier threshold for reliable pose estimation
     // Lowered from 50 to 30 to handle challenging scenarios
-    const size_t min_inliers = 30;
+    const size_t min_inliers = 24;
 
     if (success && inliers.size() >= min_inliers) {
         std::cout << "TrackLocalMap: PnP Success, inliers: " << inliers.size() << std::endl;
@@ -657,8 +657,8 @@ bool Tracking::trackLocalMap() {
             // Thresholds:
             // - Translation: max 0.2 units per frame (strict for indoor)
             // - Rotation: max 0.3 radians (~17 degrees) per frame
-            const double max_trans_change = 0.2;
-            const double max_rot_change = 0.3;
+            const double max_trans_change = 0.35;
+            const double max_rot_change = 0.45;
 
             std::cout << "TrackLocalMap: Pose change - trans=" << trans_change
                       << " rot=" << rot_change << " rad" << std::endl;
@@ -723,8 +723,8 @@ bool Tracking::trackReferenceKeyframe() {
         const auto& m1 = ms[0];
         const auto& m2 = ms[1];
         // Stricter Lowe ratio test (0.6) + tighter absolute distance gate (50)
-        if (m1.distance > 50.0f) continue;
-        if (m1.distance >= 0.6f * m2.distance) continue;
+        if (m1.distance > 65.0f) continue;
+        if (m1.distance >= 0.75f * m2.distance) continue;
         candidates.push_back({m1.queryIdx, m1.trainIdx, m1.distance});
     }
 
@@ -747,7 +747,7 @@ bool Tracking::trackReferenceKeyframe() {
 
     std::cout << "Matches with last frame: " << good_matches.size() << std::endl;
 
-    if (good_matches.size() < 10) {
+    if (good_matches.size() < 8) {
         return false;
     }
     
@@ -802,7 +802,7 @@ bool Tracking::trackReferenceKeyframe() {
                                           rvec, tvec, false, 500, 20.0, 0.99, inliers, cv::SOLVEPNP_EPNP);
                                           
         // Minimum inlier threshold
-        const size_t min_inliers = 20;
+        const size_t min_inliers = 15;
 
         if (success && inliers.size() >= min_inliers) {
              std::cout << "TrackReferenceKeyframe: PnP Success, inliers: " << inliers.size() << std::endl;
@@ -825,8 +825,8 @@ bool Tracking::trackReferenceKeyframe() {
                  Eigen::AngleAxisd aa(delta_rot.matrix());
                  double rot_change = std::abs(aa.angle());
 
-                 const double max_trans_change = 0.2;
-                 const double max_rot_change = 0.3;
+                 const double max_trans_change = 0.35;
+                 const double max_rot_change = 0.45;
 
                  std::cout << "TrackReferenceKeyframe: Pose change - trans=" << trans_change
                            << " rot=" << rot_change << " rad" << std::endl;
@@ -1007,12 +1007,12 @@ bool Tracking::relocalize() {
 
         std::vector<cv::DMatch> good;
         for (auto& m : knn) {
-            if (m.size() >= 2 && m[0].distance < 0.6f * m[1].distance && m[0].distance < 50.0f) {
+            if (m.size() >= 2 && m[0].distance < 0.75f * m[1].distance && m[0].distance < 65.0f) {
                 good.push_back(m[0]);
             }
         }
 
-        if (good.size() >= 10) {  // Lower minimum match threshold
+        if (good.size() >= 8) {  // Slightly lower minimum match threshold for recovery
             candidates.push_back({kf, good, static_cast<int>(good.size())});
         }
     }
@@ -1071,7 +1071,7 @@ bool Tracking::relocalize() {
         bool ok = cv::solvePnPRansac(pts3d, pts2d, current_frame_->camera_->K(), cv::Mat(),
                                       rvec, tvec, false, 500, 8.0, 0.99, inliers, cv::SOLVEPNP_EPNP);
 
-        if (ok && inliers.size() >= 15) {  // Lower threshold for relocalization
+        if (ok && inliers.size() >= 12) {  // Lower threshold for relocalization
             // Success! Update pose
             cv::Mat R;
             cv::Rodrigues(rvec, R);
