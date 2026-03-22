@@ -22,6 +22,11 @@ public:
     cv::Mat depth_image_;
     bool depth_is_metric_ = true;
 
+    // Gravity direction in camera frame (from accelerometer, if available)
+    // Used for gravity constraint in BA (constrains roll/pitch)
+    Vec3 gravity_in_camera_ = Vec3::Zero();
+    bool has_gravity_ = false;
+
     float getDepth(float u, float v) const;
 
     // Features (copied from Frame to be immutable/independent)

@@ -19,7 +19,7 @@ message(STATUS "OpenCV_LIBS: ${OpenCV_LIBS}")
 
 # Ceres
 # set(Ceres_DIR "$HOME/workspace/ceres-bin" CACHE PATH "Path to CeresConfig.cmake")
-find_package(Ceres QUIET)
+find_package(Ceres 2.1 QUIET)
 if(NOT Ceres_FOUND)
     message(STATUS "Ceres not found, fetching from source...")
     include(FetchContent)
