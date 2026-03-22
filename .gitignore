@@ -31,3 +31,7 @@ eval_*.txt
 
 # ONNX models
 *.onnx
+models/
+
+# Evaluation results directory
+eval_results/

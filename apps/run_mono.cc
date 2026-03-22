@@ -246,8 +246,13 @@ int main(int argc, char** argv) {
         }
 #ifdef USE_DEPTH_DL
         else if (dl_depth_estimator) {
-            frame->depth_image_ = dl_depth_estimator->estimate(img);
-            frame->depth_is_metric_ = false;
+            // Only run DL depth every N frames to reduce CPU cost
+            // Always run on first frame (init) and every 5th frame (keyframe candidates)
+            bool run_dl = (frame_id <= 1) || (frame_id % 5 == 0);
+            if (run_dl) {
+                frame->depth_image_ = dl_depth_estimator->estimate(img);
+                frame->depth_is_metric_ = false;
+            }
         }
 #endif
 
