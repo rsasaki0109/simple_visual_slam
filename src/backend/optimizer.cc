@@ -309,6 +309,28 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         std::cout << "BA: Added " << depth_residual_count << " depth prior residuals" << std::endl;
     }
 
+    // Add gravity prior residuals for keyframes with accelerometer data
+    int gravity_residual_count = 0;
+    for (auto& kf : keyframes) {
+        if (!kf || !kf->has_gravity_) continue;
+        if (pose_params.find(kf->id_) == pose_params.end()) continue;
+        if (problem.IsParameterBlockConstant(pose_params[kf->id_])) continue;
+
+        // Weight: moderate — gravity measurement is noisy but constrains 2 DOF
+        double gravity_weight = 5.0;
+        ceres::CostFunction* gravity_cost = GravityPriorError::Create(
+            kf->gravity_in_camera_.x(), kf->gravity_in_camera_.y(), kf->gravity_in_camera_.z(),
+            gravity_weight);
+
+        problem.AddResidualBlock(gravity_cost, new ceres::HuberLoss(0.3),
+                                 pose_params[kf->id_]);
+        gravity_residual_count++;
+    }
+
+    if (gravity_residual_count > 0) {
+        std::cout << "BA: Added " << gravity_residual_count << " gravity prior residuals" << std::endl;
+    }
+
     if (residual_count == 0 && depth_residual_count == 0) {
         for (auto& kv : pose_params) {
             delete[] kv.second;

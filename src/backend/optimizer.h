@@ -48,6 +48,40 @@ struct DepthPriorError {
     double weight;
 };
 
+// Gravity prior cost function: constrains roll/pitch by requiring that
+// R_cw * gravity_world ≈ gravity_camera (measured by accelerometer)
+// gravity_world = [0, 0, -1] after gravity alignment
+// This leaves yaw unconstrained (1 DOF free)
+struct GravityPriorError {
+    GravityPriorError(double gx_cam, double gy_cam, double gz_cam, double weight)
+        : gx_cam(gx_cam), gy_cam(gy_cam), gz_cam(gz_cam), weight(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const camera_pose,  // [tx, ty, tz, qw, qx, qy, qz]
+                    T* residuals) const {
+        // World gravity direction (after gravity alignment): [0, 0, -1]
+        const T g_world[3] = {T(0), T(0), T(-1)};
+
+        // Rotate world gravity to camera frame: g_cam_pred = R_cw * g_world
+        T g_cam_pred[3];
+        ceres::QuaternionRotatePoint(camera_pose + 3, g_world, g_cam_pred);
+
+        // Residual: predicted vs observed gravity in camera frame
+        residuals[0] = T(weight) * (g_cam_pred[0] - T(gx_cam));
+        residuals[1] = T(weight) * (g_cam_pred[1] - T(gy_cam));
+        residuals[2] = T(weight) * (g_cam_pred[2] - T(gz_cam));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double gx_cam, double gy_cam, double gz_cam, double weight) {
+        return new ceres::AutoDiffCostFunction<GravityPriorError, 3, 7>(
+            new GravityPriorError(gx_cam, gy_cam, gz_cam, weight));
+    }
+
+    double gx_cam, gy_cam, gz_cam;
+    double weight;
+};
+
 class Optimizer {
 public:
     struct PoseGraphEdge {
