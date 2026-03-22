@@ -20,6 +20,9 @@
 #include "tracking/tracking.h"
 #include "backend/local_mapping.h"
 #include "loop_closing/loop_closing.h"
+#ifdef USE_DEPTH_DL
+#include "depth/onnx_depth_estimator.h"
+#endif
 #include <thread>
 
 using namespace svslam;
@@ -29,7 +32,7 @@ int main(int argc, char** argv) {
         std::cerr << "Usage:\n"
                   << "  ./run_mono <video_path> [vocab_path]\n"
                   << "  ./run_mono --euroc <sequence_dir> [vocab_path]\n"
-                  << "  ./run_mono --tum <sequence_dir> [--depth] [--accel] [vocab_path]\n" << std::endl;
+                  << "  ./run_mono --tum <sequence_dir> [--depth] [--accel] [--depth-model <path.onnx>] [vocab_path]\n" << std::endl;
         return -1;
     }
 
@@ -38,6 +41,7 @@ int main(int argc, char** argv) {
     bool use_depth = false;
     bool use_accel = false;
     bool no_viz = false;
+    std::string depth_model_path;
     std::string euroc_seq_dir;
     std::string tum_seq_dir;
     std::string input_path;
@@ -74,6 +78,8 @@ int main(int argc, char** argv) {
             use_accel = true;
         } else if (arg == "--no-viz") {
             no_viz = true;
+        } else if (arg == "--depth-model" && i + 1 < argc) {
+            depth_model_path = argv[++i];
         }
     }
 
@@ -141,6 +147,7 @@ int main(int argc, char** argv) {
     // Find vocab path: last argument that isn't a flag
     for (int i = positional_idx; i < argc; ++i) {
         std::string arg = argv[i];
+        if (arg == "--depth-model") { ++i; continue; }
         if (arg != "--depth" && arg != "--accel" && arg != "--no-viz") {
             vocab_path = arg;
             break;
@@ -194,6 +201,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Deep learning depth estimator
+#ifdef USE_DEPTH_DL
+    std::shared_ptr<DepthEstimator> dl_depth_estimator;
+    if (!depth_model_path.empty()) {
+        std::cout << "Loading DL depth model: " << depth_model_path << std::endl;
+        dl_depth_estimator = std::make_shared<OnnxDepthEstimator>(depth_model_path);
+        std::cout << "DL depth estimation: ENABLED" << std::endl;
+    }
+#endif
+
     // Trajectory storage (TUM format: timestamp tx ty tz qx qy qz qw)
     struct TrajEntry { double ts, x, y, z, qx, qy, qz, qw; };
     std::vector<TrajEntry> trajectory;
@@ -227,6 +244,12 @@ int main(int argc, char** argv) {
             frame->depth_image_ = depth_img;
             frame->depth_is_metric_ = true;
         }
+#ifdef USE_DEPTH_DL
+        else if (dl_depth_estimator) {
+            frame->depth_image_ = dl_depth_estimator->estimate(img);
+            frame->depth_is_metric_ = false;
+        }
+#endif
 
         // Extract Features
         frame->extractORB(orb);
