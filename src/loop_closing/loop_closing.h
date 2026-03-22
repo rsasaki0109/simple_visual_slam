@@ -3,10 +3,14 @@
 #include "core/common.h"
 #include "core/map.h"
 #include "core/keyframe.h"
+#include "core/landmark.h"
+#include "backend/optimizer.h"
+#include <opencv2/features2d.hpp>
 #include <mutex>
 #include <thread>
 #include <deque>
 #include <condition_variable>
+#include <vector>
 
 #ifdef USE_DBOW2
 #include <DBoW2/DBoW2.h>
@@ -36,12 +40,24 @@ public:
 
     bool isEnabled() const { return enabled_; }
 
+    // Set to true when metric depth is available (disables scale correction in loop closing)
+    void setMetricDepth(bool metric) { has_metric_depth_ = metric; }
+
 private:
+    struct LoopConstraint {
+        Keyframe::Ptr from;
+        Keyframe::Ptr to;
+        Sim3 relative_pose;
+    };
+
     bool checkNewKeyframes();
     void processNewKeyframe();
     bool detectLoop();
     bool computeSim3();
     void correctLoop();
+    std::vector<cv::DMatch> matchLoopCandidate() const;
+    void fuseLoopLandmarks();
+    void mergeLandmarks(const Landmark::Ptr& target, const Landmark::Ptr& source);
 
     Map::Ptr map_;
     std::string vocab_path_;
@@ -61,12 +77,25 @@ private:
 
     Keyframe::Ptr current_processed_kf_;
     Keyframe::Ptr loop_candidate_kf_;
+    Sim3 corrected_sim3_;
+    std::vector<cv::DMatch> verified_loop_matches_;
+    std::vector<LoopConstraint> loop_constraints_;
 
     std::vector<Keyframe::Ptr> db_keyframes_;
     int min_loop_interval_kf_ = 30;
     int max_loop_candidates_ = 4;
     double min_loop_score_ = 0.01;
+    int min_loop_inliers_ = 30;
+    int correction_window_size_ = 30;
+    int loop_cooldown_kf_ = 120;
+    int sim3_ransac_iterations_ = 200;
+    double max_sim3_residual_ = 0.25;
+    double min_sim3_scale_ = 0.7;
+    double max_sim3_scale_ = 1.4;
 
+    bool has_metric_depth_ = false;
+    bool has_successful_loop_ = false;
+    unsigned long last_successful_loop_kf_id_ = 0;
     bool stop_requested_ = false;
 };
 

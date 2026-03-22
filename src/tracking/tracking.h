@@ -5,6 +5,7 @@
 #include "core/map.h"
 #include "tracking/initializer.h"
 #include "backend/local_mapping.h"
+#include "io/tum_dataset.h"
 #include <mutex>
 
 namespace svslam {
@@ -52,7 +53,13 @@ public:
     int consecutive_tracking_failures_ = 0;
     Keyframe::Ptr reference_keyframe_;
 
+    // Accelerometer data for gravity alignment and stationary detection
+    std::vector<AccelEntry> accel_buffer_;
+    bool gravity_aligned_ = false;
+
 private:
+    bool initializeWithDepth();
+    void createLandmarksFromDepth(Keyframe::Ptr kf);
     bool track();
     bool initialize();
     bool trackReferenceKeyframe();
@@ -60,12 +67,19 @@ private:
     bool needNewKeyframe();
     void recomputeCurrentPose();
     bool relocalize();  // Attempt to recover from tracking loss
+    bool reinitialize();  // Re-initialize from scratch when lost for too long
 
     cv::Ptr<cv::DescriptorMatcher> matcher_;
     std::mutex pose_mutex_;  // For thread-safe pose updates
 
     int lost_frame_count_ = 0;
     static constexpr int max_lost_frames_ = 30;  // Max frames before giving up
+    SE3 last_good_pose_;  // Last known good T_cw pose before tracking loss
+
+    // Re-initialization state
+    Frame::Ptr reinit_reference_frame_;
+    Initializer::Ptr reinit_initializer_;
+    static constexpr int reinit_trigger_frames_ = 20;  // Start re-init after this many lost frames
 };
 
 }

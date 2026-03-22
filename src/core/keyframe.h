@@ -18,6 +18,12 @@ public:
     
     SE3 T_cw_;
 
+    // Depth image (copied from Frame)
+    cv::Mat depth_image_;
+    bool depth_is_metric_ = true;
+
+    float getDepth(float u, float v) const;
+
     // Features (copied from Frame to be immutable/independent)
     std::vector<cv::KeyPoint> keypoints_;
     cv::Mat descriptors_;

@@ -2,10 +2,12 @@
 #include <iostream>
 #include <limits>
 #include <cmath>
+#include <set>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/eigen.hpp>
 #include "core/keyframe.h"
 #include "core/landmark.h"
+#include "sensors/accelerometer.h"
 
 namespace svslam {
 
@@ -39,18 +41,127 @@ bool Tracking::addFrame(Frame::Ptr frame) {
     return success;
 }
 
+bool Tracking::initializeWithDepth() {
+    // Single-frame initialization using depth map
+    current_frame_->setPose(SE3());
+
+    // Apply gravity alignment if accelerometer data is available
+    if (!gravity_aligned_ && !accel_buffer_.empty()) {
+        Vec3 gravity = AccelerometerProcessor::estimateGravity(accel_buffer_);
+        if (gravity.norm() > 0.5) {
+            Mat33 R_align = AccelerometerProcessor::computeGravityAlignment(gravity);
+            SE3 T_aligned(R_align, Vec3(0, 0, 0));
+            current_frame_->setPose(T_aligned);
+            gravity_aligned_ = true;
+            std::cout << "Tracking: Applied gravity alignment" << std::endl;
+        }
+    }
+
+    auto kf = std::make_shared<Keyframe>(current_frame_);
+
+    // Back-project keypoints with valid depth to create landmarks
+    int created = 0;
+    static unsigned long depth_lm_id = 200000;
+    SE3 T_wc = kf->T_cw_.inverse();
+
+    for (size_t i = 0; i < kf->keypoints_.size(); ++i) {
+        const auto& kp = kf->keypoints_[i];
+        float depth = kf->getDepth(kp.pt.x, kp.pt.y);
+        if (depth <= 0.0f || depth > 10.0f) continue;
+
+        Vec3 p_norm = kf->camera_->unproject(Vec2(kp.pt.x, kp.pt.y));
+        Vec3 p_cam = p_norm * static_cast<double>(depth);
+        Vec3 p_w = T_wc * p_cam;
+
+        auto lm = std::make_shared<Landmark>(depth_lm_id++, p_w);
+        lm->addObservation(kf, i);
+        lm->descriptor_ = kf->descriptors_.row(i).clone();
+
+        kf->landmarks_[i] = lm;
+        current_frame_->landmarks_[i] = lm;
+
+        if (map_) map_->addLandmark(lm);
+        created++;
+    }
+
+    if (created < 100) {
+        std::cout << "Tracking: Depth init failed - only " << created << " points with valid depth" << std::endl;
+        // Clean up
+        if (map_) {
+            for (auto& lm_pair : map_->getAllLandmarks()) {
+                map_->removeLandmark(lm_pair.second);
+            }
+        }
+        return false;
+    }
+
+    if (map_) {
+        map_->addKeyframe(kf);
+    }
+
+    reference_keyframe_ = kf;
+    initial_frame_ = current_frame_;
+    state_ = TrackingState::OK;
+
+    std::cout << "Tracking: Depth-based initialization SUCCESS! " << created
+              << " 3D points from single frame (metric scale)" << std::endl;
+    return true;
+}
+
+void Tracking::createLandmarksFromDepth(Keyframe::Ptr kf) {
+    if (!kf || kf->depth_image_.empty()) return;
+
+    SE3 T_wc = kf->T_cw_.inverse();
+    int created = 0;
+    static unsigned long depth_track_lm_id = 300000;
+
+    for (size_t i = 0; i < kf->keypoints_.size(); ++i) {
+        if (kf->landmarks_[i]) continue;  // Already has a landmark
+
+        const auto& kp = kf->keypoints_[i];
+        float depth = kf->getDepth(kp.pt.x, kp.pt.y);
+        if (depth <= 0.0f || depth > 10.0f) continue;
+
+        Vec3 p_norm = kf->camera_->unproject(Vec2(kp.pt.x, kp.pt.y));
+        Vec3 p_cam = p_norm * static_cast<double>(depth);
+        Vec3 p_w = T_wc * p_cam;
+
+        auto lm = std::make_shared<Landmark>(depth_track_lm_id++, p_w);
+        lm->addObservation(kf, i);
+        lm->descriptor_ = kf->descriptors_.row(i).clone();
+
+        kf->landmarks_[i] = lm;
+        if (map_) map_->addLandmark(lm);
+        created++;
+    }
+
+    if (created > 0) {
+        std::cout << "Tracking: Created " << created << " landmarks from depth in KF " << kf->id_ << std::endl;
+    }
+}
+
 bool Tracking::initialize() {
     if (!initial_frame_) {
+        // First frame - try single-frame depth initialization
+        if (!current_frame_->depth_image_.empty()) {
+            initial_frame_ = current_frame_;
+            if (initializeWithDepth()) {
+                return true;
+            }
+            // Depth init failed, fall through to two-frame init
+            initial_frame_ = nullptr;
+        }
+
         // First frame
         initial_frame_ = current_frame_;
         // Set identity pose
         initial_frame_->setPose(SE3());
-        
+
         // Initialize initializer
         initializer_ = std::make_shared<Initializer>(initial_frame_);
-        
+
         std::cout << "Tracking: Initial Frame set (ID: " << initial_frame_->id_ << ")" << std::endl;
-        return true; 
+        return true;
     } else {
         // Second frame, try to initialize
         if (initializer_->initialize(current_frame_)) {
@@ -144,36 +255,38 @@ bool Tracking::initialize() {
                       << " norm_max=" << norm_max
                       << std::endl;
 
-            // Scale normalization: use median depth to normalize the map to a reasonable scale
-            // Collect all depths for computing median
-            std::vector<double> depths;
-            for (auto& kv : map_->getAllLandmarks()) {
-                auto& lm = kv.second;
-                if (lm && !lm->isBad()) {
-                    depths.push_back(lm->getPos().z());
-                }
-            }
-            if (!depths.empty()) {
-                std::sort(depths.begin(), depths.end());
-                double median_depth = depths[depths.size() / 2];
-                if (median_depth > 0.0) {
-                    // Target median depth: 1.0 (arbitrary unit scale)
-                    double scale = 1.0 / median_depth;
-                    std::cout << "Tracking: Scaling map by " << scale << " (median depth was " << median_depth << ")" << std::endl;
-
-                    // Scale all landmarks
-                    for (auto& kv : map_->getAllLandmarks()) {
-                        auto& lm = kv.second;
-                        if (lm && !lm->isBad()) {
-                            lm->setPos(lm->getPos() * scale);
-                        }
+            // Scale normalization: skip if we have metric depth data
+            bool has_metric_depth = !current_frame_->depth_image_.empty() && current_frame_->depth_is_metric_;
+            if (!has_metric_depth) {
+                // Collect all depths for computing median
+                std::vector<double> depths;
+                for (auto& kv : map_->getAllLandmarks()) {
+                    auto& lm = kv.second;
+                    if (lm && !lm->isBad()) {
+                        depths.push_back(lm->getPos().z());
                     }
-
-                    // Scale translation of current keyframe pose
-                    SE3 T_scaled = SE3(kf_cur->T_cw_.so3(), kf_cur->T_cw_.translation() * scale);
-                    kf_cur->T_cw_ = T_scaled;
-                    current_frame_->setPose(T_scaled);
                 }
+                if (!depths.empty()) {
+                    std::sort(depths.begin(), depths.end());
+                    double median_depth = depths[depths.size() / 2];
+                    if (median_depth > 0.0) {
+                        double scale = 1.0 / median_depth;
+                        std::cout << "Tracking: Scaling map by " << scale << " (median depth was " << median_depth << ")" << std::endl;
+
+                        for (auto& kv : map_->getAllLandmarks()) {
+                            auto& lm = kv.second;
+                            if (lm && !lm->isBad()) {
+                                lm->setPos(lm->getPos() * scale);
+                            }
+                        }
+
+                        SE3 T_scaled = SE3(kf_cur->T_cw_.so3(), kf_cur->T_cw_.translation() * scale);
+                        kf_cur->T_cw_ = T_scaled;
+                        current_frame_->setPose(T_scaled);
+                    }
+                }
+            } else {
+                std::cout << "Tracking: Metric depth available, skipping scale normalization" << std::endl;
             }
 
             if (map_) {
@@ -199,9 +312,29 @@ bool Tracking::initialize() {
 bool Tracking::track() {
     // 1. Motion Model Prediction
     if (last_frame_) {
-        // T_current = velocity * T_last
-        SE3 T_cw_pred = velocity_ * last_frame_->getPose();
-        current_frame_->setPose(T_cw_pred);
+        // Check accelerometer for stationary detection
+        bool stationary = false;
+        if (!accel_buffer_.empty() && last_frame_) {
+            auto recent_accel = std::vector<AccelEntry>();
+            for (const auto& a : accel_buffer_) {
+                if (a.timestamp_sec >= last_frame_->timestamp_ &&
+                    a.timestamp_sec <= current_frame_->timestamp_) {
+                    recent_accel.push_back(a);
+                }
+            }
+            if (AccelerometerProcessor::isStationary(recent_accel)) {
+                stationary = true;
+            }
+        }
+
+        if (stationary) {
+            // Zero motion prediction
+            current_frame_->setPose(last_frame_->getPose());
+        } else {
+            // T_current = velocity * T_last
+            SE3 T_cw_pred = velocity_ * last_frame_->getPose();
+            current_frame_->setPose(T_cw_pred);
+        }
     }
 
     // 2. Track Reference Keyframe (Frame-to-Frame matching for now)
@@ -219,6 +352,7 @@ bool Tracking::track() {
         state_ = TrackingState::OK;
         consecutive_tracking_failures_ = 0;
         lost_frame_count_ = 0;
+        last_good_pose_ = current_frame_->getPose();
 
         // Update velocity for next frame (Constant velocity model)
         if (last_frame_) {
@@ -241,10 +375,11 @@ bool Tracking::track() {
             lost_frame_count_++;
 
             if (consecutive_tracking_failures_ >= 3) {
-                std::cout << "Tracking: Resetting velocity model after " << consecutive_tracking_failures_ << " failures" << std::endl;
                 velocity_ = SE3();
             }
 
+            // Keep trying relocalization rather than re-initializing
+            // Re-initialization creates segments with inconsistent scale that degrades trajectory
             if (lost_frame_count_ > max_lost_frames_) {
                 std::cout << "Tracking: Completely lost for " << lost_frame_count_ << " frames" << std::endl;
             }
@@ -256,6 +391,14 @@ bool Tracking::track() {
         std::cout << "Tracking: Insert New Keyframe (ID=" << current_frame_->id_ << ")" << std::endl;
         // Create new Keyframe
         auto kf = std::make_shared<Keyframe>(current_frame_);
+        for (size_t i = 0; i < kf->landmarks_.size(); ++i) {
+            auto& lm = kf->landmarks_[i];
+            if (!lm || lm->isBad()) continue;
+            lm->addObservation(kf, i);
+        }
+
+        // Create additional landmarks from depth for unmatched keypoints
+        createLandmarksFromDepth(kf);
 
         // Update reference keyframe
         reference_keyframe_ = kf;
@@ -276,20 +419,20 @@ bool Tracking::needNewKeyframe() {
 
     // Heuristics for new keyframe decision:
     // 1. Min frames since last KF
-    const int min_frames_since_last_kf = 5;
+    const int min_frames_since_last_kf = 3;
     if (current_frame_->id_ - reference_keyframe_->id_ < min_frames_since_last_kf) {
         return false;
     }
 
     // 2. Track quality: if tracked features drop below threshold, insert KF
-    const int min_tracked_threshold = 40;
+    const int min_tracked_threshold = 60;
     if (num_tracked_features_ < min_tracked_threshold) {
         std::cout << "needNewKeyframe: Low tracked features (" << num_tracked_features_ << "), inserting KF." << std::endl;
         return true;
     }
 
     // 3. Max frames since last KF
-    const int max_frames_since_last_kf = 20;
+    const int max_frames_since_last_kf = 12;
     if (current_frame_->id_ - reference_keyframe_->id_ >= max_frames_since_last_kf) {
         std::cout << "needNewKeyframe: Max frames reached, inserting KF." << std::endl;
         return true;
@@ -303,7 +446,7 @@ bool Tracking::needNewKeyframe() {
 
     if (ref_landmarks > 0) {
         double ratio = static_cast<double>(num_tracked_features_) / ref_landmarks;
-        if (ratio < 0.45) {
+        if (ratio < 0.65) {
             std::cout << "needNewKeyframe: Low tracking ratio (" << ratio << "), inserting KF." << std::endl;
             return true;
         }
@@ -315,9 +458,36 @@ bool Tracking::needNewKeyframe() {
 bool Tracking::trackLocalMap() {
     if (!map_) return false;
 
-    // 1. Get all landmarks (Naive local map: all map points)
-    // In real SLAM, we should only select those in view frustum and connected to local keyframes.
-    auto landmarks = map_->getAllLandmarks();
+    // 1. Build a true local map from the reference keyframe and its covisible neighbors.
+    std::vector<Landmark::Ptr> landmarks;
+    std::set<unsigned long> landmark_ids;
+
+    auto add_landmarks_from_kf = [&](const Keyframe::Ptr& kf) {
+        if (!kf) return;
+        for (const auto& lm : kf->landmarks_) {
+            if (!lm || lm->isBad()) continue;
+            if (!landmark_ids.insert(lm->id_).second) continue;
+            landmarks.push_back(lm);
+        }
+    };
+
+    add_landmarks_from_kf(reference_keyframe_);
+    if (reference_keyframe_) {
+        const auto neighbors = reference_keyframe_->getBestCovisibilityKeyframes(15);
+        for (const auto& neighbor : neighbors) {
+            add_landmarks_from_kf(neighbor);
+        }
+    }
+
+    if (landmarks.size() < 80) {
+        const auto& all_landmarks = map_->getAllLandmarks();
+        for (const auto& kv : all_landmarks) {
+            const auto& lm = kv.second;
+            if (!lm || lm->isBad()) continue;
+            if (!landmark_ids.insert(lm->id_).second) continue;
+            landmarks.push_back(lm);
+        }
+    }
     
     std::vector<cv::Point3f> object_points;
     std::vector<cv::Point2f> image_points;
@@ -335,14 +505,58 @@ bool Tracking::trackLocalMap() {
     
     std::cout << "TrackLocalMap: Landmarks to check: " << landmarks.size() << std::endl;
 
+    auto filter_correspondences_by_pose = [&](double base_gate_px) {
+        if (object_points.empty()) return;
+
+        std::vector<cv::Point3f> filtered_object_points;
+        std::vector<cv::Point2f> filtered_image_points;
+        std::vector<Landmark::Ptr> filtered_landmarks;
+        std::vector<int> filtered_kp_indices;
+
+        filtered_object_points.reserve(object_points.size());
+        filtered_image_points.reserve(image_points.size());
+        filtered_landmarks.reserve(matched_landmarks.size());
+        filtered_kp_indices.reserve(matched_kp_indices.size());
+
+        const SE3 T_cw_est = current_frame_->getPose();
+        for (size_t i = 0; i < object_points.size(); ++i) {
+            const auto& Pw = object_points[i];
+            Vec3 p_w(Pw.x, Pw.y, Pw.z);
+            Vec3 p_c = T_cw_est * p_w;
+            if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) continue;
+            if (p_c[2] <= 0.15 || p_c[2] > 18.0) continue;
+
+            const int kp_idx = matched_kp_indices[i];
+            const int octave = (kp_idx >= 0 && kp_idx < static_cast<int>(current_frame_->keypoints_.size()))
+                ? current_frame_->keypoints_[kp_idx].octave
+                : 0;
+            const double gate_px = base_gate_px * (1.0 + 0.12 * static_cast<double>(std::max(0, octave)));
+
+            Vec2 proj = current_frame_->camera_->project(p_c);
+            const auto& uv = image_points[i];
+            const double dx = uv.x - proj[0];
+            const double dy = uv.y - proj[1];
+            if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+
+            filtered_object_points.push_back(Pw);
+            filtered_image_points.push_back(uv);
+            filtered_landmarks.push_back(matched_landmarks[i]);
+            filtered_kp_indices.push_back(kp_idx);
+        }
+
+        object_points.swap(filtered_object_points);
+        image_points.swap(filtered_image_points);
+        matched_landmarks.swap(filtered_landmarks);
+        matched_kp_indices.swap(filtered_kp_indices);
+    };
+
     // 2. Project and Match
     int matches_found = 0;
     int visible_points = 0;
     int skipped_nonfinite = 0;
     int skipped_behind_or_close = 0;
     int skipped_oob = 0;
-    for (auto& pair : landmarks) {
-        auto lm = pair.second;
+    for (const auto& lm : landmarks) {
         if (!lm) continue;
         if (lm->descriptor_.empty()) continue;
         
@@ -380,8 +594,8 @@ bool Tracking::trackLocalMap() {
         // Search for match in current frame features
         // Simple search: look for features near px
         int best_idx = -1;
-        double best_dist = 60.0; // Slightly more permissive descriptor distance threshold (Hamming)
-        const double search_radius_sq = 120.0 * 120.0;  // Slightly wider search radius
+        double best_dist = 64.0;
+        const double search_radius_sq = 120.0 * 120.0;
         
         // Radius search (naive O(N) per landmark)
         // Ideally should use grid search
@@ -418,6 +632,11 @@ bool Tracking::trackLocalMap() {
               << " behind/close=" << skipped_behind_or_close
               << " oob=" << skipped_oob
               << ")" << std::endl;
+
+    filter_correspondences_by_pose(35.0);
+    if (!object_points.empty()) {
+        std::cout << "TrackLocalMap: Pose-gated matches: " << object_points.size() << std::endl;
+    }
 
     // Fallback: if pose is too noisy, projection-based matching may find 0.
     // In that case, do global descriptor matching (landmark descriptor -> current descriptors)
@@ -470,40 +689,7 @@ bool Tracking::trackLocalMap() {
                 kp_used[c.kp_idx] = true;
             }
 
-            // Geometric gating using current pose: keep only matches consistent with projection.
-            // This helps improve inlier ratio before PnP.
-            if (!object_points.empty()) {
-                std::vector<cv::Point3f> obj_f;
-                std::vector<cv::Point2f> img_f;
-                std::vector<Landmark::Ptr> lm_f;
-                std::vector<int> kp_f;
-
-                const double gate_sq = 70.0 * 70.0;  // Slightly looser gate (70px)
-                const SE3 T_cw_est = current_frame_->getPose();
-
-                for (size_t i = 0; i < object_points.size(); ++i) {
-                    const auto& Pw = object_points[i];
-                    Vec3 p_w(Pw.x, Pw.y, Pw.z);
-                    Vec3 p_c = T_cw_est * p_w;
-                    if (p_c[2] <= 0.1) continue;
-                    Vec2 proj = current_frame_->camera_->project(p_c);
-                    const auto& uv = image_points[i];
-                    const double dx = uv.x - proj[0];
-                    const double dy = uv.y - proj[1];
-                    const double e2 = dx * dx + dy * dy;
-                    if (e2 > gate_sq) continue;
-
-                    obj_f.push_back(Pw);
-                    img_f.push_back(uv);
-                    lm_f.push_back(matched_landmarks[i]);
-                    kp_f.push_back(matched_kp_indices[i]);
-                }
-
-                object_points.swap(obj_f);
-                image_points.swap(img_f);
-                matched_landmarks.swap(lm_f);
-                matched_kp_indices.swap(kp_f);
-            }
+            filter_correspondences_by_pose(55.0);
 
             used_global_fallback = true;
             std::cout << "TrackLocalMap: Fallback global matches: " << object_points.size() << std::endl;
@@ -596,6 +782,71 @@ bool Tracking::trackLocalMap() {
     // If correspondences come from global descriptor matching, do not trust the motion-model pose as an initial guess.
     const bool use_extrinsic_guess = !used_global_fallback;
 
+    auto refine_pnp_solution = [&](double refine_gate_px) -> bool {
+        if (inliers.size() < 6) return false;
+
+        std::vector<cv::Point3f> refine_object_points;
+        std::vector<cv::Point2f> refine_image_points;
+        std::vector<int> refine_indices;
+        refine_object_points.reserve(inliers.size());
+        refine_image_points.reserve(inliers.size());
+        refine_indices.reserve(inliers.size());
+
+        for (int idx : inliers) {
+            if (idx < 0 || idx >= static_cast<int>(object_points.size())) continue;
+            refine_object_points.push_back(object_points[idx]);
+            refine_image_points.push_back(image_points[idx]);
+            refine_indices.push_back(idx);
+        }
+        if (refine_object_points.size() < 6) return false;
+
+        cv::Mat rvec_refined = rvec.clone();
+        cv::Mat tvec_refined = tvec.clone();
+        bool ok = cv::solvePnP(refine_object_points, refine_image_points, current_frame_->camera_->K(),
+                               cv::Mat(), rvec_refined, tvec_refined, true, cv::SOLVEPNP_ITERATIVE);
+        if (!ok) return false;
+
+        std::vector<cv::Point2f> projected;
+        cv::projectPoints(refine_object_points, rvec_refined, tvec_refined,
+                          current_frame_->camera_->K(), cv::Mat(), projected);
+
+        std::vector<cv::Point3f> gated_object_points;
+        std::vector<cv::Point2f> gated_image_points;
+        std::vector<int> gated_indices;
+        gated_object_points.reserve(refine_object_points.size());
+        gated_image_points.reserve(refine_image_points.size());
+        gated_indices.reserve(refine_indices.size());
+
+        for (size_t i = 0; i < projected.size(); ++i) {
+            const int corr_idx = refine_indices[i];
+            const int kp_idx = matched_kp_indices[corr_idx];
+            const int octave = (kp_idx >= 0 && kp_idx < static_cast<int>(current_frame_->keypoints_.size()))
+                ? current_frame_->keypoints_[kp_idx].octave
+                : 0;
+            const double gate_px = refine_gate_px * (1.0 + 0.10 * static_cast<double>(std::max(0, octave)));
+            const double dx = projected[i].x - refine_image_points[i].x;
+            const double dy = projected[i].y - refine_image_points[i].y;
+            if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+            gated_object_points.push_back(refine_object_points[i]);
+            gated_image_points.push_back(refine_image_points[i]);
+            gated_indices.push_back(corr_idx);
+        }
+
+        if (gated_object_points.size() < 6) return false;
+        if (gated_object_points.size() != refine_object_points.size()) {
+            rvec_refined = rvec.clone();
+            tvec_refined = tvec.clone();
+            ok = cv::solvePnP(gated_object_points, gated_image_points, current_frame_->camera_->K(),
+                              cv::Mat(), rvec_refined, tvec_refined, true, cv::SOLVEPNP_ITERATIVE);
+            if (!ok) return false;
+        }
+
+        rvec = rvec_refined;
+        tvec = tvec_refined;
+        inliers.swap(gated_indices);
+        return true;
+    };
+
     enum class PnpMethod { EPNP, P3P, ITERATIVE };
     auto try_pnp = [&](PnpMethod method) -> bool {
         int flag = cv::SOLVEPNP_EPNP;
@@ -614,7 +865,7 @@ bool Tracking::trackLocalMap() {
 
         bool ok = cv::solvePnPRansac(object_points, image_points, current_frame_->camera_->K(), cv::Mat(),
                                      rvec_tmp, tvec_tmp, use_extrinsic_guess,
-                                     200, 20.0, 0.99, tmp_inliers, flag);
+                                     150, 10.0, 0.995, tmp_inliers, flag);
         if (ok) {
             rvec = rvec_tmp;
             tvec = tvec_tmp;
@@ -626,10 +877,12 @@ bool Tracking::trackLocalMap() {
     };
 
     bool success = try_pnp(PnpMethod::EPNP) || try_pnp(PnpMethod::P3P) || try_pnp(PnpMethod::ITERATIVE);
+    if (success) {
+        success = refine_pnp_solution(8.0);
+    }
 
     // Minimum inlier threshold for reliable pose estimation
-    // Lowered from 50 to 30 to handle challenging scenarios
-    const size_t min_inliers = 24;
+    const size_t min_inliers = 15;
 
     if (success && inliers.size() >= min_inliers) {
         std::cout << "TrackLocalMap: PnP Success, inliers: " << inliers.size() << std::endl;
@@ -641,6 +894,16 @@ bool Tracking::trackLocalMap() {
         cv::cv2eigen(R_new, R_eig);
         cv::cv2eigen(tvec, t_eig);
         SE3 new_pose(R_eig, t_eig);
+
+        // Absolute pose sanity check: reject obviously wrong poses
+        {
+            Vec3 cam_pos = new_pose.inverse().translation();
+            const double max_abs_pos = 50.0;  // Indoor scene: max 50m from origin
+            if (std::abs(cam_pos.x()) > max_abs_pos || std::abs(cam_pos.y()) > max_abs_pos || std::abs(cam_pos.z()) > max_abs_pos) {
+                std::cout << "TrackLocalMap: REJECTED - Absolute position out of bounds: " << cam_pos.transpose() << std::endl;
+                return false;
+            }
+        }
 
         // Sanity check: reject poses with sudden large jumps
         if (last_frame_) {
@@ -657,8 +920,8 @@ bool Tracking::trackLocalMap() {
             // Thresholds:
             // - Translation: max 0.2 units per frame (strict for indoor)
             // - Rotation: max 0.3 radians (~17 degrees) per frame
-            const double max_trans_change = 0.35;
-            const double max_rot_change = 0.45;
+            const double max_trans_change = 0.5;
+            const double max_rot_change = 0.6;
 
             std::cout << "TrackLocalMap: Pose change - trans=" << trans_change
                       << " rot=" << rot_change << " rad" << std::endl;
@@ -759,7 +1022,8 @@ bool Tracking::trackReferenceKeyframe() {
     // Optimization: Pose from 3D-2D
     std::vector<cv::Point3f> object_points;
     std::vector<cv::Point2f> image_points;
-    std::vector<int> match_indices; // index into good_matches for each 3D-2D pair
+    std::vector<int> current_kp_indices;
+    std::vector<Landmark::Ptr> propagated_landmarks;
     
     for (const auto& m : good_matches) {
         // Query is current, Train is last
@@ -770,11 +1034,26 @@ bool Tracking::trackReferenceKeyframe() {
             last_frame_->landmarks_[idx_last]) {
             // Found a map point
             Vec3 pos = last_frame_->landmarks_[idx_last]->getPos();
+            if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) continue;
+
+            Vec3 p_c = current_frame_->getPose() * pos;
+            if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) continue;
+            if (p_c[2] <= 0.15 || p_c[2] > 18.0) continue;
+
+            const int octave = current_frame_->keypoints_[idx_curr].octave;
+            const double gate_px = 48.0 * (1.0 + 0.12 * static_cast<double>(std::max(0, octave)));
+            Vec2 proj = current_frame_->camera_->project(p_c);
+            const auto& uv = current_frame_->keypoints_[idx_curr].pt;
+            const double dx = uv.x - proj[0];
+            const double dy = uv.y - proj[1];
+            if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+
             object_points.push_back(cv::Point3f(pos.x(), pos.y(), pos.z()));
-            image_points.push_back(current_frame_->keypoints_[idx_curr].pt);
+            image_points.push_back(uv);
 
             current_frame_->landmarks_[idx_curr] = last_frame_->landmarks_[idx_last];
-            match_indices.push_back(static_cast<int>(&m - &good_matches[0]));
+            current_kp_indices.push_back(idx_curr);
+            propagated_landmarks.push_back(last_frame_->landmarks_[idx_last]);
             propagated++;
         }
     }
@@ -796,10 +1075,72 @@ bool Tracking::trackReferenceKeyframe() {
         cv::eigen2cv(R, R_cv);
         cv::Rodrigues(R_cv, rvec);
         cv::eigen2cv(t, tvec);
-        
-        // Do not rely on initial guess here; allow RANSAC to find a pose even if motion model is poor.
+
         bool success = cv::solvePnPRansac(object_points, image_points, current_frame_->camera_->K(), cv::Mat(),
-                                          rvec, tvec, false, 500, 20.0, 0.99, inliers, cv::SOLVEPNP_EPNP);
+                                          rvec, tvec, true, 250, 8.0, 0.995, inliers, cv::SOLVEPNP_EPNP);
+
+        auto refine_reference_pose = [&]() -> bool {
+            if (inliers.size() < 6) return false;
+
+            std::vector<cv::Point3f> refine_object_points;
+            std::vector<cv::Point2f> refine_image_points;
+            std::vector<int> refine_indices;
+            refine_object_points.reserve(inliers.size());
+            refine_image_points.reserve(inliers.size());
+            refine_indices.reserve(inliers.size());
+
+            for (int idx : inliers) {
+                if (idx < 0 || idx >= static_cast<int>(object_points.size())) continue;
+                refine_object_points.push_back(object_points[idx]);
+                refine_image_points.push_back(image_points[idx]);
+                refine_indices.push_back(idx);
+            }
+            if (refine_object_points.size() < 6) return false;
+
+            cv::Mat rvec_refined = rvec.clone();
+            cv::Mat tvec_refined = tvec.clone();
+            bool ok = cv::solvePnP(refine_object_points, refine_image_points, current_frame_->camera_->K(),
+                                   cv::Mat(), rvec_refined, tvec_refined, true, cv::SOLVEPNP_ITERATIVE);
+            if (!ok) return false;
+
+            std::vector<cv::Point2f> projected;
+            cv::projectPoints(refine_object_points, rvec_refined, tvec_refined,
+                              current_frame_->camera_->K(), cv::Mat(), projected);
+
+            std::vector<cv::Point3f> gated_object_points;
+            std::vector<cv::Point2f> gated_image_points;
+            std::vector<int> gated_indices;
+            for (size_t i = 0; i < projected.size(); ++i) {
+                const int corr_idx = refine_indices[i];
+                const int kp_idx = current_kp_indices[corr_idx];
+                const int octave = current_frame_->keypoints_[kp_idx].octave;
+                const double gate_px = 6.0 * (1.0 + 0.10 * static_cast<double>(std::max(0, octave)));
+                const double dx = projected[i].x - refine_image_points[i].x;
+                const double dy = projected[i].y - refine_image_points[i].y;
+                if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+                gated_object_points.push_back(refine_object_points[i]);
+                gated_image_points.push_back(refine_image_points[i]);
+                gated_indices.push_back(corr_idx);
+            }
+
+            if (gated_object_points.size() < 6) return false;
+            if (gated_object_points.size() != refine_object_points.size()) {
+                rvec_refined = rvec.clone();
+                tvec_refined = tvec.clone();
+                ok = cv::solvePnP(gated_object_points, gated_image_points, current_frame_->camera_->K(),
+                                  cv::Mat(), rvec_refined, tvec_refined, true, cv::SOLVEPNP_ITERATIVE);
+                if (!ok) return false;
+            }
+
+            rvec = rvec_refined;
+            tvec = tvec_refined;
+            inliers.swap(gated_indices);
+            return true;
+        };
+
+        if (success) {
+            success = refine_reference_pose();
+        }
                                           
         // Minimum inlier threshold
         const size_t min_inliers = 15;
@@ -814,6 +1155,16 @@ bool Tracking::trackReferenceKeyframe() {
              cv::cv2eigen(R_new, R_eig);
              cv::cv2eigen(tvec, t_eig);
              SE3 new_pose(R_eig, t_eig);
+
+             // Absolute pose sanity check
+             {
+                 Vec3 cam_pos = new_pose.inverse().translation();
+                 const double max_abs_pos = 50.0;
+                 if (std::abs(cam_pos.x()) > max_abs_pos || std::abs(cam_pos.y()) > max_abs_pos || std::abs(cam_pos.z()) > max_abs_pos) {
+                     std::cout << "TrackReferenceKeyframe: REJECTED - Absolute position out of bounds: " << cam_pos.transpose() << std::endl;
+                     return false;
+                 }
+             }
 
              // Sanity check: reject poses with sudden large jumps
              if (last_frame_) {
@@ -835,10 +1186,20 @@ bool Tracking::trackReferenceKeyframe() {
                      std::cout << "TrackReferenceKeyframe: REJECTED - Pose change too large!" << std::endl;
                      // Fall through to use motion model
                  } else {
+                     current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
+                     for (int idx : inliers) {
+                         if (idx < 0 || idx >= static_cast<int>(current_kp_indices.size())) continue;
+                         current_frame_->landmarks_[current_kp_indices[idx]] = propagated_landmarks[idx];
+                     }
                      current_frame_->setPose(new_pose);
                      return true;
                  }
              } else {
+                 current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
+                 for (int idx : inliers) {
+                     if (idx < 0 || idx >= static_cast<int>(current_kp_indices.size())) continue;
+                     current_frame_->landmarks_[current_kp_indices[idx]] = propagated_landmarks[idx];
+                 }
                  current_frame_->setPose(new_pose);
                  return true;
              }
@@ -1031,7 +1392,7 @@ bool Tracking::relocalize() {
     std::cout << "Relocalize: Found " << candidates.size() << " candidate keyframes" << std::endl;
 
     // Try PnP with top N candidates
-    const int max_candidates = 5;
+    const int max_candidates = 10;
     for (int i = 0; i < std::min(static_cast<int>(candidates.size()), max_candidates); i++) {
         auto& cand = candidates[i];
 
@@ -1072,7 +1433,7 @@ bool Tracking::relocalize() {
                                       rvec, tvec, false, 500, 8.0, 0.99, inliers, cv::SOLVEPNP_EPNP);
 
         if (ok && inliers.size() >= 12) {  // Lower threshold for relocalization
-            // Success! Update pose
+            // Success! Validate pose before accepting
             cv::Mat R;
             cv::Rodrigues(rvec, R);
             Eigen::Matrix3d R_eig;
@@ -1080,7 +1441,18 @@ bool Tracking::relocalize() {
             cv::cv2eigen(R, R_eig);
             cv::cv2eigen(tvec, t_eig);
 
-            current_frame_->setPose(SE3(R_eig, t_eig));
+            SE3 candidate_pose(R_eig, t_eig);
+            // Sanity check: camera position should be near the candidate KF
+            SE3 T_wc_cand = cand.kf->T_cw_.inverse();
+            SE3 T_wc_new = candidate_pose.inverse();
+            double dist_to_kf = (T_wc_new.translation() - T_wc_cand.translation()).norm();
+            if (dist_to_kf > 5.0) {
+                std::cout << "Relocalize: Rejected KF " << cand.kf->id_
+                          << " - pose too far from KF (" << dist_to_kf << "m)" << std::endl;
+                continue;
+            }
+
+            current_frame_->setPose(candidate_pose);
 
             // Set landmark associations for inliers
             current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
@@ -1104,6 +1476,143 @@ bool Tracking::relocalize() {
 
     std::cout << "Relocalize: All candidate PnP attempts failed" << std::endl;
     return false;
+}
+
+bool Tracking::reinitialize() {
+    if (!current_frame_) return false;
+
+    // First call after entering re-init mode: store reference frame
+    if (!reinit_reference_frame_) {
+        reinit_reference_frame_ = current_frame_;
+        reinit_initializer_ = std::make_shared<Initializer>(current_frame_);
+        std::cout << "Tracking: Re-init reference set (frame " << current_frame_->id_ << ")" << std::endl;
+        return false;
+    }
+
+    // Check if enough disparity has accumulated since reference
+    // (avoid trying to initialize from nearly identical frames)
+    if (current_frame_->id_ - reinit_reference_frame_->id_ < 3) {
+        return false;
+    }
+
+    // Try initialization
+    bool ok = reinit_initializer_->initialize(current_frame_);
+    if (!ok) {
+        // If too many frames without success, reset reference
+        if (current_frame_->id_ - reinit_reference_frame_->id_ > 30) {
+            std::cout << "Tracking: Re-init timeout, resetting reference frame" << std::endl;
+            reinit_reference_frame_ = current_frame_;
+            reinit_initializer_ = std::make_shared<Initializer>(current_frame_);
+        }
+        return false;
+    }
+
+    // Initialization succeeded!
+    std::cout << "Tracking: Re-init triangulation starting..." << std::endl;
+
+    auto kf_ref = std::make_shared<Keyframe>(reinit_reference_frame_);
+    auto kf_cur = std::make_shared<Keyframe>(current_frame_);
+
+    // Set poses - anchor the new segment to the last known good pose
+    // This keeps the new segment in the same coordinate system as the existing map
+    SE3 T_anchor = last_good_pose_;  // Last known good T_cw before tracking loss
+    reinit_reference_frame_->setPose(T_anchor);
+    kf_ref->T_cw_ = T_anchor;
+
+    // Poses will be set after scale normalization below
+
+    // Triangulate points in local frame first, then normalize scale, then transform to world
+    struct TriPoint {
+        Vec3 pos_local;
+        int idx_ref;
+        int idx_cur;
+    };
+    std::vector<TriPoint> tri_points;
+    std::vector<double> depths;
+
+    for (size_t i = 0; i < reinit_initializer_->is_triangulated_.size(); ++i) {
+        if (!reinit_initializer_->is_triangulated_[i]) continue;
+
+        cv::Point3f pt3d = reinit_initializer_->triangulated_points_[i];
+        if (!std::isfinite(pt3d.x) || !std::isfinite(pt3d.y) || !std::isfinite(pt3d.z)) continue;
+        if (pt3d.z <= 0.0f) continue;
+        if (std::abs(pt3d.x) > 1e4f || std::abs(pt3d.y) > 1e4f || std::abs(pt3d.z) > 1e4f) continue;
+
+        depths.push_back(pt3d.z);
+        tri_points.push_back({
+            Vec3(pt3d.x, pt3d.y, pt3d.z),
+            reinit_initializer_->matches_[i].queryIdx,
+            reinit_initializer_->matches_[i].trainIdx
+        });
+    }
+
+    if (tri_points.size() < 50) {
+        std::cout << "Tracking: Re-init failed - only " << tri_points.size() << " points triangulated" << std::endl;
+        reinit_reference_frame_ = current_frame_;
+        reinit_initializer_ = std::make_shared<Initializer>(current_frame_);
+        return false;
+    }
+
+    // Normalize scale in local frame using median depth
+    // This sets median depth to 1.0m (reasonable for indoor scenes)
+    double scale = 1.0;
+    if (!depths.empty()) {
+        std::sort(depths.begin(), depths.end());
+        double median_depth = depths[depths.size() / 2];
+        if (median_depth > 0.0) {
+            scale = 1.0 / median_depth;
+        }
+    }
+
+    // Scale the relative pose T_c1_c2 in local frame, then compose with anchor
+    SE3 T_c1_c2_scaled = SE3(
+        reinit_initializer_->T_c1_c2_.so3(),
+        reinit_initializer_->T_c1_c2_.translation() * scale);
+    SE3 T_cur = T_c1_c2_scaled * T_anchor;
+    kf_cur->T_cw_ = T_cur;
+    current_frame_->setPose(T_cur);
+
+    // Transform scaled points from local frame to world frame
+    SE3 T_wc_anchor = T_anchor.inverse();
+    size_t inserted = 0;
+
+    for (auto& tp : tri_points) {
+        Vec3 pos_local_scaled = tp.pos_local * scale;
+        Vec3 pos_w = T_wc_anchor * pos_local_scaled;
+
+        static unsigned long reinit_lm_id = 100000;
+        auto lm = std::make_shared<Landmark>(reinit_lm_id++, pos_w);
+
+        lm->addObservation(kf_ref, tp.idx_ref);
+        lm->addObservation(kf_cur, tp.idx_cur);
+        lm->descriptor_ = reinit_reference_frame_->descriptors_.row(tp.idx_ref).clone();
+
+        kf_ref->landmarks_[tp.idx_ref] = lm;
+        kf_cur->landmarks_[tp.idx_cur] = lm;
+        reinit_reference_frame_->landmarks_[tp.idx_ref] = lm;
+        current_frame_->landmarks_[tp.idx_cur] = lm;
+
+        if (map_) {
+            map_->addLandmark(lm);
+            inserted++;
+        }
+    }
+
+    // Add keyframes to map
+    if (map_) {
+        map_->addKeyframe(kf_ref);
+        map_->addKeyframe(kf_cur);
+    }
+
+    reference_keyframe_ = kf_cur;
+
+    // Reset re-init state
+    reinit_reference_frame_ = nullptr;
+    reinit_initializer_ = nullptr;
+
+    std::cout << "Tracking: Re-init complete! " << inserted << " landmarks, "
+              << map_->getAllKeyframes().size() << " total KFs" << std::endl;
+    return true;
 }
 
 }
