@@ -2,11 +2,12 @@
 # Comprehensive evaluation script for SimpleVisualSLAM
 # Runs all modes on available TUM datasets and produces a comparison table.
 
-set -e
+set -uo pipefail
 
-BUILD_DIR="$(cd "$(dirname "$0")/../build" && pwd)"
-DATA_DIR="$(cd "$(dirname "$0")/../data/tum" && pwd)"
-RESULTS_DIR="$(cd "$(dirname "$0")/.." && pwd)/eval_results"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$(cd "$SCRIPT_DIR/../build" && pwd)"
+DATA_DIR="$(cd "$SCRIPT_DIR/../data/tum" && pwd)"
+RESULTS_DIR="$SCRIPT_DIR/../eval_results"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -17,6 +18,7 @@ if [ ! -f "$RUN_MONO" ]; then
     exit 1
 fi
 
+# Must run from build dir for ORBvoc.txt and other data paths
 cd "$BUILD_DIR"
 
 # Available datasets
@@ -53,11 +55,17 @@ run_eval() {
 
     echo "--- Running: $name [$mode] ---"
 
-    # Run SLAM
-    if timeout 600 "$RUN_MONO" --tum "$dataset" $flags --no-viz > "$RESULTS_DIR/${key}_log.txt" 2>&1; then
-        cp trajectory.txt "$traj_file" 2>/dev/null || true
+    # Clean up previous trajectory files to avoid stale data
+    rm -f trajectory.txt trajectory_online.txt trajectory_keyframes.txt map.bin
+
+    # Run SLAM (allow non-zero exit codes including segfaults)
+    timeout 600 "$RUN_MONO" --tum "$dataset" $flags --no-viz > "$RESULTS_DIR/${key}_log.txt" 2>&1 || true
+
+    # Check if trajectory was produced
+    if [ -f trajectory.txt ] && [ -s trajectory.txt ]; then
+        cp trajectory.txt "$traj_file"
     else
-        echo "  TIMEOUT or FAILED"
+        echo "  FAILED (no trajectory output)"
         RESULTS[$key]="FAILED"
         return
     fi
@@ -70,10 +78,19 @@ run_eval() {
     fi
 
     local ate_output
-    ate_output=$(evo_ape tum "$gt" "$traj_file" --align --correct_scale 2>&1)
-    local rmse=$(echo "$ate_output" | grep "rmse" | awk '{print $2}')
-    local mean=$(echo "$ate_output" | grep "mean" | awk '{print $2}')
-    local max_val=$(echo "$ate_output" | grep "max" | awk '{print $2}')
+    ate_output=$(evo_ape tum "$gt" "$traj_file" --align --correct_scale --t_max_diff 0.05 2>&1)
+
+    # Check for errors (no matching timestamps, etc.)
+    if echo "$ate_output" | grep -q "\[ERROR\]"; then
+        echo "  evo_ape error: $(echo "$ate_output" | grep "\[ERROR\]")"
+        RESULTS[$key]="EVO_ERROR"
+        return
+    fi
+
+    # Parse metrics (tab-separated: label\tvalue)
+    local rmse=$(echo "$ate_output" | grep -E "^\s+rmse" | awk '{print $2}')
+    local mean=$(echo "$ate_output" | grep -E "^\s+mean" | awk '{print $2}')
+    local max_val=$(echo "$ate_output" | grep -E "^\s+max" | awk '{print $2}')
 
     RESULTS[$key]="mean=${mean} rmse=${rmse} max=${max_val}"
     echo "  ATE: mean=$mean rmse=$rmse max=$max_val"
