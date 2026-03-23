@@ -313,6 +313,14 @@ bool Tracking::initialize() {
 }
 
 bool Tracking::track() {
+    // If loop closing is correcting the map, use motion model only and skip all map access
+    if (map_ && map_->loop_correcting_.load()) {
+        if (last_frame_) {
+            current_frame_->setPose(velocity_ * last_frame_->getPose());
+        }
+        return true;
+    }
+
     // 1. Motion Model Prediction
     if (last_frame_) {
         // Check accelerometer for stationary detection
@@ -461,6 +469,12 @@ bool Tracking::needNewKeyframe() {
 
 bool Tracking::trackLocalMap() {
     if (!map_) return false;
+
+    // Skip if loop closing is correcting the map to avoid accessing invalidated landmarks
+    if (map_->loop_correcting_.load()) {
+        std::cout << "TrackLocalMap: Loop correction in progress, skipping" << std::endl;
+        return true;
+    }
 
     // 1. Build a true local map from the reference keyframe and its covisible neighbors.
     std::vector<Landmark::Ptr> landmarks;
@@ -972,6 +986,7 @@ bool Tracking::trackLocalMap() {
 
 bool Tracking::trackReferenceKeyframe() {
     if (!last_frame_) return false;
+    if (map_ && map_->loop_correcting_.load()) return false;
 
     // Compute matches between current and last frame
     std::vector<std::vector<cv::DMatch>> knn;

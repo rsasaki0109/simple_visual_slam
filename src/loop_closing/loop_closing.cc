@@ -516,16 +516,23 @@ void LoopClosing::correctLoop() {
         optimizer_edges.push_back(edge);
     }
 
+    // Signal tracking thread to avoid landmark/pose access during correction
+    // Set BEFORE poseGraphOptimization because it writes back to kf->T_cw_ and lm positions
+    map_->loop_correcting_.store(true);
+
+    // Brief sleep to allow tracking thread to notice the flag and finish its current iteration
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
     Optimizer::poseGraphOptimization(map_, optimizer_edges, 60);
 
     fuseLoopLandmarks();
-    // Skip global BA — too expensive and can distort the map with large landmark count
-    // Optimizer::globalBundleAdjustment(map_, 10);
 
     const auto& all_keyframes = map_->getAllKeyframes();
     for (const auto& kv : all_keyframes) {
         if (kv.second) kv.second->updateConnections();
     }
+
+    map_->loop_correcting_.store(false);
 
     std::cout << "LoopClosing: Applied global pose graph with "
               << optimizer_edges.size() << " loop constraints and global BA." << std::endl;
