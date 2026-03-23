@@ -68,6 +68,7 @@ private:
     void recomputeCurrentPose();
     bool relocalize();  // Attempt to recover from tracking loss
     bool reinitialize();  // Re-initialize from scratch when lost for too long
+    void setKeyframeGravity(Keyframe::Ptr kf);  // Set gravity from accel data
 
     cv::Ptr<cv::DescriptorMatcher> matcher_;
     std::mutex pose_mutex_;  // For thread-safe pose updates

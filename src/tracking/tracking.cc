@@ -58,6 +58,7 @@ bool Tracking::initializeWithDepth() {
     }
 
     auto kf = std::make_shared<Keyframe>(current_frame_);
+    setKeyframeGravity(kf);
 
     // Back-project keypoints with valid depth to create landmarks
     int created = 0;
@@ -170,6 +171,8 @@ bool Tracking::initialize() {
             // 1. Create Keyframes
             auto kf_init = std::make_shared<Keyframe>(initial_frame_);
             auto kf_cur = std::make_shared<Keyframe>(current_frame_);
+            setKeyframeGravity(kf_init);
+            setKeyframeGravity(kf_cur);
             
             // Set Pose for current (T_cw)
             // Initializer returns T_c1_c2 which we defined as T_c2_c1 (Pose of 2 w.r.t 1)
@@ -391,6 +394,7 @@ bool Tracking::track() {
         std::cout << "Tracking: Insert New Keyframe (ID=" << current_frame_->id_ << ")" << std::endl;
         // Create new Keyframe
         auto kf = std::make_shared<Keyframe>(current_frame_);
+        setKeyframeGravity(kf);
         for (size_t i = 0; i < kf->landmarks_.size(); ++i) {
             auto& lm = kf->landmarks_[i];
             if (!lm || lm->isBad()) continue;
@@ -1511,7 +1515,9 @@ bool Tracking::reinitialize() {
     std::cout << "Tracking: Re-init triangulation starting..." << std::endl;
 
     auto kf_ref = std::make_shared<Keyframe>(reinit_reference_frame_);
+    setKeyframeGravity(kf_ref);
     auto kf_cur = std::make_shared<Keyframe>(current_frame_);
+    setKeyframeGravity(kf_cur);
 
     // Set poses - anchor the new segment to the last known good pose
     // This keeps the new segment in the same coordinate system as the existing map
@@ -1613,6 +1619,34 @@ bool Tracking::reinitialize() {
     std::cout << "Tracking: Re-init complete! " << inserted << " landmarks, "
               << map_->getAllKeyframes().size() << " total KFs" << std::endl;
     return true;
+}
+
+void Tracking::setKeyframeGravity(Keyframe::Ptr kf) {
+    if (!kf || !gravity_aligned_ || accel_buffer_.empty()) return;
+
+    // Find accelerometer readings near keyframe timestamp (±50ms window)
+    double ts = kf->timestamp_;
+    double window = 0.05;
+    std::vector<AccelEntry> nearby;
+    for (const auto& a : accel_buffer_) {
+        if (a.timestamp_sec >= ts - window && a.timestamp_sec <= ts + window) {
+            nearby.push_back(a);
+        }
+        if (a.timestamp_sec > ts + window) break;
+    }
+
+    if (nearby.size() < 3) return;
+    // Only apply gravity prior during low-dynamic-acceleration periods
+    // High threshold (5.0) to include most frames except high-acceleration moments
+    if (!AccelerometerProcessor::isStationary(nearby, 5.0)) return;
+
+    // Compute gravity direction in sensor frame, then transform to camera frame
+    Vec3 g_sensor = AccelerometerProcessor::estimateGravity(nearby);
+    if (g_sensor.norm() < 0.5) return;
+
+    // For TUM datasets, accelerometer frame ≈ camera frame (close enough for prior)
+    kf->gravity_in_camera_ = g_sensor.normalized();
+    kf->has_gravity_ = true;
 }
 
 }
