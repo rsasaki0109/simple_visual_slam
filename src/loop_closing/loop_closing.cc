@@ -516,14 +516,11 @@ void LoopClosing::correctLoop() {
         optimizer_edges.push_back(edge);
     }
 
-    // Signal tracking thread to avoid landmark/pose access during correction
-    // Set BEFORE poseGraphOptimization because it writes back to kf->T_cw_ and lm positions
-    map_->loop_correcting_.store(true);
-
-    // Brief sleep to allow tracking thread to notice the flag and finish its current iteration
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
     Optimizer::poseGraphOptimization(map_, optimizer_edges, 60);
+
+    // Protect structural modifications (landmark merge, covisibility graph update)
+    map_->loop_correcting_.store(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     fuseLoopLandmarks();
 

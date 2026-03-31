@@ -393,7 +393,12 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
                                       int iterations) {
     if (!map) return;
 
-    const auto& all_keyframes = map->getAllKeyframes();
+    // Snapshot keyframes to avoid concurrent modification from Tracking thread
+    std::map<unsigned long, Keyframe::Ptr> all_keyframes;
+    {
+        const auto& kf_ref = map->getAllKeyframes();
+        all_keyframes = kf_ref;  // copy
+    }
     if (all_keyframes.size() < 2) return;
 
     ceres::Problem problem;
@@ -525,17 +530,25 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
         kv.second->T_cw_ = SE3(q, t / scale);
     }
 
-    const auto& all_landmarks = map->getAllLandmarks();
+    // Snapshot landmarks to avoid concurrent modification
+    std::map<unsigned long, Landmark::Ptr> all_landmarks;
+    {
+        const auto& lm_ref = map->getAllLandmarks();
+        all_landmarks = lm_ref;
+    }
     for (const auto& kv : all_landmarks) {
         const auto& lm = kv.second;
         if (!lm || lm->isBad()) continue;
 
         Keyframe::Ptr reference_kf;
-        for (const auto& obs : lm->observations_) {
-            auto kf = obs.first.lock();
-            if (kf && old_poses.count(kf->id_)) {
-                reference_kf = kf;
-                break;
+        {
+            std::unique_lock<std::mutex> lm_lock(lm->mutex_);
+            for (const auto& obs : lm->observations_) {
+                auto kf = obs.first.lock();
+                if (kf && old_poses.count(kf->id_)) {
+                    reference_kf = kf;
+                    break;
+                }
             }
         }
         if (!reference_kf) continue;
