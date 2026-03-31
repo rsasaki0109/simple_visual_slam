@@ -200,3 +200,28 @@ endif()
 # App
 add_executable(run_mono apps/run_mono.cc)
 target_link_libraries(run_mono PRIVATE svslam_core)
+
+# Tests
+option(BUILD_TESTS "Build unit tests" ON)
+if(BUILD_TESTS)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+
+    add_executable(svslam_tests
+        tests/test_camera.cc
+        tests/test_landmark.cc
+        tests/test_map.cc
+        tests/test_optimizer.cc
+    )
+    target_link_libraries(svslam_tests PRIVATE svslam_core GTest::gtest_main)
+
+    include(GoogleTest)
+    gtest_discover_tests(svslam_tests)
+endif()

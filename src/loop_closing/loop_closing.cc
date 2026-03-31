@@ -429,9 +429,14 @@ bool LoopClosing::computeSim3() {
 void LoopClosing::mergeLandmarks(const Landmark::Ptr& target, const Landmark::Ptr& source) {
     if (!target || !source || target == source || source->isBad()) return;
 
+    // Deadlock-free double lock by ID ordering
+    auto& first_mtx = (target->id_ < source->id_) ? target->mutex_ : source->mutex_;
+    auto& second_mtx = (target->id_ < source->id_) ? source->mutex_ : target->mutex_;
+    std::lock_guard<std::mutex> lock1(first_mtx);
+    std::lock_guard<std::mutex> lock2(second_mtx);
+
     std::vector<std::pair<Keyframe::Ptr, size_t>> source_observations;
     {
-        std::unique_lock<std::mutex> lock(source->mutex_);
         for (const auto& obs : source->observations_) {
             auto kf = obs.first.lock();
             if (kf) {
