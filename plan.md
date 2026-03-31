@@ -1,147 +1,212 @@
-# 開発計画
+# SimpleVisualSLAM 開発計画
 
-SimpleVisualSLAM の現状整理と、今後の実装・検証を進めるための詳細計画です。
-この文書は「何を作るか」だけでなく、「すでに何が入っていて、次にどこを詰めるべきか」を共有するための運用用メモも兼ねます。
+## 1. ビジョン
 
-## 1. 現在地
+**「読めるSLAM」を目指す。**
 
-このリポジトリは、最小構成の単眼 Visual SLAM から出発しつつ、以下の要素まで実装が進んでいます。
+50k行のORB-SLAM3は正確だが読めない。DROID-SLAMはPyTorchの学習パイプラインを理解する前提がある。
+SimpleVisualSLAMは5k行のC++で、特徴点ベースSLAM + 深度センサー + DL深度推定 + 加速度計統合を
+一本のリポジトリで完結させる。ターゲットはSLAMを学びたいエンジニアと、
+既存OSSのGPLライセンスを避けたいプロダクト開発者。
 
-- 単眼トラッキング
-- 2-view 初期化 + Depth ベース単フレーム初期化
-- 局所マッピング + Depth 補助ランドマーク生成
-- 局所 BA（Depth Prior + Gravity Prior 付き）
-- ループ検出とループ補正（Metric Depth 対応 Sim3）
-- マップ保存 / 読み込み
-- EuRoC / TUM RGB-D の入力サポート
-- 深度センサー統合（TUM RGB-D depth.txt）
-- 加速度計統合（重力推定・アライメント・静止検知）
-- Deep Learning Depth 推定（Depth Anything v2 via ONNX Runtime）
-- 軌跡出力および評価レポート生成スクリプト
+**ライセンス: BSD-2-Clause（予定）**
 
-## 2. 評価結果
+## 2. 競合ポジション
 
-### TUM RGB-D ベンチマーク（ATE mean [m]、Sim3 alignment）
+### 2.1 Feature-based SLAM
 
-| Dataset | Mono | Depth | Depth+Accel | DL Depth | Target |
-|---------|------|-------|-------------|----------|--------|
-| fr1_xyz | 0.025 | 0.017 | **0.011** | 0.051 | <0.05 |
-| fr1_room | 0.816 | 0.291 | **0.214** | — | <0.30 |
+| Project | License | Approach | Strengths | Weaknesses |
+|---------|---------|----------|-----------|------------|
+| ORB-SLAM3 | GPL-3.0 | Feature | 最高精度、論文付き | GPL、50k行、読めない |
+| stella_vslam | BSD-2 | Feature | BSD、コミュニティ維持 | DL未統合、精度やや劣る |
+| **SimpleVisualSLAM** | **BSD-2** | **Feature+DL** | **DL Depth統合、5k行、教材向き** | **精度バラつき、データセット少** |
 
-**Key observations:**
-- Depth sensor: スケール不定性を解消、初期化を単フレームで完了
-- Accelerometer: 重力アライメントで座標系安定化、BA内の gravity prior で roll/pitch 拘束
-- DL Depth (Depth Anything v2 Small): sensor depth なしでも fr1_xyz で 0.051m（CPU推論、5フレームごと）
-- Loop closing: metric depth モードでは Sim3 スケール範囲を 0.85–1.15 に制限
+### 2.2 Direct / Deep SLAM（非GPL）
 
-## 3. 開発方針
+| Project | License | Approach | Notes |
+|---------|---------|----------|-------|
+| DROID-SLAM | BSD-3 | Deep (dense flow) | 最高精度級、Python/PyTorch、重い |
+| DPVO | MIT | Deep (patch VO) | DROID-SLAMより3x高速 |
+| SplaTAM | BSD-3 | 3DGS SLAM | 高品質rendering、0.3-0.5 FPS |
+| Gaussian-SLAM | MIT | 3DGS sub-map | DROID-SLAMでtracking |
+| NICE-SLAM | Apache-2.0 | NeRF implicit | 先駆的、後続に抜かれた |
+| GO-SLAM | Apache-2.0 | NeRF + global opt | RGB/RGBD対応 |
+| Point-SLAM | Apache-2.0 | Neural point cloud | rendering + tracking両立 |
+| Basalt | BSD-3 | Direct VIO | EuRoC/TUM-VI向き |
+| Kimera-VIO | BSD-2 | Feature VIO + mesh | MIT SPARK Lab |
 
-このプロジェクトでは、広いリファクタよりも「小さく作って、実データで確認し、必要な点だけを補強する」方針を取ります。
+### 2.3 差別化ポイント
 
-- 既存のモジュール境界を活かし、Tracking / LocalMapping / LoopClosing / IO を中心に拡張する。
-- 新機能追加よりも、まずは既存機能の破綻条件を減らす。
-- 動画入力で見た目が動くことより、データセットで軌跡を比較できることを優先する。
-- 数学的に重要な変数名や記法は維持し、可読性を崩す変更は避ける。
+1. **C++ネイティブ + DL深度**: Python系Deep SLAMと違い、C++でONNX Runtimeを使うので組込み系にも展開可
+2. **Depth Anything v2統合済み**: センサーdepthなしでも動く単眼DL-SLAMはOSSでほぼない
+3. **段階的に構築したgit履歴**: コミット履歴がそのままチュートリアル
+4. **5k行**: ORB-SLAM3の1/10、stella_vslamの1/6
 
-## 4. フェーズ別計画
+## 3. 現在の実装状態
 
-### Phase 1: 基本構造とデータ型 (完了)
+### 3.1 完了済み機能
 
-- [x] `Camera`, `Frame`, `Keyframe`, `Landmark`, `Map` の定義
-- [x] 単眼入力を扱うための最小アプリケーション `apps/run_mono.cc` の作成
-- [x] ORB 特徴抽出の統合
-- [x] Sophus ベースの姿勢表現導入
-- [x] `MapIO` の基本枠組み作成
+- [x] ORB特徴点抽出・マッチング
+- [x] 2フレーム初期化 (H/F行列)
+- [x] 等速モデル + 参照KFトラッキング + 局所マップトラッキング
+- [x] 局所BA (Ceres, Depth Prior, Gravity Prior)
+- [x] DBoW2ループ検出 + Sim3ポーズグラフ最適化
+- [x] マップ保存/読み込み
+- [x] EuRoC / TUM RGB-D入力
+- [x] 深度センサー統合（単フレーム初期化、depth-assisted mapping）
+- [x] 加速度計統合（重力推定・アライメント、静止検知）
+- [x] DL深度推定（Depth Anything v2, ONNX Runtime）
+- [x] ループ補正スレッド安全性（KF/LMスナップショット方式）
+- [x] 評価スクリプト（eval_all.sh, HTML軌跡レポート, 3Dマップビューア）
 
-### Phase 2: トラッキング (完了)
+### 3.2 精度実績
 
-- [x] 等速運動モデルによる初期姿勢予測
-- [x] 参照キーフレームに対する特徴マッチング
-- [x] 局所地図ランドマークの投影による追跡補強
-- [x] `SolvePnPRansac` を使った姿勢推定
-- [x] キーフレーム挿入判定の基本実装
+| Dataset | Mono | +Depth | +Depth+Accel | +DL Depth |
+|---------|------|--------|--------------|-----------|
+| Seq A (small motion) | 0.023 | 0.011 | 0.011 | 0.051 |
+| Seq B (room-scale) | 0.845 | 0.227 | 0.235 | — |
 
-### Phase 3: 単眼初期化 (完了)
+※ ATE mean [m], Sim3 alignment。非決定的要因あり（ループ検出タイミング依存）
 
-- [x] 2 フレーム間のホモグラフィ / 基本行列推定
-- [x] モデル選択と相対運動 `(R, t)` の復元
-- [x] 三角測量による初期ランドマーク生成
-- [x] 初期 2 キーフレームと Map の構築
-
-### Phase 4: 局所マッピング (完了)
-
-- [x] キーフレーム挿入 + 共視関係の更新
-- [x] 新規ランドマークの三角測量
-- [x] 品質の低いマップポイントの間引き
-- [x] Ceres を用いた局所 BA
-
-### Phase 5: ループクロージャ (完了)
-
-- [x] DBoW2 統合
-- [x] 候補キーフレーム検索 + 幾何検証
-- [x] ループ拘束の生成 + Sim3 ポーズグラフ最適化
-- [x] Metric depth 対応（スケール範囲制限 + スケール重み強化）
-
-### Phase 6: 永続化 (完了)
-
-- [x] Keyframe / Landmark / Graph を含むマップ保存
-- [x] マップ読み込み
-
-### Phase 7: データセット対応と評価基盤 (完了)
-
-- [x] EuRoC / TUM RGB-D データセット入力
-- [x] オンライン軌跡 / キーフレーム軌跡の TUM 形式出力
-- [x] TUM 用 HTML レポート + 3D マップビューア生成スクリプト
-- [x] `scripts/eval_all.sh` 全モード一括評価スクリプト
-
-### Phase 8: Depth + IMU 統合 (完了)
-
-**Phase 8.0: データ基盤**
-- [x] TUM depth.txt / accelerometer.txt パーサー
-- [x] タイムスタンプベース depth-RGB アソシエーション（±30ms tolerance）
-- [x] `--depth` / `--accel` CLI フラグ
-
-**Phase 8.1: Depth 統合**
-- [x] 単フレーム depth back-projection 初期化（`initializeWithDepth`）
-- [x] Depth 補助ランドマーク生成（`createLandmarksFromDepth`）
-- [x] DepthPriorError コスト関数（sensor: σ=0.02m, DL: σ=0.2m）
-- [x] Metric depth 対応ループクロージャ
-
-**Phase 8.2: Accelerometer 統合**
-- [x] 重力推定 + Rodrigues アライメント
-- [x] 静止検知による motion model override
-- [x] GravityPriorError コスト関数（BA 内 roll/pitch 拘束）
-- [x] Keyframe ごとの gravity_in_camera_ 計算
-
-**Phase 8.3: DL Depth (ONNX Runtime)**
-- [x] DepthEstimator 抽象基底クラス
-- [x] OnnxDepthEstimator（Depth Anything v2, 518×518 入力, ImageNet 正規化）
-- [x] `--depth-model <path.onnx>` CLI フラグ
-- [x] CMake `USE_DEPTH_DL` オプション + FetchContent auto-download
-- [x] フレームスキップ（5フレーム間隔）で CPU 推論コスト削減
-- [x] Sensor depth 優先、DL depth フォールバック
-
-## 5. アーキテクチャ概要
+### 3.3 アーキテクチャ
 
 ```
-apps/run_mono.cc          # エントリポイント、CLI パース、メインループ
-src/core/                 # Frame, Keyframe, Landmark, Map, Camera
-src/tracking/             # Tracking (motion model, reference KF, local map)
-src/backend/              # LocalMapping, Optimizer (BA, PoseGraph, GlobalBA)
-src/loop_closing/         # LoopClosing (DBoW2, Sim3, pose correction)
-src/io/                   # TumRgbdDataset, EurocDataset, MapIO
-src/sensors/              # AccelerometerProcessor
-src/depth/                # DepthEstimator, OnnxDepthEstimator
-scripts/                  # 評価・レポート生成スクリプト
+apps/run_mono.cc              メインループ、CLI
+src/core/                     Frame, Keyframe, Landmark, Map, Camera
+src/tracking/                 Tracking (motion model, ref KF, local map)
+src/backend/                  LocalMapping, Optimizer (BA, PoseGraph)
+src/loop_closing/             LoopClosing (DBoW2, Sim3, fuse, correct)
+src/io/                       TumRgbdDataset, EurocDataset, MapIO
+src/sensors/                  AccelerometerProcessor
+src/depth/                    DepthEstimator, OnnxDepthEstimator
+scripts/                      評価・レポート生成
 ```
+
+## 4. ロードマップ
+
+### Phase A: stella_vslam同等の品質基盤（最優先）
+
+**目標: 安定性と再現性でstella_vslamに並ぶ**
+
+- [ ] A-1: 精度安定化
+  - ループ検出の決定論的シード導入（ORB抽出のランダム性排除）
+  - BA収束条件の厳密化
+  - trackLocalMap中のoutlier rejection強化
+  - 目標: 同一入力で±15%以内のATE変動
+
+- [ ] A-2: 追加データセット検証（最低5シーケンス）
+  - 既存: Seq A (small), Seq B (room)
+  - 追加: 大規模環境、高速移動、低テクスチャの各パターン
+  - 各モード (mono/depth/depth+accel/DL depth) で全シーケンス評価
+
+- [ ] A-3: テスト・CI
+  - ユニットテスト: Frame/Keyframe/Landmark/Map/Camera
+  - 統合テスト: 合成データでトラッキング精度確認
+  - GitHub Actions: ビルド確認 + 基本テスト（データセット不要分）
+
+- [ ] A-4: README + 使い方ドキュメント
+  - 英語README (日本語は別ファイル)
+  - ビルド手順、依存関係、実行例
+  - 結果テーブル + アーキテクチャ図
+  - stella_vslamのREADMEと同等の見栄えを目標
+
+### Phase B: DL深度の差別化強化
+
+**目標: 「Depth Anything統合SLAM」として唯一のOSSになる**
+
+- [ ] B-1: DL Depth精度改善
+  - Metric3D v2 / UniDepth v2 対応（metric scaleの直接推定）
+  - depth_is_metric_ = true で動作するDLモデル → sensor depthと同等の精度
+  - モデル切替: Depth Anything v2 (relative) / Metric3D (metric) を選択可
+
+- [ ] B-2: DL Depth推論高速化
+  - ONNX Runtime CUDA ExecutionProvider 対応
+  - TensorRT対応 (optional)
+  - キーフレームのみ推論 → 初期化時のみフル解像度、以降は1/2解像度
+
+- [ ] B-3: DL Depth単体モードの精度向上
+  - DL depthのconfidence map活用（低信頼領域をBA対象から除外）
+  - 時間的consistency: 前フレームのdepthとの整合性チェック
+  - 目標: sensor depthの2倍以内の精度
+
+### Phase C: 堅牢性の本格強化
+
+**目標: 長時間実行で落ちないSLAM**
+
+- [ ] C-1: スレッド安全性の体系的改善
+  - Landmark::observations_ のロック戦略統一
+  - Map操作のread-write lock導入
+  - LocalMapping ↔ LoopClosing の排他制御見直し
+
+- [ ] C-2: 再ローカライズの改善
+  - BoW-based place recognition による失敗回復
+  - マップの部分再利用
+
+- [ ] C-3: メモリ管理
+  - 古いキーフレーム/ランドマークの間引き
+  - 長尺シーケンスでのメモリ使用量制限
+
+### Phase D: 拡張機能
+
+**目標: stella_vslamを超える機能セット**
+
+- [ ] D-1: Stereo入力対応
+  - ステレオペアからのdepth生成
+  - 左右画像の特徴マッチング
+
+- [ ] D-2: IMU tight coupling（オプション）
+  - 加速度計/ジャイロのpre-integration
+  - BA内でのIMU residual
+  - VIO (Visual-Inertial Odometry) モード
+
+- [ ] D-3: 3D Gaussian Splatting マッピング（実験的）
+  - キーフレーム + depth → 3DGSシーン構築
+  - SplaTAM/Gaussian-SLAM的なアプローチをC++で
+  - rendering品質の可視化
+
+- [ ] D-4: ROS 2ノード化
+  - sensor_msgs/Image, sensor_msgs/Imu 対応
+  - tf2によるpose publish
+  - rqiz可視化
+
+### Phase E: コミュニティ・ドキュメント
+
+- [ ] E-1: チュートリアル記事
+  - 「5000行で作る Visual SLAM」シリーズ
+  - Phase別に解説（初期化 → トラッキング → BA → ループ → DL Depth）
+  - git commitを追えば段階的に理解できる構成
+
+- [ ] E-2: API文書
+  - Doxygenコメント追加
+  - 主要クラスのインタフェース仕様
+
+- [ ] E-3: Contributing guide
+  - コーディング規約
+  - PRテンプレート
+  - Issue テンプレート
+
+## 5. 依存関係とライセンス
+
+| 依存 | License | 用途 | 必須/オプション |
+|------|---------|------|----------------|
+| OpenCV 4.5+ | Apache-2.0 | 画像処理、特徴抽出 | 必須 |
+| Ceres Solver | BSD-3 | BA、ポーズグラフ最適化 | 必須 |
+| Sophus | MIT | SE3/Sim3 Lie群 | 必須 |
+| Eigen3 | MPL-2.0 | 線形代数 | 必須 |
+| DBoW2 | BSD (modified) | BoWループ検出 | オプション |
+| ONNX Runtime | MIT | DL深度推定 | オプション |
+| fmt | MIT | ログ出力 (将来) | オプション |
+
+**全依存がBSD/MIT/Apache互換。GPL汚染なし。**
 
 ## 6. ビルドと実行
 
 ```bash
 # 基本ビルド
-cd build && cmake .. && make -j$(nproc)
+mkdir build && cd build
+cmake .. && make -j$(nproc)
 
-# DL Depth 付きビルド
+# DL Depth付きビルド
 cmake .. -DUSE_DEPTH_DL=ON && make -j$(nproc)
 
 # 実行例
@@ -152,10 +217,36 @@ cmake .. -DUSE_DEPTH_DL=ON && make -j$(nproc)
 bash ../scripts/eval_all.sh
 ```
 
-## 7. 今後の方向性
+## 7. 優先順位の考え方
 
-- [ ] 追加データセット（fr2_desk, fr3_long_office）での検証
-- [ ] EuRoC での評価パイプライン整備
-- [ ] DL Depth の GPU 推論（CUDA provider）
-- [ ] 閾値群の設定ファイル化
-- [ ] 長尺シーケンスでのメモリ・スレッド安定性確認
+```
+安定性 > 精度 > 機能数 > 速度 > 見栄え
+```
+
+理由:
+- 不安定なSLAMは使われない
+- 精度が出なければ存在意義がない
+- 機能が少なくても正確なら使い道がある
+- 速度は後から最適化できる
+- 見栄えはREADMEとデモで十分
+
+## 8. 非目標
+
+現時点では以下を優先しない:
+
+- リアルタイムAR/VR向けの低レイテンシ最適化
+- 商用グレードの堅牢化
+- Web UI / GUI可視化ツール
+- LiDAR, Event Camera対応
+- 大規模環境（数km規模）のマッピング
+
+## 9. この文書の運用
+
+以下のタイミングで更新する:
+
+- Phaseの完了時
+- 方針変更時
+- 新しい競合OSSの出現時
+- ベンチマーク結果の大幅な変化時
+
+目的: 「次に何をすべきか」を迷わない状態を維持すること。
