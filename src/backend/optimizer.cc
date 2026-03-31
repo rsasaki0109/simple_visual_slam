@@ -246,7 +246,8 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         problem.SetParameterUpperBound(param, 2, position_bound);
         
         // Add Residuals
-        // Iterate observations
+        // Iterate observations (lock to prevent concurrent modification)
+        std::lock_guard<std::mutex> obs_lock(lm->mutex_);
         for (const auto& obs : lm->observations_) {
             auto kf = obs.first.lock();
             if (!kf) continue;
