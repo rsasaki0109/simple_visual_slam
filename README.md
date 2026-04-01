@@ -1,107 +1,220 @@
 # SimpleVisualSLAM
 
-C++17で実装された最小限の単眼Visual SLAM実装。
-
-## ライセンス
-
-MIT License.
-
-## 依存関係
-
-- **OpenCV** (必須)
-- **Ceres Solver** (必須 - 最適化フェーズで有効化)
-- **Sophus** (必須)
-- **DBoW2** (必須 - Loop Closure用)
-
-## ビルド
-
-```bash
-mkdir build
-cd build
-cmake ..
-make
-```
-
-## 使用方法
-
-```bash
-# ビデオファイルの場合
-./run_mono path/to/video.mp4 [vocab_path]
-
-# EuRoC dataset の場合（正攻法: 画像列 + timestamps + intrinsics）
-./run_mono --euroc /path/to/MH_01_easy [vocab_path]
-
-# カメラの場合 (ID指定)
-./run_mono 0
-```
-
-### サンプル実行
-
-リポジトリにはサンプル動画 `tree.avi` (OpenCV sample) を使用した実行結果が含まれています。
-
-```bash
-./run_mono tree.avi
-```
-
-実行後、`slam_result.jpg` が生成されます。
-
-### EuRoC dataset
-
-Tracking / Mapping のデバッグには、カメラ内パラとタイムスタンプが付属する EuRoC の利用を推奨します。
-
-- https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets
-
-#### フォルダ構成（例）
-
-`--euroc` にはシーケンス直下（例: `MH_01_easy`）を渡してください。
-
-```
-MH_01_easy/
-  mav0/
-    cam0/
-      sensor.yaml
-      data.csv
-      data/
-        1403636579763555584.png
-        ...
-```
-
-この実装は `mav0/cam0` のみを読み込みます（単眼）。
-
-## ORB Vocabulary
-
-ループクロージャ（DBoW2）を有効化するには ORB の語彙ファイル（例: `ORBvoc.txt`）が必要です。
-
-このリポジトリでは語彙ファイルは配布しません。各自で入手して `data/ORBvoc.txt` に配置してください。
-
-例（ORB-SLAM2 配布の語彙）:
-
-- https://github.com/raulmur/ORB_SLAM2
-
-### ダウンロード例（Linux）
-
-以下は ORB-SLAM2 の配布物から `ORBvoc.txt` を取得して `data/ORBvoc.txt` に配置する例です。
-
-```bash
-mkdir -p data
-curl -L -o ORBvoc.txt.tar.gz https://github.com/raulmur/ORB_SLAM2/raw/master/Vocabulary/ORBvoc.txt.tar.gz
-tar -xzf ORBvoc.txt.tar.gz -C data
-```
-
-上記で `data/ORBvoc.txt` が作成されます。
-
-デフォルトでは `data/ORBvoc.txt`（存在すれば）を読み込みます。別パスを使う場合は第2引数で指定してください。
-
-### 実行結果例
+A lightweight, readable visual SLAM system with deep learning depth integration.
 
 ![SLAM Result](slam_result.jpg)
 
-## 機能 (計画)
+## Features
 
-- [x] 基本データ構造 (Frame, Keyframe, Map, Camera)
-- [x] ORB特徴抽出
-- [ ] トラッキング (等速運動モデル, 参照KF)
-- [ ] 初期化 (単眼)
-- [ ] 局所マッピング (Local BA)
-- [ ] ループクロージャ (DBoW2 + Pose Graph)
-- [ ] マップ保存/読み込み
+- **Monocular visual SLAM** with ORB feature extraction and matching
+- **Depth sensor integration** -- single-frame initialization and depth-assisted bundle adjustment
+- **Deep learning depth estimation** -- Depth Anything v2 via ONNX Runtime for metric-scale monocular operation
+- **Accelerometer integration** -- gravity-aligned coordinate frames and stationary detection
+- **Loop closing** -- DBoW2 place recognition with Sim(3) pose graph optimization
+- **Map persistence** -- save and load maps for relocalization across sessions
+- **~6,000 lines of C++** -- designed to be readable and educational rather than maximally optimized
+- **BSD-2-Clause license** -- all dependencies are GPL-free
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Main Thread
+        A[Video / Dataset Input] --> B[Frame]
+        B --> C[ORB Extraction]
+        C --> D[Tracking]
+    end
+
+    subgraph Mapping Thread
+        D -- new Keyframe --> E[Local Mapping]
+        E -- triangulate --> F[New Landmarks]
+        E -- optimize --> G[Local Bundle Adjustment]
+    end
+
+    subgraph Loop Closing Thread
+        E -- Keyframe --> H[Loop Detection<br/>DBoW2]
+        H -- candidate --> I[Sim3 Verification]
+        I -- loop found --> J[Pose Graph Optimization]
+        J -- correction --> K[Map Update]
+    end
+
+    D <--> L[(Map<br/>Keyframes + Landmarks)]
+    E <--> L
+    J <--> L
+```
+
+**Data flow summary:**
+1. Each incoming image is converted into a `Frame` with ORB keypoints and descriptors.
+2. **Tracking** estimates the camera pose by matching against the local map (constant-velocity model, then reference keyframe, then local map tracking).
+3. When a new keyframe is created, the **Local Mapping** thread triangulates new landmarks and runs local bundle adjustment via Ceres Solver.
+4. The **Loop Closing** thread queries the DBoW2 database for place-recognition candidates, verifies them with Sim(3) alignment, and distributes the accumulated drift across the pose graph.
+
+## Results
+
+Absolute Trajectory Error (ATE) mean in meters, evaluated with Sim(3) alignment:
+
+| Sequence | Monocular | + Depth | + Depth + Accel |
+|---|---|---|---|
+| Indoor Desk (small motion) | 0.023 | 0.011 | 0.011 |
+| Indoor Room (room-scale) | 0.845 | 0.227 | 0.235 |
+
+Depth sensor integration significantly improves metric-scale accuracy. Accelerometer data provides gravity alignment and helps with stationary detection but shows marginal improvement when depth is already available.
+
+## Dependencies
+
+**Required:**
+- [OpenCV](https://opencv.org/) 4.5+
+- [Eigen3](https://eigen.tuxfamily.org/)
+
+**Auto-fetched via CMake FetchContent (no manual installation needed):**
+- [Ceres Solver](http://ceres-solver.org/) 2.1+
+- [Sophus](https://github.com/strasdat/Sophus) (Lie group library)
+- [DBoW2](https://github.com/dorian3d/DBoW2) (bag-of-words for loop closing)
+
+**Optional (auto-fetched when enabled):**
+- [ONNX Runtime](https://onnxruntime.ai/) (for deep learning depth estimation)
+
+## Build
+
+Tested on Ubuntu 22.04 with GCC 11+.
+
+```bash
+# Install system dependencies
+sudo apt install libopencv-dev libeigen3-dev libgoogle-glog-dev libgflags-dev
+
+# Build
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+```
+
+The first build may take several minutes as CMake fetches and compiles Ceres Solver, Sophus, and DBoW2 automatically.
+
+### Build Options
+
+| CMake Option | Default | Description |
+|---|---|---|
+| `USE_DBOW2` | `ON` | Enable DBoW2 for loop closing |
+| `USE_DEPTH_DL` | `OFF` | Enable deep learning depth estimation (fetches ONNX Runtime) |
+
+Example with all features enabled:
+
+```bash
+cmake .. -DUSE_DEPTH_DL=ON
+make -j$(nproc)
+```
+
+## Usage
+
+### Video File
+
+```bash
+./build/run_mono path/to/video.mp4
+```
+
+### Image Sequence Dataset
+
+```bash
+# EuRoC-format dataset (cam0/data/ with timestamps)
+./build/run_mono --euroc /path/to/sequence_dir
+
+# TUM RGB-D format dataset
+./build/run_mono --tum /path/to/sequence_dir
+```
+
+### With ORB Vocabulary (enables loop closing)
+
+```bash
+# Vocabulary path as last argument
+./build/run_mono path/to/video.mp4 data/ORBvoc.txt
+./build/run_mono --euroc /path/to/sequence_dir data/ORBvoc.txt
+./build/run_mono --tum /path/to/sequence_dir data/ORBvoc.txt
+```
+
+If no vocabulary path is given, the system looks for `data/ORBvoc.txt` by default. If the file is not found, loop closing is disabled and the system runs without it.
+
+### Output
+
+- **`trajectory.txt`** -- estimated camera trajectory (timestamp, x, y, z)
+- **`map.bin`** -- serialized map for later reuse
+- **`slam_result.jpg`** -- visualization snapshot
+
+### Keyboard Controls
+
+- `Esc` -- stop processing
+
+## ORB Vocabulary
+
+Loop closing requires an ORB vocabulary file. This repository does not distribute one. You can obtain `ORBvoc.txt` from the ORB-SLAM2 project:
+
+```bash
+mkdir -p data
+curl -L -o ORBvoc.txt.tar.gz \
+    https://github.com/raulmur/ORB_SLAM2/raw/master/Vocabulary/ORBvoc.txt.tar.gz
+tar -xzf ORBvoc.txt.tar.gz -C data
+rm ORBvoc.txt.tar.gz
+```
+
+This places the vocabulary at `data/ORBvoc.txt`, which is the default search path.
+
+## Deep Learning Depth Estimation
+
+SimpleVisualSLAM can use [Depth Anything v2](https://github.com/DepthAnything/Depth-Anything-V2) to predict dense depth maps from monocular images via ONNX Runtime. This enables metric-scale reconstruction without a physical depth sensor.
+
+### Download the ONNX Model
+
+```bash
+mkdir -p models
+# Download Depth Anything v2 Small (recommended for real-time use)
+wget -O models/depth_anything_v2_small.onnx \
+    https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx
+```
+
+### Build with DL Depth
+
+```bash
+mkdir build && cd build
+cmake .. -DUSE_DEPTH_DL=ON
+make -j$(nproc)
+```
+
+### Run with DL Depth
+
+```bash
+./build/run_mono --depth-model models/depth_anything_v2_small.onnx path/to/video.mp4
+```
+
+When enabled, the system runs depth inference on each keyframe and uses the predicted depth to:
+- Initialize the map from a single frame (no two-view initialization required)
+- Add depth priors to bundle adjustment for improved scale consistency
+
+## Project Structure
+
+```
+SimpleVisualSLAM/
+├── apps/
+│   └── run_mono.cc            # Main application entry point
+├── src/
+│   ├── core/                  # Camera, Frame, Keyframe, Landmark, Map
+│   ├── tracking/              # Tracking, Initializer
+│   ├── backend/               # Local Mapping, Bundle Adjustment (Ceres)
+│   ├── loop_closing/          # Loop detection + Sim3 pose graph optimization
+│   └── io/                    # Dataset readers, Map serialization
+├── cmake/                     # CMake modules
+└── CMakeLists.txt
+```
+
+## License
+
+This project is licensed under the [BSD 2-Clause License](LICENSE).
+
+## Acknowledgements
+
+SimpleVisualSLAM builds on the following open source projects:
+
+- [OpenCV](https://opencv.org/) -- feature extraction, image processing, visualization
+- [Ceres Solver](http://ceres-solver.org/) -- bundle adjustment and nonlinear optimization
+- [Sophus](https://github.com/strasdat/Sophus) -- Lie group (SE3/Sim3) operations
+- [DBoW2](https://github.com/dorian3d/DBoW2) -- bag-of-words place recognition for loop closing
+- [ONNX Runtime](https://onnxruntime.ai/) -- deep learning inference for depth estimation
+- [Depth Anything v2](https://github.com/DepthAnything/Depth-Anything-V2) -- monocular depth estimation model
