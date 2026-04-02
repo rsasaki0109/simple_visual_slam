@@ -27,6 +27,7 @@ public:
     void insertKeyframe(Keyframe::Ptr kf);
     void run(); // Main loop
     void requestStop();
+    void processPendingWork();
 
     // Callback for BA completion notification
     std::function<void()> on_ba_completed_;

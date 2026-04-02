@@ -317,8 +317,8 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         if (pose_params.find(kf->id_) == pose_params.end()) continue;
         if (problem.IsParameterBlockConstant(pose_params[kf->id_])) continue;
 
-        // Weight: moderate — gravity measurement is noisy but constrains 2 DOF
-        double gravity_weight = 5.0;
+        // Gravity is only approximately camera-aligned on TUM, so keep this prior soft.
+        double gravity_weight = 2.0;
         ceres::CostFunction* gravity_cost = GravityPriorError::Create(
             kf->gravity_in_camera_.x(), kf->gravity_in_camera_.y(), kf->gravity_in_camera_.z(),
             gravity_weight);

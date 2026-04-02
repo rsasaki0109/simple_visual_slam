@@ -454,7 +454,7 @@ void LoopClosing::mergeLandmarks(const Landmark::Ptr& target, const Landmark::Pt
         std::unique_lock<std::mutex> kf_lock(kf->mutex_);
         if (!kf->landmarks_[idx] || kf->landmarks_[idx] == source) {
             kf->landmarks_[idx] = target;
-            target->addObservation(kf, idx);
+            target->observations_[kf] = idx;
         }
     }
 
