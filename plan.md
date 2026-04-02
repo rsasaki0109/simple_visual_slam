@@ -413,7 +413,7 @@ ctest --output-on-failure
 | Task | Status | 内容 |
 |------|--------|------|
 | A-1 | ✅完了 | ORB決定論化、BA収束強化、2パスPnP |
-| A-2 | 未着手 | 追加データセット検証（5+シーケンス） |
+| A-2 | 進行中 | 追加データセット検証（`--repeat N` 実装済み、追加シーケンス収集中） |
 | A-3 | ✅完了 | Google Test導入、4テストファイル |
 | A-4 | ✅完了 | 英語README（Mermaid図、結果テーブル） |
 
@@ -423,8 +423,8 @@ ctest --output-on-failure
 
 **タスク:**
 1. 追加データセットを入手（大規模環境、高速移動、低テクスチャ）
-2. eval_all.sh に `--repeat N` オプション追加（N回実行してmean/std出力）
-3. 結果テーブルをREADME.mdに反映
+2. ✅ `eval_all.sh` に `--repeat N` オプション追加（N回実行してmean/std出力）
+3. ✅ 結果テーブルと評価手順をREADME.mdに反映
 
 **注意:** データセット名はREADME/plan.mdで伏せる（"Seq A/B/C..."）
 

@@ -38,17 +38,19 @@ void LocalMapping::run() {
             if (stop_requested_) break;
         }
         
-        // Process all available keyframes (or maybe just one by one?)
-        if (checkNewKeyframes()) {
-            processNewKeyframe();
-            mapPointCulling();
-            createNewMapPoints();
-            current_processed_kf_->updateConnections();
-            
-            optimization(); 
-        }
+        processPendingWork();
     }
     std::cout << "LocalMapping thread stopped." << std::endl;
+}
+
+void LocalMapping::processPendingWork() {
+    while (checkNewKeyframes()) {
+        processNewKeyframe();
+        mapPointCulling();
+        createNewMapPoints();
+        current_processed_kf_->updateConnections();
+        optimization();
+    }
 }
 
 bool LocalMapping::checkNewKeyframes() {

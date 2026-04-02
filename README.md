@@ -51,14 +51,30 @@ flowchart LR
 
 ## Results
 
-Absolute Trajectory Error (ATE) mean in meters, evaluated with Sim(3) alignment:
+Absolute Trajectory Error (ATE) mean in meters, evaluated with Sim(3) alignment. The table below is a single-run snapshot; for repeated evaluation, run `bash scripts/eval_all.sh --repeat N` to export aggregate `mean/std` summaries into `eval_results/summary.txt`.
 
 | Sequence | Monocular | + Depth | + Depth + Accel |
 |---|---|---|---|
-| Indoor Desk (small motion) | 0.023 | 0.011 | 0.011 |
-| Indoor Room (room-scale) | 0.845 | 0.227 | 0.235 |
+| Seq A (small motion) | 0.023 | 0.011 | 0.011 |
+| Seq B (room-scale) | 0.845 | 0.227 | 0.235 |
 
 Depth sensor integration significantly improves metric-scale accuracy. Accelerometer data provides gravity alignment and helps with stationary detection but shows marginal improvement when depth is already available.
+
+## Experiment Status
+
+The reference-keyframe policy work now lives as a compareable experiment surface rather than a one-off implementation tweak.
+
+- GitHub landing page: [docs/index.md](docs/index.md)
+- Decision record: [docs/decisions.md](docs/decisions.md)
+- Full experiment tables: [docs/experiments.md](docs/experiments.md)
+- Minimal surviving interface: [docs/interfaces.md](docs/interfaces.md)
+
+Current snapshot:
+
+- Curated corpus accuracy: `score` and `pipeline` tie at `0.929`
+- Bounded real-trace replay: `score` is the current overall best
+- Full repeat-2 replay: `score` stays best overall, but no single policy wins every mode
+- Runtime default remains `heuristic` until one policy wins across curated, replay, and repeat gates
 
 ## Dependencies
 
@@ -103,6 +119,14 @@ Example with all features enabled:
 cmake .. -DUSE_DEPTH_DL=ON
 make -j$(nproc)
 ```
+
+### Repeated Evaluation
+
+```bash
+bash scripts/eval_all.sh --repeat 5
+```
+
+This runs each dataset/mode pair five times, keeps per-run trajectories and logs in `eval_results/`, and writes aggregate `mean/std` ATE statistics to `eval_results/summary.txt`.
 
 ## Usage
 
