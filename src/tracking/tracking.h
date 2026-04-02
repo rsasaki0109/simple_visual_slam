@@ -3,9 +3,11 @@
 #include "core/common.h"
 #include "core/frame.h"
 #include "core/map.h"
+#include "core/reference_keyframe_policy.h"
 #include "tracking/initializer.h"
 #include "backend/local_mapping.h"
 #include "io/tum_dataset.h"
+#include <memory>
 #include <mutex>
 
 namespace svslam {
@@ -27,6 +29,7 @@ public:
 
     void setMap(std::shared_ptr<Map> map);
     void setLocalMapping(std::shared_ptr<LocalMapping> local_mapping);
+    void setReferenceKeyframePolicy(std::unique_ptr<ReferenceKeyframePolicy> policy);
     bool addFrame(Frame::Ptr frame);
 
     // Callback from LocalMapping when BA is completed
@@ -52,6 +55,7 @@ public:
     int frames_since_last_kf_ = 0;
     int consecutive_tracking_failures_ = 0;
     Keyframe::Ptr reference_keyframe_;
+    Keyframe::Ptr previous_reference_keyframe_;
 
     // Accelerometer data for gravity alignment and stationary detection
     std::vector<AccelEntry> accel_buffer_;
@@ -68,6 +72,7 @@ private:
     void recomputeCurrentPose();
     bool relocalize();  // Attempt to recover from tracking loss
     bool reinitialize();  // Re-initialize from scratch when lost for too long
+    void setReferenceKeyframe(Keyframe::Ptr kf);
     void setKeyframeGravity(Keyframe::Ptr kf);  // Set gravity from accel data
 
     cv::Ptr<cv::DescriptorMatcher> matcher_;
@@ -76,6 +81,7 @@ private:
     int lost_frame_count_ = 0;
     static constexpr int max_lost_frames_ = 30;  // Max frames before giving up
     SE3 last_good_pose_;  // Last known good T_cw pose before tracking loss
+    std::unique_ptr<ReferenceKeyframePolicy> reference_keyframe_policy_;
 
     // Re-initialization state
     Frame::Ptr reinit_reference_frame_;

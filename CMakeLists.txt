@@ -154,6 +154,29 @@ else()
 endif()
 
 # Core Library
+add_library(svslam_reference_policy_core
+    src/core/heuristic_reference_keyframe_policy.cc
+)
+
+target_include_directories(svslam_reference_policy_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:include>
+)
+
+add_library(svslam_reference_policy_experiments
+    src/experiments/reference_keyframe/score_reference_keyframe_policy.cc
+    src/experiments/reference_keyframe/pipeline_reference_keyframe_policy.cc
+)
+
+target_include_directories(svslam_reference_policy_experiments PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(svslam_reference_policy_experiments PUBLIC
+    svslam_reference_policy_core
+)
+
 add_library(svslam_core
     src/core/camera.cc
     src/core/frame.cc
@@ -177,6 +200,7 @@ target_include_directories(svslam_core PUBLIC
 )
 
 target_link_libraries(svslam_core PUBLIC
+    svslam_reference_policy_core
     ${OpenCV_LIBS}
     Ceres::ceres
     Sophus::Sophus
@@ -199,7 +223,15 @@ endif()
 
 # App
 add_executable(run_mono apps/run_mono.cc)
-target_link_libraries(run_mono PRIVATE svslam_core)
+target_link_libraries(run_mono PRIVATE svslam_core svslam_reference_policy_experiments)
+
+add_executable(reference_policy_experiments
+    tools/reference_policy_experiments.cc
+)
+target_link_libraries(reference_policy_experiments PRIVATE svslam_reference_policy_experiments)
+target_include_directories(reference_policy_experiments PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 # Tests
 option(BUILD_TESTS "Build unit tests" ON)
@@ -219,8 +251,13 @@ if(BUILD_TESTS)
         tests/test_landmark.cc
         tests/test_map.cc
         tests/test_optimizer.cc
+        tests/test_reference_keyframe_policy.cc
     )
-    target_link_libraries(svslam_tests PRIVATE svslam_core GTest::gtest_main)
+    target_link_libraries(svslam_tests PRIVATE
+        svslam_core
+        svslam_reference_policy_experiments
+        GTest::gtest_main
+    )
 
     include(GoogleTest)
     gtest_discover_tests(svslam_tests)

@@ -11,7 +11,7 @@ void Landmark::setPos(const Vec3& pos) {
 }
 
 Vec3 Landmark::getPos() const {
-    // std::unique_lock<std::mutex> lock(mutex_); // Can be locked if needed
+    std::unique_lock<std::mutex> lock(mutex_);
     return pos_w_;
 }
 

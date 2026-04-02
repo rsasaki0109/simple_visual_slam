@@ -11,12 +11,14 @@
 
 #include <Eigen/Core>
 #include <sophus/se3.hpp>
+#include <sophus/sim3.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/core/eigen.hpp>
 
 namespace svslam {
 
 using SE3 = Sophus::SE3d;
+using Sim3 = Sophus::Sim3d;
 using Vec3 = Eigen::Vector3d;
 using Vec2 = Eigen::Vector2d;
 using Mat33 = Eigen::Matrix3d;
