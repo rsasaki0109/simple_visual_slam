@@ -30,7 +30,7 @@ public:
     bool isBad() const { return is_bad_; }
     void setBad() { is_bad_ = true; }
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     
 private:
     bool is_bad_ = false;

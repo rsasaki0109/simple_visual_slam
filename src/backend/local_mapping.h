@@ -3,7 +3,9 @@
 #include "core/common.h"
 #include "core/map.h"
 #include "core/keyframe.h"
+#include "core/landmark.h"
 #include <deque>
+#include <list>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -25,15 +27,19 @@ public:
     void insertKeyframe(Keyframe::Ptr kf);
     void run(); // Main loop
     void requestStop();
+    void processPendingWork();
 
     // Callback for BA completion notification
     std::function<void()> on_ba_completed_;
 
 private:
+    using RecentLandmark = std::pair<Landmark::Ptr, unsigned long>;
+
     void processNewKeyframe();
     void createNewMapPoints();
     void mapPointCulling();
     void optimization();
+    void removeLandmark(const Landmark::Ptr& lm);
 
     // Check if there are keyframes in the queue
     bool checkNewKeyframes();
@@ -42,6 +48,8 @@ private:
 
     std::deque<Keyframe::Ptr> new_keyframes_;
     Keyframe::Ptr current_processed_kf_;
+    std::list<RecentLandmark> recent_landmarks_;
+    unsigned long processed_keyframe_count_ = 0;
 
     std::shared_ptr<LoopClosing> loop_closing_;
 

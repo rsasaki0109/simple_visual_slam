@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <tuple>
+#include <algorithm>
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/videoio.hpp>
@@ -16,9 +17,17 @@
 #include "io/euroc_dataset.h"
 #include "io/tum_dataset.h"
 #include "io/map_io.h"
+#include "core/heuristic_reference_keyframe_policy.h"
+#include "experiments/reference_keyframe/pipeline_reference_keyframe_policy.h"
+#include "experiments/reference_keyframe/score_reference_keyframe_policy.h"
 #include "tracking/tracking.h"
 #include "backend/local_mapping.h"
 #include "loop_closing/loop_closing.h"
+#ifdef USE_DEPTH_DL
+#include "depth/onnx_depth_estimator.h"
+#endif
+#include <memory>
+#include <stdexcept>
 #include <thread>
 
 using namespace svslam;
@@ -28,16 +37,26 @@ int main(int argc, char** argv) {
         std::cerr << "Usage:\n"
                   << "  ./run_mono <video_path> [vocab_path]\n"
                   << "  ./run_mono --euroc <sequence_dir> [vocab_path]\n"
-                  << "  ./run_mono --tum <sequence_dir> [vocab_path]\n" << std::endl;
+                  << "  ./run_mono --tum <sequence_dir> [--depth] [--accel] [--repro-eval] [--reference-policy <heuristic|score|pipeline>] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [vocab_path]\n" << std::endl;
         return -1;
     }
 
     bool use_euroc = false;
     bool use_tum = false;
+    bool use_depth = false;
+    bool use_accel = false;
+    bool no_viz = false;
+    bool repro_eval = false;
+    int max_frames = -1;
+    int skip_frames = 0;
+    std::string reference_policy_name = "heuristic";
+    std::string depth_model_path;
     std::string euroc_seq_dir;
     std::string tum_seq_dir;
     std::string input_path;
 
+    // Parse arguments
+    int positional_idx = 1;
     if (std::string(argv[1]) == "--euroc") {
         if (argc < 3) {
             std::cerr << "Usage: ./run_mono --euroc <sequence_dir> [vocab_path]" << std::endl;
@@ -45,15 +64,72 @@ int main(int argc, char** argv) {
         }
         use_euroc = true;
         euroc_seq_dir = argv[2];
+        positional_idx = 3;
     } else if (std::string(argv[1]) == "--tum") {
         if (argc < 3) {
-            std::cerr << "Usage: ./run_mono --tum <sequence_dir> [vocab_path]" << std::endl;
+            std::cerr << "Usage: ./run_mono --tum <sequence_dir> [--depth] [--accel] [vocab_path]" << std::endl;
             return -1;
         }
         use_tum = true;
         tum_seq_dir = argv[2];
+        positional_idx = 3;
     } else {
         input_path = argv[1];
+        positional_idx = 2;
+    }
+
+    auto parse_non_negative_int = [](const std::string& value, const std::string& flag_name) {
+        try {
+            size_t parsed = 0;
+            int result = std::stoi(value, &parsed);
+            if (parsed != value.size() || result < 0) {
+                throw std::invalid_argument("invalid");
+            }
+            return result;
+        } catch (const std::exception&) {
+            throw std::runtime_error(flag_name + " requires a non-negative integer: " + value);
+        }
+    };
+
+    auto create_reference_policy = [](const std::string& name) -> std::unique_ptr<ReferenceKeyframePolicy> {
+        if (name == "heuristic") {
+            return std::make_unique<HeuristicReferenceKeyframePolicy>();
+        }
+        if (name == "score") {
+            return std::make_unique<ScoreReferenceKeyframePolicy>();
+        }
+        if (name == "pipeline") {
+            return std::make_unique<PipelineReferenceKeyframePolicy>();
+        }
+        throw std::runtime_error(
+            "Unknown reference policy: " + name + " (expected heuristic, score, or pipeline)");
+    };
+
+    // Parse optional flags
+    try {
+        for (int i = positional_idx; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--depth") {
+                use_depth = true;
+            } else if (arg == "--accel") {
+                use_accel = true;
+            } else if (arg == "--repro-eval") {
+                repro_eval = true;
+            } else if (arg == "--no-viz") {
+                no_viz = true;
+            } else if (arg == "--reference-policy" && i + 1 < argc) {
+                reference_policy_name = argv[++i];
+            } else if (arg == "--skip-frames" && i + 1 < argc) {
+                skip_frames = parse_non_negative_int(argv[++i], "--skip-frames");
+            } else if (arg == "--max-frames" && i + 1 < argc) {
+                max_frames = parse_non_negative_int(argv[++i], "--max-frames");
+            } else if (arg == "--depth-model" && i + 1 < argc) {
+                depth_model_path = argv[++i];
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return -1;
     }
 
     cv::VideoCapture cap;
@@ -101,7 +177,7 @@ int main(int argc, char** argv) {
     }
 
     // Initialize ORB detector
-    cv::Ptr<cv::Feature2D> orb = cv::ORB::create(1000);
+    cv::Ptr<cv::Feature2D> orb = cv::ORB::create(2000);
 
     // Initialize Map
     Map::Ptr map = std::make_shared<Map>();
@@ -113,16 +189,28 @@ int main(int argc, char** argv) {
 
     // Initialize Local Mapping
     LocalMapping::Ptr local_mapping = std::make_shared<LocalMapping>(map);
-    std::thread local_mapping_thread(&LocalMapping::run, local_mapping);
+    std::thread local_mapping_thread;
+    const bool run_local_mapping_thread = !repro_eval;
+    if (run_local_mapping_thread) {
+        local_mapping_thread = std::thread(&LocalMapping::run, local_mapping);
+    }
 
     // Initialize Loop Closing
     std::string vocab_path;
-    int vocab_arg_index = 2;
-    if (use_euroc || use_tum) vocab_arg_index = 3;
-
-    if (argc >= vocab_arg_index + 1) {
-        vocab_path = argv[vocab_arg_index];
-    } else {
+    // Find vocab path: last argument that isn't a flag
+    for (int i = positional_idx; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--depth-model" || arg == "--reference-policy" ||
+            arg == "--skip-frames" || arg == "--max-frames") {
+            ++i;
+            continue;
+        }
+        if (arg != "--depth" && arg != "--accel" && arg != "--repro-eval" && arg != "--no-viz") {
+            vocab_path = arg;
+            break;
+        }
+    }
+    if (vocab_path.empty()) {
         if (std::filesystem::exists("data/ORBvoc.txt")) {
             vocab_path = "data/ORBvoc.txt";
         } else {
@@ -133,31 +221,125 @@ int main(int argc, char** argv) {
         std::cerr << "LoopClosing: vocab file not found: " << vocab_path << " (loop closing disabled)" << std::endl;
         vocab_path.clear();
     }
-    LoopClosing::Ptr loop_closing = std::make_shared<LoopClosing>(map, vocab_path);
-    std::thread loop_closing_thread(&LoopClosing::run, loop_closing);
+    LoopClosing::Ptr loop_closing;
+    std::thread loop_closing_thread;
+    const bool run_loop_closing_thread = !repro_eval;
+    if (run_loop_closing_thread) {
+        loop_closing = std::make_shared<LoopClosing>(map, vocab_path);
+        if (use_depth) {
+            loop_closing->setMetricDepth(true);
+        }
+        loop_closing_thread = std::thread(&LoopClosing::run, loop_closing);
+    }
     
-    // Connect LocalMapping to LoopClosing (Keyframes should be passed to LoopClosing)
-    // We need to add a method to LocalMapping to set LoopClosing
     local_mapping->setLoopClosing(loop_closing);
 
     // Initialize Tracking
     Tracking::Ptr tracker = std::make_shared<Tracking>();
     tracker->setMap(map);
     tracker->setLocalMapping(local_mapping);
+    tracker->setReferenceKeyframePolicy(create_reference_policy(reference_policy_name));
+
+    std::cout << "Reference keyframe policy: " << reference_policy_name << std::endl;
+    if (repro_eval) {
+        std::cout << "Repro eval mode: ENABLED (synchronous local mapping, loop closing disabled)" << std::endl;
+    }
+    if (skip_frames > 0) {
+        std::cout << "Skipping first " << skip_frames << " frames before tracking" << std::endl;
+    }
+    if (max_frames >= 0) {
+        std::cout << "Frame budget: " << max_frames << " tracked frames" << std::endl;
+    }
 
     // Register BA completion callback to recompute current frame pose
     local_mapping->on_ba_completed_ = [tracker]() {
         tracker->onBACompleted();
     };
 
-    // Trajectory storage
-    std::vector<std::tuple<double, double, double, double>> trajectory; // timestamp, x, y, z
+    // Depth/accel integration setup
+    if (use_tum) {
+        if (use_depth && tum.hasDepth()) {
+            std::cout << "Depth integration: ENABLED (sensor depth)" << std::endl;
+        } else if (use_depth) {
+            std::cout << "Depth integration: requested but no depth.txt found, DISABLED" << std::endl;
+            use_depth = false;
+        }
+        if (use_accel && tum.hasAccel()) {
+            std::cout << "Accelerometer integration: ENABLED" << std::endl;
+            tracker->accel_buffer_ = tum.allAccel();
+        } else if (use_accel) {
+            std::cout << "Accelerometer integration: requested but no accelerometer.txt found, DISABLED" << std::endl;
+            use_accel = false;
+        }
+    }
+
+    // Deep learning depth estimator
+#ifdef USE_DEPTH_DL
+    std::shared_ptr<DepthEstimator> dl_depth_estimator;
+    if (!depth_model_path.empty()) {
+        std::cout << "Loading DL depth model: " << depth_model_path << std::endl;
+        dl_depth_estimator = std::make_shared<OnnxDepthEstimator>(depth_model_path);
+        std::cout << "DL depth estimation: ENABLED" << std::endl;
+    }
+#endif
+
+    // Trajectory storage (TUM format: timestamp tx ty tz qx qy qz qw)
+    struct TrajEntry { double ts, x, y, z, qx, qy, qz, qw; };
+    std::vector<TrajEntry> trajectory;
+
+    auto save_online_trajectory = [&](const std::string& path) {
+        std::ofstream traj_file(path);
+        if (!traj_file.is_open()) return false;
+        traj_file << "# timestamp tx ty tz qx qy qz qw\n";
+        for (const auto& e : trajectory) {
+            traj_file << std::fixed << std::setprecision(6) << e.ts << " "
+                      << std::setprecision(9) << e.x << " " << e.y << " " << e.z << " "
+                      << e.qx << " " << e.qy << " " << e.qz << " " << e.qw << "\n";
+        }
+        return true;
+    };
+
+    auto save_keyframe_trajectory = [&](const std::string& path) {
+        std::ofstream traj_file(path);
+        if (!traj_file.is_open()) return false;
+
+        std::vector<Keyframe::Ptr> keyframes;
+        keyframes.reserve(map->getAllKeyframes().size());
+        for (const auto& kv : map->getAllKeyframes()) {
+            if (kv.second) keyframes.push_back(kv.second);
+        }
+
+        std::sort(keyframes.begin(), keyframes.end(),
+                  [](const Keyframe::Ptr& a, const Keyframe::Ptr& b) {
+                      if (a->timestamp_ == b->timestamp_) return a->id_ < b->id_;
+                      return a->timestamp_ < b->timestamp_;
+                  });
+
+        traj_file << "# timestamp x y z qx qy qz qw\n";
+        for (const auto& kf : keyframes) {
+            SE3 T_wc = kf->T_cw_.inverse();
+            Eigen::Vector3d pos = T_wc.translation();
+            Eigen::Quaterniond q = T_wc.unit_quaternion();
+            traj_file << std::fixed << std::setprecision(6) << kf->timestamp_ << " "
+                      << std::setprecision(9) << pos.x() << " " << pos.y() << " " << pos.z() << " "
+                      << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+        }
+        return true;
+    };
 
     // Main Loop
     cv::Mat img;
+    cv::Mat depth_img;
     unsigned long frame_id = 0;
+    int skipped_frames = 0;
+    int processed_frames = 0;
     while (true) {
+        if (max_frames >= 0 && processed_frames >= max_frames) {
+            break;
+        }
+
         double timestamp = 0.0;
+        depth_img = cv::Mat();
         if (!use_euroc && !use_tum) {
             cap >> img;
             if (img.empty()) break;
@@ -165,59 +347,96 @@ int main(int argc, char** argv) {
         } else {
             if (use_euroc) {
                 if (!euroc.next(img, timestamp)) break;
+            } else if (use_depth) {
+                if (!tum.nextWithDepth(img, depth_img, timestamp)) break;
             } else {
                 if (!tum.next(img, timestamp)) break;
             }
         }
 
+        if (skipped_frames < skip_frames) {
+            skipped_frames++;
+            continue;
+        }
+
         // Create Frame
         Frame::Ptr frame = std::make_shared<Frame>(frame_id++, timestamp, camera, img);
+
+        // Attach depth if available
+        if (!depth_img.empty()) {
+            frame->depth_image_ = depth_img;
+            frame->depth_is_metric_ = true;
+        }
+#ifdef USE_DEPTH_DL
+        else if (dl_depth_estimator) {
+            // Only run DL depth every N frames to reduce CPU cost
+            // Always run on first frame (init) and every 5th frame (keyframe candidates)
+            bool run_dl = (frame_id <= 1) || (frame_id % 5 == 0);
+            if (run_dl) {
+                frame->depth_image_ = dl_depth_estimator->estimate(img);
+                frame->depth_is_metric_ = false;
+            }
+        }
+#endif
 
         // Extract Features
         frame->extractORB(orb);
 
         // Track
         tracker->addFrame(frame);
+        if (repro_eval) {
+            local_mapping->processPendingWork();
+        }
 
-        // Save trajectory (camera position in world frame)
-        // T_cw transforms world to camera, so camera position = -R^T * t = T_wc.translation()
+        // Save trajectory (camera position in world frame, TUM format)
         SE3 T_wc = frame->getPose().inverse();
         Eigen::Vector3d pos = T_wc.translation();
-        trajectory.push_back({timestamp, pos.x(), pos.y(), pos.z()});
+        Eigen::Quaterniond q = T_wc.unit_quaternion();
+        trajectory.push_back({timestamp, pos.x(), pos.y(), pos.z(), q.x(), q.y(), q.z(), q.w()});
 
         std::cout << "Frame " << frame->id_
                   << ": " << frame->keypoints_.size() << " kps"
                   << " | State: " << (int)tracker->state_
                   << " | Pose: " << pos.transpose()
                   << std::endl;
+        processed_frames++;
 
         // Visualization
-        cv::Mat img_show;
-        cv::drawKeypoints(img, frame->keypoints_, img_show);
-        
-        // Draw pose info
-        cv::putText(img_show, "State: " + std::to_string((int)tracker->state_), cv::Point(10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
-
-        cv::imshow("SimpleVisualSLAM", img_show);
-        char k = cv::waitKey(10);
-        if (k == 27) break;
-        
-        // Save the 100th frame as a sample result
-        if (frame_id == 100) {
-            cv::imwrite("slam_result.jpg", img_show);
-            std::cout << "Saved slam_result.jpg" << std::endl;
+        if (!no_viz) {
+            cv::Mat img_show;
+            cv::drawKeypoints(img, frame->keypoints_, img_show);
+            cv::putText(img_show, "State: " + std::to_string((int)tracker->state_), cv::Point(10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+            cv::imshow("SimpleVisualSLAM", img_show);
+            char k = cv::waitKey(10);
+            if (k == 27) break;
+            if (frame_id == 100) {
+                cv::imwrite("slam_result.jpg", img_show);
+            }
         }
     }
     
     std::cout << "Finished processing." << std::endl;
+    std::cout << "Processed frames: " << processed_frames
+              << " (skipped " << skipped_frames << ")" << std::endl;
+
+    if (save_online_trajectory("trajectory.txt")) {
+        std::cout << "Trajectory saved to trajectory.txt (" << trajectory.size() << " poses)" << std::endl;
+    }
+    if (save_online_trajectory("trajectory_online.txt")) {
+        std::cout << "Trajectory saved to trajectory_online.txt" << std::endl;
+    }
     
-    // Stop Local Mapping
-    local_mapping->requestStop();
-    local_mapping_thread.join();
-    
-    // Stop Loop Closing
-    loop_closing->requestStop();
-    loop_closing_thread.join();
+    // Request worker threads to stop before waiting so shutdown does not enqueue more work.
+    if (run_local_mapping_thread) {
+        local_mapping->requestStop();
+        local_mapping_thread.join();
+    } else {
+        local_mapping->processPendingWork();
+    }
+    if (run_loop_closing_thread) {
+        loop_closing->requestStop();
+        loop_closing_thread.join();
+    }
     
     // Save Map
     std::cout << "Saving map to map.bin..." << std::endl;
@@ -227,16 +446,9 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to save map." << std::endl;
     }
 
-    // Save Trajectory
-    std::ofstream traj_file("trajectory.txt");
-    if (traj_file.is_open()) {
-        traj_file << "# timestamp x y z\n";
-        for (const auto& [ts, x, y, z] : trajectory) {
-            traj_file << std::fixed << std::setprecision(6) << ts << " "
-                      << std::setprecision(9) << x << " " << y << " " << z << "\n";
-        }
-        traj_file.close();
-        std::cout << "Trajectory saved to trajectory.txt (" << trajectory.size() << " poses)" << std::endl;
+    if (save_keyframe_trajectory("trajectory_keyframes.txt")) {
+        std::cout << "Keyframe trajectory saved to trajectory_keyframes.txt (" << map->getAllKeyframes().size()
+                  << " keyframes)" << std::endl;
     }
 
     // Plan comments for future steps

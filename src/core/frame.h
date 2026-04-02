@@ -29,6 +29,16 @@ public:
     // Let's use T_cw (World -> Camera) as is common in ORB-SLAM
     SE3 T_cw_; 
 
+    // Depth image (CV_16UC1 in mm for sensor depth, or CV_32FC1 in meters for DL depth)
+    cv::Mat depth_image_;
+    bool depth_is_metric_ = true;  // true for sensor depth, false for DL relative depth
+
+    // Get depth at pixel (u,v) in meters. Returns <= 0 if invalid.
+    float getDepth(float u, float v) const;
+
+    // Back-project pixel with known depth to 3D world point
+    Vec3 backprojectWithDepth(const cv::KeyPoint& kp, float depth_m) const;
+
     // Features
     std::vector<cv::KeyPoint> keypoints_;
     cv::Mat descriptors_;
