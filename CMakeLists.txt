@@ -19,7 +19,7 @@ message(STATUS "OpenCV_LIBS: ${OpenCV_LIBS}")
 
 # Ceres
 # set(Ceres_DIR "$HOME/workspace/ceres-bin" CACHE PATH "Path to CeresConfig.cmake")
-find_package(Ceres QUIET)
+find_package(Ceres 2.1 QUIET)
 if(NOT Ceres_FOUND)
     message(STATUS "Ceres not found, fetching from source...")
     include(FetchContent)
@@ -35,10 +35,9 @@ if(NOT Ceres_FOUND)
     set(BUILD_DOCUMENTATION OFF CACHE BOOL "" FORCE)
     set(PROVISION_DEPENDENCIES ON CACHE BOOL "" FORCE) # Let Ceres manage deps if needed
 
-    # Avoid depending on system glog/gflags (which may pull in libfmt.so.9)
-    set(CERES_USE_MINIGLOG ON CACHE BOOL "" FORCE)
-    set(CERES_USE_GLOG OFF CACHE BOOL "" FORCE)
-    set(CERES_USE_GFLAGS OFF CACHE BOOL "" FORCE)
+    # Avoid depending on system glog/gflags.
+    set(MINIGLOG ON CACHE BOOL "" FORCE)
+    set(GFLAGS OFF CACHE BOOL "" FORCE)
     
     FetchContent_MakeAvailable(ceres)
     
@@ -91,6 +90,23 @@ if(USE_DBOW2)
     string(REPLACE "CXX_STANDARD 11" "CXX_STANDARD 17" dbow2_cmake "${dbow2_cmake}")
     file(WRITE "${dbow2_SOURCE_DIR}/CMakeLists.txt" "${dbow2_cmake}")
 
+    # Patch TemplatedVocabulary.h to add loadFromTextFile (for ORB-SLAM vocab format)
+    file(READ "${dbow2_SOURCE_DIR}/include/DBoW2/TemplatedVocabulary.h" _tv_h)
+    if(NOT _tv_h MATCHES "loadFromTextFile")
+        # Add method declaration after "void load(const std::string"
+        string(REPLACE
+            "void load(const std::string &filename);"
+            "void load(const std::string &filename);\n  void loadFromTextFile(const std::string &filename);"
+            _tv_h "${_tv_h}")
+        # Add method implementation before the final #endif
+        string(REPLACE
+            "} // namespace DBoW2"
+            "template<class TDescriptor, class F>\nvoid TemplatedVocabulary<TDescriptor,F>::loadFromTextFile(const std::string &filename)\n{\n  m_words.clear();\n  m_nodes.clear();\n  std::ifstream f(filename);\n  if(!f.is_open()) throw std::string(\"Could not open file \") + filename;\n  int n1, n2;\n  f >> m_k >> m_L >> n1 >> n2;\n  m_scoring = (ScoringType)n1;\n  m_weighting = (WeightingType)n2;\n  createScoringObject();\n  int expected_nodes = (int)((std::pow((double)m_k, (double)m_L + 1) - 1)/(m_k - 1));\n  m_nodes.resize(expected_nodes);\n  m_nodes[0].id = 0;\n  for(int i = 1; i < expected_nodes; i++)\n  {\n    m_nodes[i].id = i;\n    int nIsLeaf;\n    f >> m_nodes[i].parent >> nIsLeaf;\n    std::stringstream ssd;\n    for(int iD = 0; iD < F::L; iD++) { std::string s; f >> s; ssd << s << \" \"; }\n    F::fromString(m_nodes[i].descriptor, ssd.str());\n    f >> m_nodes[i].weight;\n    m_nodes[m_nodes[i].parent].children.push_back(i);\n    if(nIsLeaf > 0)\n    {\n      int wid = (int)m_words.size();\n      m_words.push_back(&m_nodes[i]);\n      m_nodes[i].word_id = wid;\n    }\n  }\n}\n\n} // namespace DBoW2"
+            _tv_h "${_tv_h}")
+        file(WRITE "${dbow2_SOURCE_DIR}/include/DBoW2/TemplatedVocabulary.h" "${_tv_h}")
+        message(STATUS "Patched DBoW2 with loadFromTextFile support")
+    endif()
+
     # Now add the subdirectory
     add_subdirectory(${dbow2_SOURCE_DIR} ${dbow2_BINARY_DIR})
 
@@ -100,7 +116,67 @@ else()
     message(STATUS "DBoW2 disabled - loop closing not available")
 endif()
 
+# Deep Learning Depth Estimation (ONNX Runtime)
+option(USE_DEPTH_DL "Enable deep learning depth estimation (ONNX Runtime)" OFF)
+if(USE_DEPTH_DL)
+    # Try system-installed ONNX Runtime first
+    find_library(ONNXRUNTIME_LIB onnxruntime)
+    find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h PATH_SUFFIXES onnxruntime)
+
+    if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE)
+        message(STATUS "Found system ONNX Runtime: ${ONNXRUNTIME_LIB}")
+        add_library(onnxruntime::onnxruntime SHARED IMPORTED)
+        set_target_properties(onnxruntime::onnxruntime PROPERTIES
+            IMPORTED_LOCATION "${ONNXRUNTIME_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE}"
+        )
+    else()
+        message(STATUS "ONNX Runtime not found, fetching pre-built release...")
+        include(FetchContent)
+        set(ONNXRUNTIME_VERSION "1.17.1")
+        FetchContent_Declare(
+            onnxruntime
+            URL https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz
+        )
+        FetchContent_MakeAvailable(onnxruntime)
+
+        add_library(onnxruntime::onnxruntime SHARED IMPORTED)
+        set_target_properties(onnxruntime::onnxruntime PROPERTIES
+            IMPORTED_LOCATION "${onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so"
+            INTERFACE_INCLUDE_DIRECTORIES "${onnxruntime_SOURCE_DIR}/include"
+        )
+    endif()
+
+    add_definitions(-DUSE_DEPTH_DL)
+    message(STATUS "Deep learning depth estimation: ENABLED")
+else()
+    message(STATUS "Deep learning depth estimation: DISABLED")
+endif()
+
 # Core Library
+add_library(svslam_reference_policy_core
+    src/core/heuristic_reference_keyframe_policy.cc
+)
+
+target_include_directories(svslam_reference_policy_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:include>
+)
+
+add_library(svslam_reference_policy_experiments
+    src/experiments/reference_keyframe/score_reference_keyframe_policy.cc
+    src/experiments/reference_keyframe/pipeline_reference_keyframe_policy.cc
+)
+
+target_include_directories(svslam_reference_policy_experiments PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(svslam_reference_policy_experiments PUBLIC
+    svslam_reference_policy_core
+)
+
 add_library(svslam_core
     src/core/camera.cc
     src/core/frame.cc
@@ -124,6 +200,7 @@ target_include_directories(svslam_core PUBLIC
 )
 
 target_link_libraries(svslam_core PUBLIC
+    svslam_reference_policy_core
     ${OpenCV_LIBS}
     Ceres::ceres
     Sophus::Sophus
@@ -138,7 +215,50 @@ if(USE_DBOW2 AND TARGET DBoW2)
     target_include_directories(svslam_core PUBLIC ${dbow2_SOURCE_DIR}/include)
 endif()
 
+if(USE_DEPTH_DL)
+    target_sources(svslam_core PRIVATE src/depth/onnx_depth_estimator.cc)
+    target_link_libraries(svslam_core PUBLIC onnxruntime::onnxruntime)
+endif()
+
 
 # App
 add_executable(run_mono apps/run_mono.cc)
-target_link_libraries(run_mono PRIVATE svslam_core)
+target_link_libraries(run_mono PRIVATE svslam_core svslam_reference_policy_experiments)
+
+add_executable(reference_policy_experiments
+    tools/reference_policy_experiments.cc
+)
+target_link_libraries(reference_policy_experiments PRIVATE svslam_reference_policy_experiments)
+target_include_directories(reference_policy_experiments PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# Tests
+option(BUILD_TESTS "Build unit tests" ON)
+if(BUILD_TESTS)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+
+    add_executable(svslam_tests
+        tests/test_camera.cc
+        tests/test_landmark.cc
+        tests/test_map.cc
+        tests/test_optimizer.cc
+        tests/test_reference_keyframe_policy.cc
+    )
+    target_link_libraries(svslam_tests PRIVATE
+        svslam_core
+        svslam_reference_policy_experiments
+        GTest::gtest_main
+    )
+
+    include(GoogleTest)
+    gtest_discover_tests(svslam_tests)
+endif()

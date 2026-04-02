@@ -22,7 +22,10 @@ public:
     void clear();
 
     std::mutex mutex_;
-    
+
+    // Flag set during loop correction to signal other threads to avoid landmark access
+    std::atomic<bool> loop_correcting_{false};
+
 private:
     std::map<unsigned long, std::shared_ptr<Keyframe>> keyframes_;
     std::map<unsigned long, std::shared_ptr<Landmark>> landmarks_;
