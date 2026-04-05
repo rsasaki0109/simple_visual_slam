@@ -4,10 +4,32 @@
 #include <ceres/manifold.h>
 #include <ceres/product_manifold.h>
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <vector>
 
 namespace svslam {
+
+namespace {
+
+// Default 1 for repeatable BA; use SVSLAM_CERES_NUM_THREADS=N (integer >= 1) for faster solves.
+int ceres_num_threads_from_env() {
+    const char* env = std::getenv("SVSLAM_CERES_NUM_THREADS");
+    if (!env || env[0] == '\0') {
+        return 1;
+    }
+    char* end = nullptr;
+    long v = std::strtol(env, &end, 10);
+    if (end == env || v < 1) {
+        return 1;
+    }
+    if (v > 64) {
+        return 64;
+    }
+    return static_cast<int>(v);
+}
+
+}  // namespace
 
 // Define Cost Functions here
 
@@ -376,10 +398,10 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         return;
     }
 
-    // Solve (single-threaded for repeatable residuals/Jacobian evaluation across runs).
+    // Solve: default single-thread for repeatable BA; override via SVSLAM_CERES_NUM_THREADS.
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_SCHUR;
-    options.num_threads = 1;
+    options.num_threads = ceres_num_threads_from_env();
     options.max_num_iterations = iterations;
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;
@@ -535,7 +557,7 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.num_threads = 1;
+    options.num_threads = ceres_num_threads_from_env();
     options.max_num_iterations = iterations;
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;

@@ -78,6 +78,8 @@ Current snapshot:
 
 **Local regression gate (data required):** With `data/tum/rgbd_dataset_freiburg1_room` present and `evo_ape` installed, run `python3 scripts/check_regression_gate.py --quiet` from the repo root. This checks `--repro-eval` bitwise trajectory match on two runs and compares mean ATE (same `evo_ape` flags as `scripts/eval_reference_policies.sh`) to the ceiling in `eval/regression_baselines.json`. Use `--skip-ate` for the reproducibility check only.
 
+**Ceres parallelism:** Bundle adjustment and pose-graph solves default to **one thread** for repeatable results. For faster (possibly run-to-run variable) solves, set e.g. `export SVSLAM_CERES_NUM_THREADS=8` before running `run_mono`.
+
 ## Dependencies
 
 **Required:**
