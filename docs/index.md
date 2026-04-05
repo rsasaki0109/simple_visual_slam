@@ -6,14 +6,14 @@ It summarizes the current conclusion and links to the detailed experiment artifa
 ## Current Status
 
 - Curated corpus top accuracy: `score` (0.929), `pipeline` (0.929).
-- Bounded real-trace replay winner: `score` with mean APE `0.070`.
-- Full repeat-2 replay winner: `score` with mean/std `0.074±0.064`.
+- Bounded real-trace replay winner: `score` with mean APE `0.000`.
+- Full repeat-2 replay winner: `score` with mean/std `0.093±0.080`.
 - Runtime default is still `heuristic` because no single policy dominates every mode under repeat replay.
 
 ## Mode Snapshot
 
-- Single-run bounded replay mode winners: `depth=heuristic, depth_accel=score, mono=score`.
-- Repeat-2 bounded replay mode winners: `depth=score, depth_accel=heuristic, mono=score`.
+- Single-run bounded replay mode winners: ``.
+- Repeat-2 bounded replay mode winners: `depth=heuristic, depth_accel=score, mono=score`.
 - Room-only hotspot winners: `depth_accel=score, mono=pipeline`.
 
 ## Read Next
