@@ -1,0 +1,40 @@
+# Build and run unit tests on Ubuntu. FetchContent (Sophus, DBoW2, googletest, Ceres if needed)
+# requires network on the runner.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            libopencv-dev \
+            libeigen3-dev \
+            libgoogle-glog-dev \
+            libgflags-dev \
+            libsuitesparse-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

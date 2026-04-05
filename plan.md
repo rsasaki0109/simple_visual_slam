@@ -571,6 +571,34 @@ repeat-5 room focus + repeat-2 real trace の結果、**3ポリシーは実質�
 corpus は厚くした（repeat-5 完了）。次の一手は **SLAM コアの non-determinism 源を特定・削減すること**。
 候補: ORB マッチングの tie-break、PnP RANSAC の乱数 seed、relocalization 候補選択。
 
+#### 2026-04-06 追記: `--repro-eval` の bitwise determinism を達成（進捗）
+
+本 repo の repeat comparison を成立させるため、`--repro-eval` で **同一入力→同一出力（trajectory bitwise一致）** を達成した。
+
+確認済み事実（ローカル検証）:
+
+- 入力: `data/tum/rgbd_dataset_freiburg1_room`
+- 実行: `run_mono --tum <seq> --reference-policy heuristic --skip-frames 0 --max-frames 200 --repro-eval --no-viz`
+- 結果: 同一条件で 2 回実行した `trajectory.txt` が **sha256一致**（bitwise identical）
+
+実施した対策（原因→対処）:
+
+1. **OpenCV RANSAC の乱数を固定**
+   - `run_mono` 起動時に常に `cv::setRNGSeed(0)` を適用（トラッキングスレッド上の RANSAC の run-to-run 揺れ低減。以前は `--repro-eval` 時のみ）。
+   - `solvePnPRansac` / `findFundamentalMat(FM_RANSAC)` / `findHomography(RANSAC)` 等の内部RNG由来の揺れを抑制。
+2. **tracking の候補ソート tie-break**
+   - `std::sort` を距離のみ→距離+indexで安定化（同距離時の順序未定義を除去）。
+3. **Local BA 入力の順序を決定論化（主要因）**
+   - `LocalMapping::optimization()` が `std::set<std::shared_ptr<Landmark>>` を使用しており、
+     **ポインタ値順（run-to-runで変わる）**により BA の入力順が揺れていた。
+   - `Landmark::id_` ソート+uniqueに変更し、観測数での選別も同点を `id_` で tie-break。
+
+注意:
+
+- `--no-repro`（async local mapping / loop closing thread有効）では別要因が残り得る。
+- CI が GitHub への到達性（DNS/ネットワーク）に依存するため、現環境では FetchContent による `googletest` / `DBoW2` 取得が失敗する場合がある。
+  その場合は `BUILD_TESTS=OFF` / `USE_DBOW2=OFF` でコンパイルだけ先に確認し、疎通がある環境で full gate を回す。
+
 ### 4.3 [重要] `Map::getAllKeyframes()` / `getAllLandmarks()` が const 参照を返す
 
 これは旧来から残る設計負債で、長期的には `shared_mutex` 化か snapshot API 化が必要。現状の experiment track では直接 blocker ではないが、広い refactor を始める前にここを整理した方がよい。
@@ -587,7 +615,7 @@ corpus は厚くした（repeat-5 完了）。次の一手は **SLAM コアの n
 ./scripts/update_reference_policy_docs.py
 ```
 
-これを忘れると `docs/` が stale になる。GitHub Actions で replay までは重くても、少なくとも docs generation と policy tests の CI は欲しい。
+これを忘れると `docs/` が stale になる。`.github/workflows/ci.yml` で **`cmake` ビルド + `ctest`（ユニットテスト）** は CI 化済み。重い replay 評価や上記 docs 自動生成はまだ gate に含めていない。
 
 ### 4.6 [低] map.bin にバージョニングがない
 
@@ -669,7 +697,7 @@ TUM / EuRoC 固定で、設定ファイル読み込みはまだない。実験�
 | Task | Status | 内容 |
 |------|--------|------|
 | E-1 | 未着手 | チュートリアル記事 |
-| E-2 | 未着手 | GitHub Actions CI |
+| E-2 | ✅完了（最小） | GitHub Actions: Ubuntu で Ninja ビルド + `ctest`。`workflow_dispatch` 可。docs/replay は未 |
 | E-3 | 未着手 | Contributing guide |
 | E-4 | 未着手 | `LICENSE` 作成（BSD-2-Clause） |
 
@@ -857,6 +885,10 @@ Phase F（policy 実験）は完了した。今後期待するのは **SLAM コ�
    - 候補: ORB knnMatch の tie-break、PnP RANSAC seed、cv::solvePnPRansac の内部乱数
    - 調査方法: RANSAC seed を固定して repeat-5 の std が減るか確認
 
+   2026-04-06 追記（進捗）:
+   - `--repro-eval` での repeat 実行については **trajectory bitwise一致**まで改善できた。
+     次は「`--no-repro` 側の揺れ」と「評価窓を広げたrepeat-5で std が実際に下がるか」を確認する。
+
 3. **SLAM コア改善の candidate**
    - `room_mono_head` の ATE が 0.316-0.358 と大きい → 初期化品質の問題か tracking loss か
    - 2パス PnP の reproj 閾値 (5.0px) のチューニング
@@ -864,7 +896,11 @@ Phase F（policy 実験）は完了した。今後期待するのは **SLAM コ�
 
 4. **Phase B-1: Metric DL Depth** — Depth Anything v2 は relative depth。Metric3D v2 / UniDepth で metric 化すれば depth sensor なしでも高精度化
 
-5. **Phase E-2: GitHub Actions CI** — 少なくとも `ctest` と docs regen の CI 化
+5. **Phase E-2: GitHub Actions CI** — `ctest` は `.github/workflows/ci.yml` で実行済み。次の拡張候補: docs regen（`eval_results/` を repo に載せるか要設計）
+
+   2026-04-06 追記（障害）:
+   - 現環境で `github.com` の名前解決/到達性が不安定なことがあり、FetchContent で `googletest`/`DBoW2` が取れない場合がある。
+     CI 導入時は runner 側のネットワーク前提を明確化し、必要なら依存を vendor する/ミラーを用意する。
 
 ### 12.4 public repo としての注意
 

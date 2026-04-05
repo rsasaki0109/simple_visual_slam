@@ -386,15 +386,25 @@ void LocalMapping::optimization() {
     }
 
     // 2. Setup local map points: all points observed by local keyframes
-    std::set<Landmark::Ptr> local_landmarks_set;
+    // NOTE: Avoid using std::set<shared_ptr<...>> here because it orders by pointer value,
+    // which varies run-to-run and can introduce non-determinism in BA.
+    std::vector<Landmark::Ptr> local_landmarks;
     for (auto& kf : local_keyframes) {
         for (auto& lm : kf->landmarks_) {
             if (lm && !lm->isBad()) {
-                local_landmarks_set.insert(lm);
+                local_landmarks.push_back(lm);
             }
         }
     }
-    std::vector<Landmark::Ptr> local_landmarks(local_landmarks_set.begin(), local_landmarks_set.end());
+    std::sort(local_landmarks.begin(), local_landmarks.end(),
+              [](const Landmark::Ptr& a, const Landmark::Ptr& b) {
+                  return a->id_ < b->id_;
+              });
+    local_landmarks.erase(std::unique(local_landmarks.begin(), local_landmarks.end(),
+                                      [](const Landmark::Ptr& a, const Landmark::Ptr& b) {
+                                          return a->id_ == b->id_;
+                                      }),
+                          local_landmarks.end());
 
     // Limit BA size to keep it fast
     const size_t max_ba_landmarks = 800;
@@ -402,7 +412,12 @@ void LocalMapping::optimization() {
         // Keep landmarks with most observations (most constrained)
         std::sort(local_landmarks.begin(), local_landmarks.end(),
             [](const Landmark::Ptr& a, const Landmark::Ptr& b) {
-                return a->observations_.size() > b->observations_.size();
+                const size_t a_obs = a ? a->observations_.size() : 0;
+                const size_t b_obs = b ? b->observations_.size() : 0;
+                if (a_obs != b_obs) return a_obs > b_obs;
+                const unsigned long a_id = a ? a->id_ : 0;
+                const unsigned long b_id = b ? b->id_ : 0;
+                return a_id < b_id;
             });
         local_landmarks.resize(max_ba_landmarks);
     }

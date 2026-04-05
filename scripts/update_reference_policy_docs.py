@@ -18,7 +18,7 @@ REAL_TRACE_FILE = OUTPUT_DIR / "real_trace_metrics.csv"
 MONO_STABILITY_FILE = OUTPUT_DIR / "real_trace_metrics_mono_repeat2.csv"
 MONO_REPRO_STABILITY_FILE = OUTPUT_DIR / "real_trace_metrics_mono_repeat2_repro.csv"
 FULL_REPRO_STABILITY_FILE = OUTPUT_DIR / "real_trace_metrics_repeat2.csv"
-ROOM_FOCUS_STABILITY_FILE = OUTPUT_DIR / "room_focus_repeat2.csv"
+ROOM_FOCUS_STABILITY_FILE = OUTPUT_DIR / "room_focus_repeat5.csv"
 DOCS_DIR = ROOT / "docs"
 
 POLICIES = {

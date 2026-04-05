@@ -785,7 +785,9 @@ bool Tracking::trackLocalMap() {
             }
 
             std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-                return a.dist < b.dist;
+                if (a.dist != b.dist) return a.dist < b.dist;
+                if (a.lm_idx != b.lm_idx) return a.lm_idx < b.lm_idx;
+                return a.kp_idx < b.kp_idx;
             });
 
             const size_t max_keep = 200;
@@ -1109,7 +1111,9 @@ bool Tracking::trackReferenceKeyframe() {
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-        return a.dist < b.dist;
+        if (a.dist != b.dist) return a.dist < b.dist;
+        if (a.query_idx != b.query_idx) return a.query_idx < b.query_idx;
+        return a.train_idx < b.train_idx;
     });
 
     std::vector<cv::DMatch> good_matches;
@@ -1517,6 +1521,11 @@ bool Tracking::relocalize() {
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) {
                   if (a.score == b.score) {
+                      if (a.matches.size() == b.matches.size()) {
+                          const long a_id = a.kf ? static_cast<long>(a.kf->id_) : -1L;
+                          const long b_id = b.kf ? static_cast<long>(b.kf->id_) : -1L;
+                          return a_id < b_id;
+                      }
                       return a.matches.size() > b.matches.size();
                   }
                   return a.score > b.score;

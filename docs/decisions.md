@@ -10,39 +10,26 @@
 
 - Top curated-corpus accuracy tie: `score` (0.929), `pipeline` (0.929).
 - The runtime default stays `heuristic` as the core baseline while experiments compete under the shared contract. Current curated counters: `fp=2`, `fn=0`.
-- `pipeline` is the leading experimental candidate when latency matters (`23.76` ns/eval), but it still misses `room_mono_confident_refresh`.
+- `pipeline` is the leading experimental candidate when latency matters (`20.59` ns/eval), but it still misses `room_mono_confident_refresh`.
 - `score` stays as the conservative experiment with curated counters `fp=0`, `fn=1`.
 - No experimental policy is promoted into `core` yet. The gate for adoption is replaying the same policy on real TUM/EuRoC traces, not just the curated scenario corpus.
 
 ## Real Trace Status
 
-- Real-trace mean APE with `--repro-eval` enabled: `heuristic=0.099`, `score=0.070`, `pipeline=0.107`.
-- Mode winners on the current bounded replay corpus: `depth=heuristic`, `depth_accel=score`, `mono=score`.
-- The runtime default should only change if one policy wins on both curated scenarios and the bounded real-trace corpus.
-
-## Mono Stability Status
-
-- Mono repeat-2 mean/std APE: `heuristic=0.177±0.184`, `score=0.163±0.139`, `pipeline=0.125±0.080`.
-- Worst mono variance is `room_mono_head/heuristic` with `std=0.146`. That makes repeat-based comparison mandatory for mono policy changes.
-
-## Repro Eval Status
-
-- Mono repeat-2 with `--repro-eval`: `heuristic=0.130±0.078`, `score=0.142±0.105`, `pipeline=0.113±0.061`.
-- Worst repro mono variance is `room_mono_head/score` with `std=0.055`.
-- Repro mode is an evaluation tool, not a runtime default: it exists to separate policy quality from async scheduling noise.
+- Real-trace replay has not been generated yet. Run `bash scripts/eval_reference_policies.sh` before changing the default policy.
 
 ## Full Replay Stability Gate
 
-- Full repeat-2 with `--repro-eval`: `heuristic=0.078±0.085`, `score=0.074±0.064`, `pipeline=0.083±0.088`.
-- Repeat-2 mode winners on the full bounded corpus: `depth=score`, `depth_accel=heuristic`, `mono=score`.
-- Worst full-corpus variance is `room_mono_head/heuristic` with `std=0.064`.
+- Full repeat-2 with `--repro-eval`: `heuristic=0.092±0.079`, `score=0.093±0.080`, `pipeline=0.107±0.117`.
+- Repeat-2 mode winners on the full bounded corpus: `depth=heuristic`, `depth_accel=score`, `mono=score`.
+- Worst full-corpus variance is `room_mono_head/score` with `std=0.080`.
 - No single policy dominates every mode under repeat replay, so the default stays in `core` and the experiments remain policy candidates instead of migrations.
 
 ## Room Hotspot Status
 
-- Room-only repeat-2 with `--repro-eval`: `heuristic=0.146±0.088`, `score=0.164±0.132`, `pipeline=0.137±0.081`.
+- Room-only repeat-2 with `--repro-eval`: `heuristic=0.161±0.104`, `score=0.160±0.101`, `pipeline=0.160±0.105`.
 - Room-only mode winners: `depth_accel=score`, `mono=pipeline`.
-- Worst room-only variance is `room_mono_head/score` with `std=0.115`.
+- Worst room-only variance is `room_mono_head/pipeline` with `std=0.107`.
 - The room hotspot still does not justify a universal migration. It shows that `pipeline` can win locally on room windows while the full-corpus repeat gate still favors `score` overall.
 
 ## Rejected For Now

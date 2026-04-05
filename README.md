@@ -1,5 +1,7 @@
 # SimpleVisualSLAM
 
+[![CI](https://github.com/rsasaki0109/simple_visual_slam/actions/workflows/ci.yml/badge.svg)](https://github.com/rsasaki0109/simple_visual_slam/actions/workflows/ci.yml)
+
 A lightweight, readable visual SLAM system with deep learning depth integration.
 
 ## Features

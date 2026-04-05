@@ -132,6 +132,11 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    // OpenCV RANSAC (solvePnPRansac, findFundamentalMat, findHomography, ...) uses a process-global RNG.
+    // Pin the seed so default (async) runs are less run-to-run noisy on the tracking thread. Bitwise replay
+    // of full BA state still requires `--repro-eval` (synchronous mapping + deterministic BA ordering).
+    cv::setRNGSeed(0);
+
     cv::VideoCapture cap;
     EurocDataset euroc(".");
     TumRgbdDataset tum(".");
