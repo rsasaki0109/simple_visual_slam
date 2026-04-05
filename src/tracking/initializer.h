@@ -28,6 +28,7 @@ private:
     bool reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat& K,
                       SE3& T_c2_c1, std::vector<cv::Point3f>& points, std::vector<bool>& triangulated, float min_parallax, int min_triangulated);
 
+    // `min_parallax` is the minimum allowed median inter-ray angle in **degrees** (bearing rays in frame 2).
     bool reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat& K,
                       SE3& T_c2_c1, std::vector<cv::Point3f>& points, std::vector<bool>& triangulated, float min_parallax, int min_triangulated);
 
