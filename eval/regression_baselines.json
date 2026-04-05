@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "comment": "evo_ape flags must stay aligned with scripts/eval_reference_policies.sh (mean ATE after Sim(3)).",
+  "evo_ape_extra_args": [
+    "--align",
+    "--correct_scale",
+    "--t_max_diff",
+    "0.05"
+  ],
+  "gates": {
+    "room_mono_head_repro": {
+      "description": "TUM freiburg1 room, mono, frames 0-250, heuristic, --repro-eval; same window as experiments/reference_keyframe/room_focus_corpus.tsv room_mono_head.",
+      "tum_sequence": "rgbd_dataset_freiburg1_room",
+      "reference_policy": "heuristic",
+      "skip_frames": 0,
+      "max_frames": 250,
+      "repro_eval": true,
+      "max_mean_ape_m": 0.34
+    }
+  }
+}
