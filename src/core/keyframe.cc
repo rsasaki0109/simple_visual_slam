@@ -91,12 +91,23 @@ void Keyframe::addConnection(Keyframe::Ptr kf, int weight) {
 std::vector<Keyframe::Ptr> Keyframe::getBestCovisibilityKeyframes(int N) {
     std::unique_lock<std::mutex> lock(mutex_);
     std::vector<std::pair<int, Keyframe::Ptr>> pairs;
+    pairs.reserve(connected_keyframes_.size());
     for (auto& kv : connected_keyframes_) {
         pairs.push_back({kv.second, kv.first});
     }
-    
-    std::sort(pairs.rbegin(), pairs.rend()); // Sort by weight descending
-    
+
+    // Weight desc, then keyframe id asc — avoid std::shared_ptr address ordering on ties
+    // (pointer order varies run-to-run and breaks reproducible local mapping / BA inputs).
+    std::sort(pairs.begin(), pairs.end(),
+              [](const std::pair<int, Keyframe::Ptr>& a, const std::pair<int, Keyframe::Ptr>& b) {
+                  if (a.first != b.first) {
+                      return a.first > b.first;
+                  }
+                  const unsigned long id_a = a.second ? a.second->id_ : 0UL;
+                  const unsigned long id_b = b.second ? b.second->id_ : 0UL;
+                  return id_a < id_b;
+              });
+
     std::vector<Keyframe::Ptr> res;
     for (size_t i = 0; i < pairs.size() && i < (size_t)N; ++i) {
         res.push_back(pairs[i].second);
