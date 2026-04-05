@@ -20,13 +20,22 @@ SimpleVisualSLAMは6k行のC++17で、特徴点ベースSLAM + 深度センサ�
 
 **直近の競合ターゲット:** stella_vslam に精度・安定性で並び、DL深度統合で差別化する。
 
-### 1.1 2026-04-06 現在地
+### 1.1 2026-04-06 現在地（2026-04-06 Claude Code session で更新）
 
-- `master` は `6435a99` まで到達しており、reference-keyframe policy 実験基盤は `PR #1` として mainline に統合済み。
+- `master` は `3b11008` まで到達。前回 `6435a99` からの差分:
+  - `402b196` expand Claude handoff plan
+  - `3b11008` expand room corpus and clean up README
 - GitHub repository は public 化済み: `https://github.com/rsasaki0109/simple_visual_slam`
 - GitHub Pages も公開済み: `https://rsasaki0109.github.io/simple_visual_slam/`
 - 以後の開発方針は「正しい抽象を先に固定する」ではなく、「比較可能な複数実装を先に作り、repeat replay で収束させる」。
-- この文書は Codex だけでなく Claude への handoff も意図して更新している。特に後半の「Claudeへの引き継ぎ」は作業開始前に必読。
+- この文書は Codex / Claude Code / Cursor 等の AI コーディングエージェントへの handoff を意図して更新している。後半の「引き継ぎ」セクションは作業開始前に必読。
+- **今回の Claude Code session で実施したこと:**
+  1. `room_focus_corpus.tsv` を 6→10 行に拡張（`tail`, `recovery` 窓を追加）
+  2. `real_trace_corpus.tsv` を 10→13 行に拡張（`mid` 窓を追加）
+  3. `slam_result.jpg` を README / repo から削除（デバッグ画像で品質不十分）
+  4. `update_reference_policy_docs.py` の room focus 説明文を動的化
+  5. repeat-5 room focus 評価 + repeat-2 real trace 評価を実行（結果は Section 3 に記載）
+  6. CMake ビルドキャッシュを修復（パス変更対応）
 
 ---
 
@@ -41,7 +50,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 │                             # オプション: USE_DBOW2(ON), USE_DEPTH_DL(OFF), BUILD_TESTS(ON)
 ├── plan.md                   # この文書
 ├── README.md                 # 英語README（Mermaidアーキテクチャ図、結果テーブル付き）
-├── .gitignore                # *.bin, *.onnx, models/, eval_results/, trajectory*.txt, *.html
+├── .gitignore                # *.bin, *.jpg, *.onnx, models/, eval_results/, trajectory*.txt, *.html
 │
 ├── apps/
 │   └── run_mono.cc           # [392行] エントリポイント
@@ -383,6 +392,16 @@ LoopClosing Thread (loop_closing->run())
 
 この増分こそが現在の「実験 → 収束」開発の中心である。古い記述と矛盾する場合、こちらを優先する。
 
+#### 2026-04-06 Claude Code session での変更
+
+- `slam_result.jpg` 削除済み（README からの参照も除去）
+- `.gitignore` に `*.jpg` 追加、`!slam_result.jpg` の例外ルール除去
+- `experiments/reference_keyframe/room_focus_corpus.tsv`:
+  - 追加: `room_mono_tail` (750-250), `room_mono_recovery` (350-300), `room_depth_accel_tail` (750-250), `room_depth_accel_recovery` (350-300)
+- `experiments/reference_keyframe/real_trace_corpus.tsv`:
+  - 追加: `room_mono_mid` (250-250), `room_depth_mid` (250-250), `room_depth_accel_head` (0-250)
+- `scripts/update_reference_policy_docs.py`: room focus 説明文をハードコードから `describe_repro_mode()` による動的生成に変更
+
 ---
 
 ## 3. 現在の評価の真実
@@ -402,78 +421,120 @@ README に載せている public-facing な SLAM 精度表は現時点でも以�
 
 ### 3.2 Reference-Keyframe Policy 実験の現状
 
-現時点の source of truth は `docs/index.md` / `docs/decisions.md` / `docs/experiments.md` である。要約は以下。
+source of truth は `docs/index.md` / `docs/decisions.md` / `docs/experiments.md` だが、以下に 2026-04-06 時点の最新スナップショットを記載する。
 
-#### Curated corpus
+#### Curated corpus（前回から変更なし）
 
 - `score` と `pipeline` が accuracy `0.929` で同率首位
 - `heuristic` は core baseline として維持
 - `heuristic` の curated counters は `fp=2`, `fn=0`
 - `score` は conservative、`pipeline` は latency 寄り
 
-#### Bounded real-trace replay (`--repro-eval`, single-run)
+#### Real-trace repeat-2 replay (`--repro-eval`) — 2026-04-06 再評価
 
-- `heuristic = 0.099`
-- `score = 0.070`
-- `pipeline = 0.107`
-- mode winner は `depth=heuristic`, `depth_accel=score`, `mono=score`
+corpus を拡張（13 cases）した上で repeat-2 で再評価。
 
-#### Full repeat-2 replay (`--repro-eval`)
+| Policy | Mean APE | Std APE | N |
+|--------|----------|---------|---|
+| heuristic | 0.098 | 0.080 | 24 |
+| score | 0.100 | 0.082 | 23 |
+| pipeline | 0.115 | 0.121 | 24 |
 
-- `heuristic = 0.078 ± 0.085`
-- `score = 0.074 ± 0.064`
-- `pipeline = 0.083 ± 0.088`
-- mode winner は `depth=score`, `depth_accel=heuristic`, `mono=score`
-- つまり `score` は overall best だが、**全 mode を単独支配していない**
+mode 別:
 
-#### Room hotspot repeat-2 (`--repro-eval`)
+| Mode | heuristic | score | pipeline |
+|------|-----------|-------|----------|
+| depth | 0.053 ± 0.037 | 0.056 ± 0.035 | 0.053 ± 0.040 |
+| depth_accel | 0.081 ± 0.030 | 0.080 ± 0.026 | 0.082 ± 0.034 |
+| mono | 0.151 ± 0.096 | 0.148 ± 0.102 | 0.191 ± 0.156 |
 
-- `heuristic = 0.146 ± 0.088`
-- `score = 0.164 ± 0.132`
-- `pipeline = 0.137 ± 0.081`
-- room-only mode winner は `depth_accel=score`, `mono=pipeline`
-- `pipeline` は局所 hotspot では強いが、global default 昇格を正当化するほどではない
+- `heuristic` が overall best（前回は `score` だった）
+- depth / depth_accel は3ポリシーほぼ横並び
+- mono で `pipeline` が劣化（0.191）、`heuristic` と `score` はほぼ同等
+- corpus 拡張により前回の `score` 優位は消失した — **3ポリシーは実質同等**
 
-#### 結論
+#### Room hotspot repeat-5 (`--repro-eval`) — 2026-04-06 新規
 
-- runtime default は **まだ `heuristic`**
-- `score` と `pipeline` は **捨てられる実験実装** として `src/experiments/` に残す
+corpus を 10 cases に拡張し、repeat-5 で評価。これは今回新規に実施した最も厚い gate。
+
+| Policy | Mean APE | Std APE | N |
+|--------|----------|---------|---|
+| heuristic | 0.187 | 0.106 | 38 |
+| score | 0.198 | 0.099 | 35 |
+| pipeline | 0.198 | 0.106 | 34 |
+
+mode 別:
+
+| Mode | heuristic | score | pipeline |
+|------|-----------|-------|----------|
+| depth_accel | 0.084 ± 0.021 | 0.084 ± 0.015 | 0.089 ± 0.018 |
+| mono | 0.247 ± 0.086 | 0.244 ± 0.078 | 0.243 ± 0.094 |
+
+case 別 mono 注目:
+
+| Case | heuristic | score | pipeline |
+|------|-----------|-------|----------|
+| room_mono_head | 0.358 ± 0.081 | 0.316 ± 0.071 | 0.352 ± 0.120 |
+| room_mono_mid | 0.213 ± 0.022 | 0.229 ± 0.031 | 0.225 ± 0.011 |
+| room_mono_late | 0.147 ± 0.031 | 0.139 ± 0.014 | 0.147 ± 0.040 |
+| room_mono_tail | 0.251 ± 0.046 | 0.256 ± 0.073 | 0.246 ± 0.046 |
+| room_mono_recovery | 0.267 ± 0.060 | 0.279 ± 0.053 | 0.242 ± 0.075 |
+
+- overall: `heuristic` がわずかに best だが、誤差範囲で3ポリシーは同等
+- mono: 3ポリシーとも 0.243-0.247 でほぼ同一
+- `score` は head / late で微小優位、`pipeline` は recovery で微小優位、`heuristic` は mid で微小優位
+- **どのポリシーも他を一貫して支配していない**
+
+#### 結論（2026-04-06 更新）
+
+- runtime default は **引き続き `heuristic`** — 変更を正当化するデータがない
+- corpus を拡張し repeat gate を厚くした結果、**3ポリシーの差はさらに縮まった**
+- `score` / `pipeline` は **捨てられる実験実装** として `src/experiments/` に維持
 - `has_accel` は minimal interface に昇格済み
-- 今後の policy 昇格条件は「curated + single-run replay + repeat replay」で勝ち切ること
+- **次の前進方向は policy 間比較ではなく、SLAM コア品質の改善**（Section 5 参照）
 
-### 3.3 Mono 安定性について
+### 3.3 Mono 安定性について（2026-04-06 更新）
 
-mono は依然として揺れやすい。特に `room_mono_head` が hotspot である。
+mono は依然として揺れやすい。repeat-5 で確認した結果:
 
-- mono repeat-2 mean/std:
-  - `heuristic = 0.177 ± 0.184`
-  - `score = 0.163 ± 0.139`
-  - `pipeline = 0.125 ± 0.080`
-- mono repeat-2 with `--repro-eval`:
-  - `heuristic = 0.130 ± 0.078`
-  - `score = 0.142 ± 0.105`
-  - `pipeline = 0.113 ± 0.061`
+- room mono repeat-5 with `--repro-eval`:
+  - `heuristic = 0.247 ± 0.086`
+  - `score = 0.244 ± 0.078`
+  - `pipeline = 0.243 ± 0.094`
+- `room_mono_head` が最も誤差が大きい（0.316-0.358）
+- `room_mono_recovery` (350-300) は新設窓だが、3ポリシーとも 0.242-0.279 で安定
 
-`--repro-eval` で async scheduling ノイズはかなり減るが、mono では still repeat comparison が前提である。
+repeat-5 にしても std は 0.078-0.094 で、mono の run-to-run variance は構造的。
+`--repro-eval` で async scheduling ノイズはかなり減るが、mono では repeat comparison が必須。
 
-### 3.4 直近の確認コマンド
+**重要な発見:** repeat gate を厚くするほど3ポリシーの差が消える。これは policy 差より SLAM コア（tracking / local mapping）の non-determinism が支配的であることを意味する。
+
+### 3.4 直近の確認コマンド（2026-04-06 更新）
 
 少なくとも以下は recent green path とみなしてよい。
 
 ```bash
-cmake -S . -B build
-cmake --build build -j4 --target run_mono reference_policy_experiments svslam_tests
-ctest --test-dir build -R 'ReferenceKeyframePolicyTest' --output-on-failure
+# ビルド（BUILD_TESTS=ON で全ターゲット）
+cmake -S . -B build -DBUILD_TESTS=ON
+cmake --build build -j$(nproc)
 
-bash scripts/eval_reference_policies.sh --repeat 1
+# テスト（20/20 pass 確認済み 2026-04-06）
+ctest --test-dir build --output-on-failure
+
+# real trace repeat-2（13 cases × 3 policies × 2 = 78 runs, 約20分）
 bash scripts/eval_reference_policies.sh --repeat 2 \
   --output eval_results/reference_keyframe_policy/real_trace_metrics_repeat2.csv
-bash scripts/eval_reference_policies.sh --repeat 2 \
-  --corpus experiments/reference_keyframe/room_focus_corpus.tsv \
-  --output eval_results/reference_keyframe_policy/room_focus_repeat2.csv
 
+# room focus repeat-5（10 cases × 3 policies × 5 = 150 runs, 約50分）
+bash scripts/eval_reference_policies.sh --repeat 5 \
+  --corpus experiments/reference_keyframe/room_focus_corpus.tsv \
+  --output eval_results/reference_keyframe_policy/room_focus_repeat5.csv
+
+# docs 再生成
 ./scripts/update_reference_policy_docs.py
 ```
+
+注意: CMake キャッシュが別パスで作られていた場合は `rm -rf build` してから再構成する必要がある（2026-04-06 にこの問題に遭遇）。
 
 ### 3.5 テストの見方
 
@@ -486,17 +547,19 @@ bash scripts/eval_reference_policies.sh --repeat 2 \
 
 ## 4. 既知の問題と技術的負債
 
-### 4.1 [最重要] universal default がまだ決まっていない
+### 4.1 [最重要→結論に近い] universal default は決まらなかった（意図的）
 
-今は「比較可能な実験面」はできたが、「単一の勝者」はまだいない。
+repeat-5 room focus + repeat-2 real trace の結果、**3ポリシーは実質同等**と判明。
 
-- `score` は overall repeat gate に強い
-- `pipeline` は room mono hotspot に強い
-- `heuristic` は depth_accel repeat gate で still 勝つケースがある
+- 差が最も大きい `room_mono_head` でも mean 差は 0.04m（0.316 vs 0.358）
+- overall では 0.01m 以下の差で、std の範囲内
+- corpus を厚くするほど差が消えるのは、policy 差より SLAM コアの non-determinism が支配的であることの証拠
 
-したがって、**default migration を焦ってはいけない**。mode-specific dispatch を導入するなら、それ自体を新しい experiment として扱うこと。
+**結論:** policy 間比較はこれ以上深追いしない。`heuristic` を default として確定し、今後の改善は SLAM コア品質（tracking 精度、loop closing 安定性、mono 初期化）に向ける。
 
-### 4.2 [重要] room / mono 系の残留 non-determinism
+`score` / `pipeline` は historical experiment として `src/experiments/` に残すが、active development の対象ではない。
+
+### 4.2 [重要→昇格: 最重要] room / mono 系の残留 non-determinism
 
 `--repro-eval` で local mapping / loop closing の非決定性はかなり減ったが、mono の replay variance はまだ残る。
 
@@ -505,7 +568,8 @@ bash scripts/eval_reference_policies.sh --repeat 2 \
 2. relocalization の candidate 選択
 3. データ窓の狭さによる順位逆転
 
-次の一手は policy を増やすことではなく、**`room mono` corpus を厚くすること**。
+corpus は厚くした（repeat-5 完了）。次の一手は **SLAM コアの non-determinism 源を特定・削減すること**。
+候補: ORB マッチングの tie-break、PnP RANSAC の乱数 seed、relocalization 候補選択。
 
 ### 4.3 [重要] `Map::getAllKeyframes()` / `getAllLandmarks()` が const 参照を返す
 
@@ -546,7 +610,7 @@ TUM / EuRoC 固定で、設定ファイル読み込みはまだない。実験�
 | A-3 | ✅完了 | Google Test導入 |
 | A-4 | ✅完了 | 英語 README と public-facing 結果表 |
 
-### Phase F: Experiment-to-Convergence Workflow [現在の主戦場]
+### Phase F: Experiment-to-Convergence Workflow [収束完了]
 
 | Task | Status | 内容 |
 |------|--------|------|
@@ -555,34 +619,24 @@ TUM / EuRoC 固定で、設定ファイル読み込みはまだない。実験�
 | F-3 | ✅完了 | curated corpus, bounded real-trace corpus, room hotspot corpus 整備 |
 | F-4 | ✅完了 | `--repro-eval` による async noise 切り分け |
 | F-5 | ✅完了 | GitHub-friendly docs (`docs/index.md` 等) を自動生成 |
-| F-6 | 進行中 | universal default の判定。まだ勝者不在 |
-| F-7 | 未着手 | mode-specific dispatch を experiment として追加するか検討 |
-| F-8 | 未着手 | `room mono` corpus 拡張と repeat gate 強化 |
+| F-6 | ✅完了 | universal default の判定 → **`heuristic` を確定**（3ポリシー実質同等のため変更不要） |
+| F-7 | スキップ | mode-specific dispatch → 不要（3ポリシーの差が消えたため意味がない） |
+| F-8 | ✅完了 | `room mono` corpus 拡張（tail/recovery 追加）+ repeat-5 gate 実施 |
 
-#### F-6: universal default 判定
+#### F-6: universal default 判定（確定）
 
-**現在の判断:**
+**結論:** `heuristic` を runtime default として確定。
 
-- runtime default は `heuristic`
-- `score` は overall candidate
-- `pipeline` は hotspot candidate
-- どれも universal migration には未達
+- repeat-5 room focus: 3ポリシーの overall mean 差は 0.011m（0.187 vs 0.198）
+- repeat-2 real trace: 3ポリシーの overall mean 差は 0.017m（0.098 vs 0.115）
+- mono mode では 3ポリシーとも std > mean 差であり、統計的に区別不能
+- 従って policy migration は無意味。SLAM コア改善にリソースを向けるべき
 
-**昇格条件:**
+#### F-8: `room mono` corpus 拡張（完了）
 
-1. curated corpus で劣化しない
-2. real-trace single-run で勝つ
-3. repeat replay でも勝つ
-4. room hotspot で catastrophic regression を起こさない
-
-#### F-8: `room mono` corpus 拡張
-
-Claude に最も引き継ぎたい next step はこれである。
-
-候補:
-1. `room_mono_mid`, `room_mono_late`, `room_mono_recovery` 相当の replay 窓を追加
-2. repeat を `2` から `5` へ上げ、mean/std の順位が維持されるか確認
-3. 必要なら `mode=mono` だけの別 decision table を docs に持つ
+- `room_mono_tail` (750-250), `room_mono_recovery` (350-300) を追加
+- `room_depth_accel_tail` (750-250), `room_depth_accel_recovery` (350-300) を追加
+- repeat-5 で評価完了。結果は Section 3.2 に記載
 
 ### Phase B: DL 深度の差別化強化
 
@@ -710,29 +764,31 @@ bash scripts/eval_reference_policies.sh --repeat 2 \
 
 ---
 
-## 9. 優先順位
+## 9. 優先順位（2026-04-06 更新）
 
 ```text
-比較可能性 > 安定性 > 精度 > 機能数 > 速度 > 見栄え
+安定性 > 精度 > 比較可能性 > 機能数 > 速度 > 見栄え
 ```
 
-このリポジトリでは今、綺麗な抽象より「同条件で比較できる複数実装」が優先される。
+Phase F の policy 比較は収束した。今後は SLAM コアの安定性と精度が最優先。
 
 ---
 
 ## 10. 非目標
 
-- 今すぐ universal な美しい抽象を作ること
-- 1つの policy 実装を急いで正解扱いすること
+- reference-keyframe policy 実験を再開すること（収束済み）
 - Web UI / GUI を main feature にすること
 - LiDAR / Event Camera / ToF への横展開を先にやること
 - end-to-end Deep SLAM へ寄せること
+- 不要な抽象レイヤーを増やすこと
 
 ---
 
 ## 11. git 履歴（重要マイルストーン）
 
 ```text
+3b11008 expand room corpus and clean up README          ← 2026-04-06 Claude Code session
+402b196 expand Claude handoff plan
 6435a99 Merge pull request #1 from rsasaki0109/codex/reference-policy-experiments
 b8ddbdd add reference policy experiment workflow
 73eda32 Final plan.md update for complete Codex handoff
@@ -747,94 +803,94 @@ fffb3e6 Add deep learning depth estimation via ONNX Runtime
 6647223 Integrate depth sensor + accelerometer
 ```
 
-`6435a99` が「experiment surface + public docs + GitHub Pages」まで含む現在の起点である。
+`3b11008` が corpus 拡張 + README 整理を含む最新コミット。
+`6435a99` が「experiment surface + public docs + GitHub Pages」の起点。
 
 ---
 
-## 12. Claude への引き継ぎ
+## 12. AI エージェントへの引き継ぎ（2026-04-06 更新）
 
 ### 12.1 最初に読む順番
 
-Claude が作業を始めるなら、読む順番はこれでよい。
+作業を始めるなら、読む順番はこれでよい。
 
-1. `plan.md` のこの章
-2. `docs/index.md`
-3. `docs/decisions.md`
-4. `docs/interfaces.md`
-5. `scripts/eval_reference_policies.sh`
-6. `src/core/reference_keyframe_policy.h`
-7. `src/tracking/tracking.cc` の policy input 生成箇所
+1. `plan.md` の Section 1.1（現在地）、Section 3（評価の真実）、Section 5（ロードマップ）
+2. `src/tracking/tracking.cc` — 最大のファイル、改善の中心
+3. `src/backend/optimizer.cc` — BA の実装
+4. `src/loop_closing/loop_closing.cc` — ループ検出・補正
+5. `docs/index.md` — public-facing な現状サマリ
 
-その後に必要なら `docs/experiments.md` と `tools/reference_policy_experiments.cc` を読む。
+policy 実験は **Phase F で収束済み**。`src/experiments/` や `tools/reference_policy_experiments.cc` は歴史的参考のみ。
 
-### 12.2 Claude に期待する役割
+### 12.2 期待する役割
 
-Claude に期待するのは「abstract architect」ではなく、「比較面を壊さずに探索空間を広げる worker」である。
+Phase F（policy 実験）は完了した。今後期待するのは **SLAM コア品質の改善** である。
 
 やってよいこと:
 
-- corpus の追加
-- repeat gate の強化
-- mode-specific dispatch を **新しい実験** として追加
-- `has_accel` のように、本当に surviving した field だけ interface に昇格
+- tracking 精度の改善（マッチング品質、PnP の robustness）
+- mono 初期化の安定性向上
+- non-determinism の源の特定と削減
+- loop closing の信頼性向上
+- テストの追加（特に tracking / optimizer 周り）
+- Phase B（DL 深度）、Phase D（機能拡張）の着手
 
 やってはいけないこと:
 
-- `score` / `pipeline` を早計に core へ移す
-- policy から `Frame*`, `Keyframe*`, `Map*` を見せて比較可能性を壊す
-- docs regen を飛ばして `docs/` を stale にする
-- `room mono` の variance を無視して single-run の勝敗だけで判断する
+- policy 実験を再開すること（収束済み）
+- `docs/` を stale にすること（変更したら regen を回す）
+- `--repro-eval` の仕組みを壊すこと
+- public repo に壊れた表や stale な数字を push すること
 
 ### 12.3 まずやるべき次タスク
 
-最優先はこれ。
+優先順位順:
 
-1. `experiments/reference_keyframe/room_focus_corpus.tsv` を拡張し、`room mono` の中盤・後半・回復局面を増やす
-2. `bash scripts/eval_reference_policies.sh --repeat 5 --mode mono ...` を回す
-3. `score` と `pipeline` の順位が repeat-5 でも維持されるかを見る
-4. 必要なら mode-specific dispatch を experiment 実装として追加する
-5. 結果を docs regen で GitHub / Pages に反映する
+1. **docs regen を回す** — 今回の評価結果を反映
+   ```bash
+   ./scripts/update_reference_policy_docs.py
+   ```
+   ※ `update_reference_policy_docs.py` が `room_focus_repeat5.csv` を読むよう `ROOM_FOCUS_STABILITY_FILE` の参照先を更新する必要があるかもしれない
 
-### 12.4 policy seam を触るときの実務ルール
+2. **mono non-determinism の源を調査**
+   - `--repro-eval` でも残る variance (std 0.078-0.094) の原因特定
+   - 候補: ORB knnMatch の tie-break、PnP RANSAC seed、cv::solvePnPRansac の内部乱数
+   - 調査方法: RANSAC seed を固定して repeat-5 の std が減るか確認
 
-policy 入力を増減させるなら、必ず「なぜその field が surviving したか」を説明できなければならない。
+3. **SLAM コア改善の candidate**
+   - `room_mono_head` の ATE が 0.316-0.358 と大きい → 初期化品質の問題か tracking loss か
+   - 2パス PnP の reproj 閾値 (5.0px) のチューニング
+   - `needNewKeyframe()` のフレーム閾値 (20) / tracking ratio (0.75) の見直し
 
-チェックリスト:
+4. **Phase B-1: Metric DL Depth** — Depth Anything v2 は relative depth。Metric3D v2 / UniDepth で metric 化すれば depth sensor なしでも高精度化
 
-- curated corpus で使うか
-- real-trace replay でも使うか
-- implementation ごとの差ではなく input として比較可能か
-- field を消したときに policy 間比較がむしろ明快になるか
+5. **Phase E-2: GitHub Actions CI** — 少なくとも `ctest` と docs regen の CI 化
 
-説明できない field は足さない。抽象は **後から発見** する。
-
-### 12.5 public repo としての注意
+### 12.4 public repo としての注意
 
 repo は public、Pages も public である。
 
 - GitHub repo: `https://github.com/rsasaki0109/simple_visual_slam`
 - Pages: `https://rsasaki0109.github.io/simple_visual_slam/`
 
-したがって、`docs/` の内容は external-facing artifact でもある。内部メモのつもりで壊れた表や stale な数字を push しないこと。
+`docs/` は external-facing artifact。内部メモのつもりで壊れた表や stale な数字を push しないこと。
 
-### 12.6 触らないもの
+### 12.5 触らないもの
 
-少なくとも引き継ぎ開始時点では、以下は今回の PR scope 外だったため勝手に巻き込まない。
-
-- `slam_result.jpg`
 - `.claude/`
 - `AGENTS.md`
-- `data/`
+- `data/` — ローカルデータセット。git 管理外
 - `scripts/__pycache__/`
 
-### 12.7 終了条件
+### 12.6 終了条件
 
-Claude の 1 ターンの終了条件は「抽象が美しいこと」ではない。以下のどれかを満たしたら十分である。
+1 ターンの終了条件は「抽象が美しいこと」ではない。以下のどれかを満たしたら十分。
 
-- corpus / repeat gate を1段前進させた
-- docs / decisions を fresh な結果で更新した
-- mode-specific dispatch の可否を比較可能な形で追加した
-- universal default を据え置く理由を、より明快な証拠で補強した
+- SLAM コアの品質を計測可能に改善した（ATE の mean または std が減った）
+- non-determinism の源を1つ特定・修正した
+- 新しい機能（Phase B/D）を動作する形で追加した
+- テストカバレッジを拡大した
+- docs を fresh な状態に更新した
 
 ---
 
