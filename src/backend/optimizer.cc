@@ -3,8 +3,9 @@
 #include <ceres/rotation.h>
 #include <ceres/manifold.h>
 #include <ceres/product_manifold.h>
-#include <set>
 #include <algorithm>
+#include <set>
+#include <vector>
 
 namespace svslam {
 
@@ -245,27 +246,42 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         problem.SetParameterLowerBound(param, 2, -position_bound);
         problem.SetParameterUpperBound(param, 2, position_bound);
         
-        // Add Residuals
-        // Iterate observations (lock to prevent concurrent modification)
-        std::lock_guard<std::mutex> obs_lock(lm->mutex_);
-        for (const auto& obs : lm->observations_) {
-            auto kf = obs.first.lock();
-            if (!kf) continue;
-            
-            if (pose_params.find(kf->id_) == pose_params.end()) {
-                continue; 
+        // Add Residuals in deterministic order: `Landmark::observations_` is ordered by
+        // weak_ptr owner address, which varies run-to-run and changes Ceres residual ordering.
+        struct ObsItem {
+            unsigned long kf_id;
+            size_t kp_idx;
+            Keyframe::Ptr kf;
+        };
+        std::vector<ObsItem> obs_items;
+        {
+            std::lock_guard<std::mutex> obs_lock(lm->mutex_);
+            obs_items.reserve(lm->observations_.size());
+            for (const auto& obs : lm->observations_) {
+                auto kf = obs.first.lock();
+                if (!kf) continue;
+                obs_items.push_back({kf->id_, obs.second, kf});
             }
-            
-            const size_t kp_idx = obs.second;
+        }
+        std::sort(obs_items.begin(), obs_items.end(), [](const ObsItem& a, const ObsItem& b) {
+            if (a.kf_id != b.kf_id) return a.kf_id < b.kf_id;
+            return a.kp_idx < b.kp_idx;
+        });
+        for (const auto& item : obs_items) {
+            auto kf = item.kf;
+            if (pose_params.find(kf->id_) == pose_params.end()) {
+                continue;
+            }
+            const size_t kp_idx = item.kp_idx;
             if (kp_idx >= kf->keypoints_.size()) continue;
             const auto& kp = kf->keypoints_[kp_idx];
-            
+
             auto camera = kf->camera_;
-            
+
             ceres::CostFunction* cost_function = ReprojectionError::Create(
                 kp.pt.x, kp.pt.y,
                 camera->fx_, camera->fy_, camera->cx_, camera->cy_);
-                
+
             problem.AddResidualBlock(cost_function, new ceres::HuberLoss(1.0), pose_params[kf->id_], point_params[lm->id_]);
             ++residual_count;
         }
@@ -277,13 +293,31 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         if (lm->isBad()) continue;
         if (!point_params.count(lm->id_)) continue;
 
-        for (const auto& obs : lm->observations_) {
-            auto kf = obs.first.lock();
-            if (!kf) continue;
+        struct ObsItem {
+            unsigned long kf_id;
+            size_t kp_idx;
+            Keyframe::Ptr kf;
+        };
+        std::vector<ObsItem> depth_obs;
+        {
+            std::lock_guard<std::mutex> obs_lock(lm->mutex_);
+            depth_obs.reserve(lm->observations_.size());
+            for (const auto& obs : lm->observations_) {
+                auto kf = obs.first.lock();
+                if (!kf) continue;
+                depth_obs.push_back({kf->id_, obs.second, kf});
+            }
+        }
+        std::sort(depth_obs.begin(), depth_obs.end(), [](const ObsItem& a, const ObsItem& b) {
+            if (a.kf_id != b.kf_id) return a.kf_id < b.kf_id;
+            return a.kp_idx < b.kp_idx;
+        });
+        for (const auto& item : depth_obs) {
+            auto kf = item.kf;
             if (pose_params.find(kf->id_) == pose_params.end()) continue;
             if (kf->depth_image_.empty()) continue;
 
-            const size_t kp_idx = obs.second;
+            const size_t kp_idx = item.kp_idx;
             if (kp_idx >= kf->keypoints_.size()) continue;
             const auto& kp = kf->keypoints_[kp_idx];
 
@@ -342,9 +376,10 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         return;
     }
 
-    // Solve
+    // Solve (single-threaded for repeatable residuals/Jacobian evaluation across runs).
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_SCHUR;
+    options.num_threads = 1;
     options.max_num_iterations = iterations;
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;
@@ -500,6 +535,7 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.num_threads = 1;
     options.max_num_iterations = iterations;
     options.minimizer_progress_to_stdout = false;
     options.logging_type = ceres::SILENT;
@@ -591,7 +627,10 @@ void Optimizer::globalBundleAdjustment(Map::Ptr map, int iterations) {
         // Keep landmarks with most observations (most constrained)
         std::sort(landmarks.begin(), landmarks.end(),
             [](const Landmark::Ptr& a, const Landmark::Ptr& b) {
-                return a->observations_.size() > b->observations_.size();
+                const size_t a_obs = a ? a->observations_.size() : 0;
+                const size_t b_obs = b ? b->observations_.size() : 0;
+                if (a_obs != b_obs) return a_obs > b_obs;
+                return a->id_ < b->id_;
             });
         landmarks.resize(max_global_ba_landmarks);
     }
