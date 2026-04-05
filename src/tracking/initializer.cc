@@ -1,33 +1,54 @@
 #include "tracking/initializer.h"
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/eigen.hpp>
 
 namespace svslam {
 
+namespace {
+
+constexpr float kInitLoweRatio = 0.75f;
+// Minimum median bearing parallax (degrees) for F-based initialization; rejects tiny-baseline poses.
+constexpr float kInitMedianParallaxDeg = 0.6f;
+
+}  // namespace
+
 Initializer::Initializer(Frame::Ptr frame_ref) : frame_ref_(frame_ref) {}
 
 bool Initializer::initialize(Frame::Ptr frame_cur, float sigma, int max_iterations) {
-    // 1. Match features
-    cv::Ptr<cv::DescriptorMatcher> matcher = cv::DescriptorMatcher::create(cv::DescriptorMatcher::BRUTEFORCE_HAMMING);
-    std::vector<cv::DMatch> all_matches;
-    matcher->match(frame_ref_->descriptors_, frame_cur->descriptors_, all_matches);
-
-    // Filter matches
-    double min_dist = 10000;
-    for (const auto& m : all_matches) {
-        if (m.distance < min_dist) min_dist = m.distance;
-    }
+    // 1. Match features (KNN + Lowe ratio, same spirit as tracking; more stable than 2*min-dist.)
+    cv::Ptr<cv::DescriptorMatcher> matcher =
+        cv::DescriptorMatcher::create(cv::DescriptorMatcher::BRUTEFORCE_HAMMING);
+    std::vector<std::vector<cv::DMatch>> knn;
+    matcher->knnMatch(frame_ref_->descriptors_, frame_cur->descriptors_, knn, 2);
 
     matches_.clear();
+    for (const auto& cands : knn) {
+        if (cands.size() < 2) {
+            continue;
+        }
+        if (cands[0].distance >= kInitLoweRatio * cands[1].distance) {
+            continue;
+        }
+        matches_.push_back(cands[0]);
+    }
+
+    std::sort(matches_.begin(), matches_.end(), [](const cv::DMatch& a, const cv::DMatch& b) {
+        if (a.queryIdx != b.queryIdx) {
+            return a.queryIdx < b.queryIdx;
+        }
+        return a.trainIdx < b.trainIdx;
+    });
+
     kps_ref_.clear();
     kps_cur_.clear();
-    for (const auto& m : all_matches) {
-        if (m.distance <= std::max(2.0 * min_dist, 30.0)) {
-            matches_.push_back(m);
-            kps_ref_.push_back(frame_ref_->keypoints_[m.queryIdx].pt);
-            kps_cur_.push_back(frame_cur->keypoints_[m.trainIdx].pt);
-        }
+    kps_ref_.reserve(matches_.size());
+    kps_cur_.reserve(matches_.size());
+    for (const auto& m : matches_) {
+        kps_ref_.push_back(frame_ref_->keypoints_[m.queryIdx].pt);
+        kps_cur_.push_back(frame_cur->keypoints_[m.trainIdx].pt);
     }
 
     std::cout << "Initializer: Matches found: " << matches_.size() << std::endl;
@@ -58,11 +79,13 @@ bool Initializer::initialize(Frame::Ptr frame_cur, float sigma, int max_iteratio
         success = reconstructH(inliers_H, H21, K, T_c1_c2_, triangulated_points_, is_triangulated_, 1.0, 50);
         if (!success && F_found) {
             std::cout << "Initializer: Homography reconstruction failed, falling back to Fundamental Matrix" << std::endl;
-            success = reconstructF(inliers_F, F21, K, T_c1_c2_, triangulated_points_, is_triangulated_, 1.0, 50);
+            success = reconstructF(inliers_F, F21, K, T_c1_c2_, triangulated_points_, is_triangulated_,
+                                     kInitMedianParallaxDeg, 50);
         }
     } else if (F_found) {
         std::cout << "Initializer: Selecting Fundamental Matrix" << std::endl;
-        success = reconstructF(inliers_F, F21, K, T_c1_c2_, triangulated_points_, is_triangulated_, 1.0, 50);
+        success = reconstructF(inliers_F, F21, K, T_c1_c2_, triangulated_points_, is_triangulated_,
+                              kInitMedianParallaxDeg, 50);
     }
 
     if (!success) {
@@ -145,6 +168,49 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
     std::cout << "RecoverPose valid points: " << valid_points << std::endl;
 
     if (valid_points < min_triangulated) return false;
+
+    // Reject near-degenerate two-view configurations (tiny baseline / near-pure rotation).
+    // `min_parallax` is in degrees (median angle between bearing rays in camera-2 frame).
+    {
+        cv::Mat Kinv = K.inv();
+        std::vector<double> parallax_rad;
+        parallax_rad.reserve(inlier_kps_ref.size());
+        const double pi = std::acos(-1.0);
+        const double min_parallax_rad = min_parallax * (pi / 180.0);
+        for (size_t j = 0; j < inlier_kps_ref.size(); ++j) {
+            if (!mask.at<unsigned char>(static_cast<int>(j))) {
+                continue;
+            }
+            cv::Mat p1 = (cv::Mat_<double>(3, 1) << static_cast<double>(inlier_kps_ref[j].x),
+                          static_cast<double>(inlier_kps_ref[j].y), 1.0);
+            cv::Mat p2 = (cv::Mat_<double>(3, 1) << static_cast<double>(inlier_kps_cur[j].x),
+                          static_cast<double>(inlier_kps_cur[j].y), 1.0);
+            cv::Mat n1 = Kinv * p1;
+            cv::Mat n2 = Kinv * p2;
+            const double n1n = cv::norm(n1);
+            const double n2n = cv::norm(n2);
+            if (n1n < 1e-9 || n2n < 1e-9) {
+                continue;
+            }
+            n1 /= n1n;
+            n2 /= n2n;
+            cv::Mat n1_in_2 = R * n1;
+            double c = n1_in_2.dot(n2);
+            c = std::max(-1.0, std::min(1.0, c));
+            parallax_rad.push_back(std::acos(c));
+        }
+        if (parallax_rad.empty()) {
+            std::cout << "Initializer: Rejecting F: no parallax samples" << std::endl;
+            return false;
+        }
+        std::sort(parallax_rad.begin(), parallax_rad.end());
+        const double median_parallax = parallax_rad[parallax_rad.size() / 2];
+        if (median_parallax < min_parallax_rad) {
+            std::cout << "Initializer: Rejecting F: median parallax "
+                      << median_parallax * 180.0 / pi << " deg < " << min_parallax << " deg" << std::endl;
+            return false;
+        }
+    }
 
     // Convert to Sophus SE3
     Eigen::Matrix3d R_eig;
