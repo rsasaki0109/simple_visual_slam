@@ -2,6 +2,10 @@ case_id	dataset	mode	skip_frames	max_frames
 room_mono_head	rgbd_dataset_freiburg1_room	mono	0	250
 room_mono_mid	rgbd_dataset_freiburg1_room	mono	250	250
 room_mono_late	rgbd_dataset_freiburg1_room	mono	500	250
+room_mono_tail	rgbd_dataset_freiburg1_room	mono	750	250
+room_mono_recovery	rgbd_dataset_freiburg1_room	mono	350	300
 room_depth_accel_head	rgbd_dataset_freiburg1_room	depth_accel	0	250
 room_depth_accel_mid	rgbd_dataset_freiburg1_room	depth_accel	250	250
 room_depth_accel_late	rgbd_dataset_freiburg1_room	depth_accel	500	250
+room_depth_accel_tail	rgbd_dataset_freiburg1_room	depth_accel	750	250
+room_depth_accel_recovery	rgbd_dataset_freiburg1_room	depth_accel	350	300

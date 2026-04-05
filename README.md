@@ -2,8 +2,6 @@
 
 A lightweight, readable visual SLAM system with deep learning depth integration.
 
-![SLAM Result](slam_result.jpg)
-
 ## Features
 
 - **Monocular visual SLAM** with ORB feature extraction and matching
@@ -161,7 +159,6 @@ If no vocabulary path is given, the system looks for `data/ORBvoc.txt` by defaul
 
 - **`trajectory.txt`** -- estimated camera trajectory (timestamp, x, y, z)
 - **`map.bin`** -- serialized map for later reuse
-- **`slam_result.jpg`** -- visualization snapshot
 
 ### Keyboard Controls
 
