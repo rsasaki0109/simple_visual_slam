@@ -10,15 +10,13 @@ lib/
 datasets/
 *.mp4
 *.avi
+*.jpg
 *.bin
 
 # Local ORB vocabulary (must not be distributed)
 ORBvoc.txt
 data/ORBvoc.txt
 data/*.bin
-
-# Keep slam_result.jpg
-!slam_result.jpg
 
 # Trajectory output files
 trajectory*.txt

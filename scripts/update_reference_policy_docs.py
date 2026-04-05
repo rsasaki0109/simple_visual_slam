@@ -597,7 +597,9 @@ def generate_experiments_doc(rows, scenarios):
                 "",
                 "## Room Focus Follow-Up",
                 "",
-                "This hotspot follow-up replays only `rgbd_dataset_freiburg1_room` windows for `mono` and `depth_accel` with `repeat 2` and `--repro-eval`.",
+                "This hotspot follow-up replays only `rgbd_dataset_freiburg1_room` windows for `mono` and `depth_accel` {repro}.".format(
+                    repro=describe_repro_mode(room_focus_rows),
+                ),
                 "",
                 "| Policy | Runs | Mean APE | Std APE |",
                 "| --- | ---: | ---: | ---: |",
