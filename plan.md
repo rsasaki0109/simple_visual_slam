@@ -20,6 +20,14 @@ SimpleVisualSLAMは6k行のC++17で、特徴点ベースSLAM + 深度センサ�
 
 **直近の競合ターゲット:** stella_vslam に精度・安定性で並び、DL深度統合で差別化する。
 
+### 1.1 2026-04-06 現在地
+
+- `master` は `6435a99` まで到達しており、reference-keyframe policy 実験基盤は `PR #1` として mainline に統合済み。
+- GitHub repository は public 化済み: `https://github.com/rsasaki0109/simple_visual_slam`
+- GitHub Pages も公開済み: `https://rsasaki0109.github.io/simple_visual_slam/`
+- 以後の開発方針は「正しい抽象を先に固定する」ではなく、「比較可能な複数実装を先に作り、repeat replay で収束させる」。
+- この文書は Codex だけでなく Claude への handoff も意図して更新している。特に後半の「Claudeへの引き継ぎ」は作業開始前に必読。
+
 ---
 
 ## 2. コードベース全体像
@@ -336,99 +344,247 @@ LoopClosing Thread (loop_closing->run())
 | onnx_depth | kInputW/H | 518 | DL推論入力サイズ |
 | onnx_depth | median_target | 1.5m | relative depthのscaling |
 
+### 2.5 2026-04-06 時点の増分（旧構成表の補足）
+
+旧来の「2.1 ファイル構成」は骨格として有効だが、現時点では以下が重要な増分である。
+
+- `apps/run_mono.cc`
+  - `--reference-policy <heuristic|score|pipeline>` を追加済み
+  - `--skip-frames N`, `--max-frames N` で bounded replay が可能
+  - `--repro-eval` で local mapping を同期実行し、loop closing を止めた再現性重視モードへ入る
+- `src/core/reference_keyframe_policy.h`
+  - reference-keyframe 採用判断を切り出した最小契約
+  - 現在の surviving fields は `tracked_features`, `detected_keypoints`, `candidate_landmarks`, `frames_since_reference`, `lost_frames`, `has_depth`, `has_accel`
+- `src/core/heuristic_reference_keyframe_policy.{h,cc}`
+  - runtime default。既存挙動を切り出して `core` 側に置いたもの
+- `src/experiments/reference_keyframe/`
+  - `score_reference_keyframe_policy.{h,cc}`
+  - `pipeline_reference_keyframe_policy.{h,cc}`
+  - どちらも discardable な experiment 実装であり、まだ core へ昇格していない
+- `tools/reference_policy_experiments.cc`
+  - curated scenario corpus を同一 input / 同一 interface / 同一指標で比較する小さな実験バイナリ
+- `tests/test_reference_keyframe_policy.cc`
+  - policy seam 専用のテスト
+  - `depth_accel` 系の `has_accel` 分岐もカバー済み
+- `scripts/eval_reference_policies.sh`
+  - bounded real-trace replay を policy × corpus × repeat で回す主ハーネス
+  - `--mode`, `--policy`, `--repeat`, `--corpus`, `--output`, `--no-repro` を持つ
+- `scripts/update_reference_policy_docs.py`
+  - 実験 CSV を読み、`docs/index.md`, `docs/decisions.md`, `docs/experiments.md`, `docs/interfaces.md` を自動生成する
+- `experiments/reference_keyframe/`
+  - `scenarios.csv`: curated corpus
+  - `real_trace_corpus.tsv`: full bounded replay corpus
+  - `room_focus_corpus.tsv`: `room` hotspot 専用 follow-up corpus
+- `docs/`
+  - `index.md`: GitHub / Pages 向け landing page
+  - `decisions.md`: 採用/不採用の現時点判断
+  - `experiments.md`: 詳細比較表
+  - `interfaces.md`: surviving minimal interface の記録
+
+この増分こそが現在の「実験 → 収束」開発の中心である。古い記述と矛盾する場合、こちらを優先する。
+
 ---
 
-## 3. 精度実績
+## 3. 現在の評価の真実
 
-### 3.1 eval_all.sh 自動評価結果（最新）
+### 3.1 README / `eval_all.sh` 側の公開スナップショット
+
+README に載せている public-facing な SLAM 精度表は現時点でも以下である。
 
 | Dataset | Mono | +Depth | +Depth+Accel |
 |---------|------|--------|--------------|
 | Seq A (small motion) | 0.023 | **0.011** | **0.011** |
 | Seq B (room-scale) | 0.845 | **0.227** | 0.235 |
 
-- ATE mean [m], Sim3 alignment, evo_ape --align --correct_scale
-- eval_all.shで自動取得。手動実行時のベスト: Seq A 0.011m, Seq B 0.191m
-- Seq B は非決定的: 0.19-0.49m幅（ループ検出タイミング依存）
+- これは `scripts/eval_all.sh` 系の high-level snapshot であり、今後も README 用の要約として使う。
+- ただし **reference-keyframe policy の採用判断はこの表だけでは行わない**。
+- `room` 系には run-to-run の揺れが残るため、policy 比較は必ず `--repro-eval` と repeat gate で見る。
 
-### 3.2 DL Depth単体（sensor depthなし）
+### 3.2 Reference-Keyframe Policy 実験の現状
 
-| Dataset | DL Depth | Target |
-|---------|----------|--------|
-| Seq A | 0.051 | <0.05 |
+現時点の source of truth は `docs/index.md` / `docs/decisions.md` / `docs/experiments.md` である。要約は以下。
 
-- CPU推論、5フレーム間隔、Depth Anything v2 Small (95MB)
+#### Curated corpus
 
-### 3.3 テスト結果
+- `score` と `pipeline` が accuracy `0.929` で同率首位
+- `heuristic` は core baseline として維持
+- `heuristic` の curated counters は `fp=2`, `fn=0`
+- `score` は conservative、`pipeline` は latency 寄り
 
+#### Bounded real-trace replay (`--repro-eval`, single-run)
+
+- `heuristic = 0.099`
+- `score = 0.070`
+- `pipeline = 0.107`
+- mode winner は `depth=heuristic`, `depth_accel=score`, `mono=score`
+
+#### Full repeat-2 replay (`--repro-eval`)
+
+- `heuristic = 0.078 ± 0.085`
+- `score = 0.074 ± 0.064`
+- `pipeline = 0.083 ± 0.088`
+- mode winner は `depth=score`, `depth_accel=heuristic`, `mono=score`
+- つまり `score` は overall best だが、**全 mode を単独支配していない**
+
+#### Room hotspot repeat-2 (`--repro-eval`)
+
+- `heuristic = 0.146 ± 0.088`
+- `score = 0.164 ± 0.132`
+- `pipeline = 0.137 ± 0.081`
+- room-only mode winner は `depth_accel=score`, `mono=pipeline`
+- `pipeline` は局所 hotspot では強いが、global default 昇格を正当化するほどではない
+
+#### 結論
+
+- runtime default は **まだ `heuristic`**
+- `score` と `pipeline` は **捨てられる実験実装** として `src/experiments/` に残す
+- `has_accel` は minimal interface に昇格済み
+- 今後の policy 昇格条件は「curated + single-run replay + repeat replay」で勝ち切ること
+
+### 3.3 Mono 安定性について
+
+mono は依然として揺れやすい。特に `room_mono_head` が hotspot である。
+
+- mono repeat-2 mean/std:
+  - `heuristic = 0.177 ± 0.184`
+  - `score = 0.163 ± 0.139`
+  - `pipeline = 0.125 ± 0.080`
+- mono repeat-2 with `--repro-eval`:
+  - `heuristic = 0.130 ± 0.078`
+  - `score = 0.142 ± 0.105`
+  - `pipeline = 0.113 ± 0.061`
+
+`--repro-eval` で async scheduling ノイズはかなり減るが、mono では still repeat comparison が前提である。
+
+### 3.4 直近の確認コマンド
+
+少なくとも以下は recent green path とみなしてよい。
+
+```bash
+cmake -S . -B build
+cmake --build build -j4 --target run_mono reference_policy_experiments svslam_tests
+ctest --test-dir build -R 'ReferenceKeyframePolicyTest' --output-on-failure
+
+bash scripts/eval_reference_policies.sh --repeat 1
+bash scripts/eval_reference_policies.sh --repeat 2 \
+  --output eval_results/reference_keyframe_policy/real_trace_metrics_repeat2.csv
+bash scripts/eval_reference_policies.sh --repeat 2 \
+  --corpus experiments/reference_keyframe/room_focus_corpus.tsv \
+  --output eval_results/reference_keyframe_policy/room_focus_repeat2.csv
+
+./scripts/update_reference_policy_docs.py
 ```
-ctest --output-on-failure
-# test_camera: 3テスト PASSED
-# test_landmark: 4テスト PASSED (thread safety含む)
-# test_map: 6テスト PASSED (concurrent add含む)
-# test_optimizer: 1テスト PASSED (BA noise→reduction)
-# ※ Sophusの test_cartesian2, test_so2 が Not Run (実行ファイルパス問題、svslam側の問題ではない)
-```
+
+### 3.5 テストの見方
+
+- `ReferenceKeyframePolicyTest` は通る前提
+- `test_camera`, `test_landmark`, `test_map`, `test_optimizer` も通常は green
+- full `ctest` では Sophus 側の external test (`test_cartesian2`, `test_so2`) がノイズになり得る
+- したがって、policy 変更の最低 gate は `ReferenceKeyframePolicyTest` + replay scripts + docs regen
 
 ---
 
 ## 4. 既知の問題と技術的負債
 
-### 4.1 [最重要] 精度の非決定的バラつき
+### 4.1 [最重要] universal default がまだ決まっていない
 
-**症状:** 同じデータでATE 0.19〜0.49m (Seq B)
-**原因:**
-1. ORBのFAST閾値適応にランダム性 → Worker A-1で緩和済み（ソート決定論化）
-2. DBoW2スコアが微妙に変動 → ループ検出のyes/noが変わる
-3. マルチスレッドの実行順序
-**残作業:** ORB抽出自体のシード固定、ループ検出の決定論化
+今は「比較可能な実験面」はできたが、「単一の勝者」はまだいない。
 
-### 4.2 [重要] trackLocalMapスキップによる精度劣化
+- `score` は overall repeat gate に強い
+- `pipeline` は room mono hotspot に強い
+- `heuristic` は depth_accel repeat gate で still 勝つケースがある
 
-**症状:** ループ補正中1-5フレームでtrackLocalMapがスキップ → ポーズ精度低下
-**原因:** loop_correcting_フラグ中のスキップ
-**対策案:**
-- fuseLoopLandmarks前にlandmarkのスナップショットを取り、trackLocalMapにはスナップショットを渡す
-- あるいはfuse/updateConnections をアトミックに（所要時間短縮）
+したがって、**default migration を焦ってはいけない**。mode-specific dispatch を導入するなら、それ自体を新しい experiment として扱うこと。
 
-### 4.3 [中] Map::getAllKeyframes/getAllLandmarksがconst参照を返す
+### 4.2 [重要] room / mono 系の残留 non-determinism
 
-**症状:** 返り値の参照を保持したまま別スレッドがmapを変更するとUB
-**対策:** コピーを返すか、read-write lock導入
+`--repro-eval` で local mapping / loop closing の非決定性はかなり減ったが、mono の replay variance はまだ残る。
 
-### 4.4 [低] マップ保存形式にバージョニングなし
+残候補:
+1. loop closing を切っても残る tracking 側の離散的分岐
+2. relocalization の candidate 選択
+3. データ窓の狭さによる順位逆転
 
-**対策:** "SVSLAM" ヘッダの後にuint32 version追加
+次の一手は policy を増やすことではなく、**`room mono` corpus を厚くすること**。
 
-### 4.5 [低] TUM以外のカメラパラメータ対応
+### 4.3 [重要] `Map::getAllKeyframes()` / `getAllLandmarks()` が const 参照を返す
 
-**現状:** K()がTUM freiburg1 / EuRoC固定。設定ファイル読み込み未実装。
+これは旧来から残る設計負債で、長期的には `shared_mutex` 化か snapshot API 化が必要。現状の experiment track では直接 blocker ではないが、広い refactor を始める前にここを整理した方がよい。
+
+### 4.4 [中] `loop_correcting_` はまだ完全には消えていない
+
+`repro-eval` では loop closing 自体を止めて比較しているが、runtime path では `loop_correcting_` に依存した読み書き回避が残る。`loop_correcting_` を根本的に外すなら、snapshot 化または `Map` の read/write discipline を強化する必要がある。
+
+### 4.5 [中] docs 更新は自動生成だが、CI gate ではない
+
+今は人手で以下を回している。
+
+```bash
+./scripts/update_reference_policy_docs.py
+```
+
+これを忘れると `docs/` が stale になる。GitHub Actions で replay までは重くても、少なくとも docs generation と policy tests の CI は欲しい。
+
+### 4.6 [低] map.bin にバージョニングがない
+
+旧来どおり。将来 map IO を公開 feature として押し出すなら `version` を入れるべき。
+
+### 4.7 [低] camera parameter の一般化不足
+
+TUM / EuRoC 固定で、設定ファイル読み込みはまだない。実験基盤の整備が優先されたため後回し。
 
 ---
 
 ## 5. ロードマップ
 
-### Phase A: stella_vslam同等の品質基盤 [進行中]
+### Phase A: 品質基盤
 
 | Task | Status | 内容 |
 |------|--------|------|
 | A-1 | ✅完了 | ORB決定論化、BA収束強化、2パスPnP |
-| A-2 | 進行中 | 追加データセット検証（`--repeat N` 実装済み、追加シーケンス収集中） |
-| A-3 | ✅完了 | Google Test導入、4テストファイル |
-| A-4 | ✅完了 | 英語README（Mermaid図、結果テーブル） |
+| A-2 | 進行中 | `eval_all.sh --repeat N` と README 反映までは完了。追加シーケンス拡充は未完 |
+| A-3 | ✅完了 | Google Test導入 |
+| A-4 | ✅完了 | 英語 README と public-facing 結果表 |
 
-#### A-2: 追加データセット検証
+### Phase F: Experiment-to-Convergence Workflow [現在の主戦場]
 
-**目的:** 5+シーケンスで全モード評価
+| Task | Status | 内容 |
+|------|--------|------|
+| F-1 | ✅完了 | reference-keyframe decision seam 抽出 |
+| F-2 | ✅完了 | `heuristic` / `score` / `pipeline` の3系統を同一 interface で比較 |
+| F-3 | ✅完了 | curated corpus, bounded real-trace corpus, room hotspot corpus 整備 |
+| F-4 | ✅完了 | `--repro-eval` による async noise 切り分け |
+| F-5 | ✅完了 | GitHub-friendly docs (`docs/index.md` 等) を自動生成 |
+| F-6 | 進行中 | universal default の判定。まだ勝者不在 |
+| F-7 | 未着手 | mode-specific dispatch を experiment として追加するか検討 |
+| F-8 | 未着手 | `room mono` corpus 拡張と repeat gate 強化 |
 
-**タスク:**
-1. 追加データセットを入手（大規模環境、高速移動、低テクスチャ）
-2. ✅ `eval_all.sh` に `--repeat N` オプション追加（N回実行してmean/std出力）
-3. ✅ 結果テーブルと評価手順をREADME.mdに反映
+#### F-6: universal default 判定
 
-**注意:** データセット名はREADME/plan.mdで伏せる（"Seq A/B/C..."）
+**現在の判断:**
 
-### Phase B: DL深度の差別化強化
+- runtime default は `heuristic`
+- `score` は overall candidate
+- `pipeline` は hotspot candidate
+- どれも universal migration には未達
+
+**昇格条件:**
+
+1. curated corpus で劣化しない
+2. real-trace single-run で勝つ
+3. repeat replay でも勝つ
+4. room hotspot で catastrophic regression を起こさない
+
+#### F-8: `room mono` corpus 拡張
+
+Claude に最も引き継ぎたい next step はこれである。
+
+候補:
+1. `room_mono_mid`, `room_mono_late`, `room_mono_recovery` 相当の replay 窓を追加
+2. repeat を `2` から `5` へ上げ、mean/std の順位が維持されるか確認
+3. 必要なら `mode=mono` だけの別 decision table を docs に持つ
+
+### Phase B: DL 深度の差別化強化
 
 | Task | Status | 内容 |
 |------|--------|------|
@@ -436,77 +592,32 @@ ctest --output-on-failure
 | B-2 | 未着手 | GPU推論（CUDA ExecutionProvider） |
 | B-3 | 未着手 | DL Depth品質向上（confidence map、temporal consistency） |
 
-#### B-1: Metric DL Depth対応
-
-**背景:** 現在のDepth Anything v2はrelative depth（スケール不定）。Metric3D v2/UniDepthはmetric scaleを直接出力。
-
-**タスク:**
-1. `src/depth/metric_depth_estimator.h/cc` 新規作成
-   - Metric3D v2 Small ONNX対応
-   - `isMetric()` → true
-2. `apps/run_mono.cc`: `--depth-metric` フラグ追加
-3. depth_is_metric_ = true で動作 → sensor depth同等の初期化・BA精度
-
-**検証:** DL metric depth + Seq Aで ATE < 0.03m
-
-#### B-2: GPU推論
-
-**タスク:**
-1. `onnx_depth_estimator.cc`: CUDAProviderOptions追加
-2. CMake: `USE_CUDA` オプション
-3. CLI: `--depth-gpu`
-4. GPU推論なら毎フレーム推論（5フレームスキップ不要）
-
 ### Phase C: 堅牢性強化
 
 | Task | Status | 内容 |
 |------|--------|------|
 | C-1 | ✅完了 | mergeLandmarksダブルロック、observations_ロック統一、getPos() mutex |
-| C-2 | 未着手 | Map read-write lock導入 |
-| C-3 | 未着手 | 再ローカライズ改善（DBoW2 place recognition） |
-| C-4 | 未着手 | メモリ管理（KF/LM間引き） |
+| C-2 | 未着手 | `Map` の read/write discipline 明確化 |
+| C-3 | 未着手 | relocalization 改善 |
+| C-4 | 未着手 | KF/LM 間引きとメモリ管理 |
 
-#### C-2: Map read-write lock
-
-**タスク:**
-1. `Map::mutex_` → `std::shared_mutex rw_mutex_`
-2. addKeyframe/addLandmark: `std::unique_lock` (write)
-3. getAllKeyframes/getAllLandmarks: `std::shared_lock` (read)
-4. loop_correcting_ フラグを廃止可能に
-
-### Phase D: 拡張機能
+### Phase D: 機能拡張
 
 | Task | Status | 内容 |
 |------|--------|------|
-| D-1 | 未着手 | Stereo入力対応 |
-| D-2 | 未着手 | IMU tight coupling（pre-integration + BA IMU residual） |
-| D-3 | 未着手 | 3D Gaussian Splatting マッピング（実験的） |
-| D-4 | 未着手 | ROS 2ノード化 |
+| D-1 | 未着手 | Stereo 入力対応 |
+| D-2 | 未着手 | IMU tight coupling |
+| D-3 | 未着手 | 3D Gaussian Splatting マッピング |
+| D-4 | 未着手 | ROS 2 ノード化 |
 
-### Phase E: コミュニティ・ドキュメント
+### Phase E: コミュニティ / 公開整備
 
 | Task | Status | 内容 |
 |------|--------|------|
-| E-1 | 未着手 | チュートリアル記事「5000行で作るVisual SLAM」 |
+| E-1 | 未着手 | チュートリアル記事 |
 | E-2 | 未着手 | GitHub Actions CI |
-| E-3 | 未着手 | Contributing guide、コーディング規約 |
-| E-4 | 未着手 | LICENSE ファイル作成（BSD-2-Clause） |
-
-#### E-2: GitHub Actions CI
-
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get install -y libopencv-dev libeigen3-dev libgoogle-glog-dev libgflags-dev
-      - run: mkdir build && cd build && cmake .. -DBUILD_TESTS=ON && make -j$(nproc)
-      - run: cd build && ctest --output-on-failure
-```
+| E-3 | 未着手 | Contributing guide |
+| E-4 | 未着手 | `LICENSE` 作成（BSD-2-Clause） |
 
 ---
 
@@ -522,90 +633,218 @@ jobs:
 | ONNX Runtime 1.17+ | MIT | opt | FC (pre-built) |
 | Google Test 1.14 | BSD-3 | opt | FC |
 
-**全依存がBSD/MIT/Apache互換。GPL汚染なし。**
+全依存は BSD / MIT / Apache 互換で、GPL 汚染はない。
 
 ---
 
-## 7. ビルドと実行
+## 7. ビルド・実行・評価
 
 ```bash
 # 依存 (Ubuntu 22.04)
 sudo apt install -y libopencv-dev libeigen3-dev libgoogle-glog-dev libgflags-dev
 
-# ビルド
-mkdir build && cd build
-cmake .. && make -j$(nproc)
+# 標準ビルド
+cmake -S . -B build
+cmake --build build -j$(nproc)
 
-# DL Depth付き
-cmake .. -DUSE_DEPTH_DL=ON && make -j$(nproc)
+# DL depth を有効化
+cmake -S . -B build -DUSE_DEPTH_DL=ON
+cmake --build build -j$(nproc)
 
 # テスト
-cmake .. -DBUILD_TESTS=ON && make -j$(nproc) && ctest --output-on-failure
+cmake -S . -B build -DBUILD_TESTS=ON
+cmake --build build -j$(nproc) --target svslam_tests
+ctest --test-dir build --output-on-failure
 
-# 実行
-./run_mono --tum <dir> --no-viz                    # mono
-./run_mono --tum <dir> --depth --no-viz            # + depth sensor
-./run_mono --tum <dir> --depth --accel --no-viz    # + accelerometer
-./run_mono --tum <dir> --depth-model ../models/depth_anything_v2_small.onnx --no-viz  # DL depth
+# 通常実行
+./build/run_mono --tum <dir> --no-viz
+./build/run_mono --tum <dir> --depth --no-viz
+./build/run_mono --tum <dir> --depth --accel --no-viz
+./build/run_mono --tum <dir> --depth-model models/depth_anything_v2_small.onnx --no-viz
 
-# DLモデル入手
-wget -O models/depth_anything_v2_small.onnx \
-  https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx
+# experiment seam を切り替えて bounded replay
+./build/run_mono --tum <dir> --reference-policy heuristic --skip-frames 0 --max-frames 200 --repro-eval --no-viz
+./build/run_mono --tum <dir> --reference-policy score --skip-frames 0 --max-frames 200 --repro-eval --no-viz
+./build/run_mono --tum <dir> --reference-policy pipeline --skip-frames 0 --max-frames 200 --repro-eval --no-viz
 
-# 一括評価
+# high-level SLAM evaluation
 bash scripts/eval_all.sh
+bash scripts/eval_all.sh --repeat 3
+
+# reference policy evaluation
+bash scripts/eval_reference_policies.sh --repeat 1
+bash scripts/eval_reference_policies.sh --repeat 2 \
+  --output eval_results/reference_keyframe_policy/real_trace_metrics_repeat2.csv
+bash scripts/eval_reference_policies.sh --repeat 2 \
+  --corpus experiments/reference_keyframe/room_focus_corpus.tsv \
+  --output eval_results/reference_keyframe_policy/room_focus_repeat2.csv
+
+# docs refresh
+./scripts/update_reference_policy_docs.py
 ```
+
+補足:
+
+- `scripts/eval_reference_policies.sh` は build 済み `run_mono` と `evo_ape` を前提にする
+- policy 比較時は基本 `--repro-eval` を使う
+- `--no-repro` は async scheduling を含めた挙動を見たいときだけ使う
 
 ---
 
-## 8. コーディング規約
+## 8. コーディング / 実験規約
 
 - C++17, namespace `svslam`
-- `T_cw_` = Transform Camera←World（ORB-SLAM慣例）
-- `SE3` for rigid, `Sim3` for similarity (Sophus)
-- `Vec3 = Eigen::Vector3d`, `Mat33 = Eigen::Matrix3d`
-- `using Ptr = std::shared_ptr<ClassName>`
-- ファイル: `snake_case.h/.cc`, クラス: `PascalCase`, メンバ: `snake_case_`
-- `#pragma once`, コメントは英語
-- テスト: Google Test, `tests/test_*.cc`
+- `T_cw_` = Transform Camera←World
+- `SE3` は rigid、`Sim3` は similarity
+- ファイル名は `snake_case.*`、クラスは `PascalCase`、メンバは `snake_case_`
+- コメントは英語を優先
+- broad abstract refactor は禁止。比較可能な seams だけを切り出す
+- 新しい policy を足すなら、必ず以下を一緒に更新する:
+  1. `src/core/reference_keyframe_policy.h`
+  2. `src/tracking/tracking.cc` の input population
+  3. `experiments/reference_keyframe/scenarios.csv`
+  4. `tools/reference_policy_experiments.cc`
+  5. `tests/test_reference_keyframe_policy.cc`
+  6. `scripts/update_reference_policy_docs.py` が読める評価 CSV
+  7. `docs/*.md` の再生成
 
 ---
 
 ## 9. 優先順位
 
+```text
+比較可能性 > 安定性 > 精度 > 機能数 > 速度 > 見栄え
 ```
-安定性 > 精度 > 機能数 > 速度 > 見栄え
-```
+
+このリポジトリでは今、綺麗な抽象より「同条件で比較できる複数実装」が優先される。
 
 ---
 
 ## 10. 非目標
 
-- リアルタイムAR/VR低レイテンシ最適化
-- LiDAR / Event Camera / ToF
-- 大規模環境（km規模）
-- end-to-end Deep SLAM（DROID-SLAM的）
-- Web UI / GUI
+- 今すぐ universal な美しい抽象を作ること
+- 1つの policy 実装を急いで正解扱いすること
+- Web UI / GUI を main feature にすること
+- LiDAR / Event Camera / ToF への横展開を先にやること
+- end-to-end Deep SLAM へ寄せること
 
 ---
 
-## 11. git履歴（コミット順 = チュートリアル順）
+## 11. git 履歴（重要マイルストーン）
 
-```
-f8b0e1e Initial implementation: Core classes, Tracking, Initialization, LocalMapping
-2515eea Fix Sophus, Initialization, add PnP to Reference Tracking
-b1a2e42 Improve tracking robustness
-eada60d Map Persistence (Save/Load)
-7ba00e3 Fix init triangulation; add TUM/EuRoC loaders
-e91de1f Improve tracking stability: BA pose sync, matching quality, relocalization
-51c5ee4 Tighten tracking matching thresholds
-6647223 Integrate depth sensor + accelerometer
-fffb3e6 Add DL depth estimation (ONNX Runtime, Depth Anything v2)
-5c48e38 Add gravity constraint in BA (Phase 2.4)
-b88dac3 Add evaluation scripts, DL depth frame skip
+```text
+6435a99 Merge pull request #1 from rsasaki0109/codex/reference-policy-experiments
+b8ddbdd add reference policy experiment workflow
+73eda32 Final plan.md update for complete Codex handoff
+f4fc265 Merge worker results: precision stabilization, thread safety, README, unit tests
+5639305 Comprehensive plan update for Codex handoff: architecture, threading, constants, known issues, detailed roadmap
+e2a3680 Update plan with comprehensive OSS roadmap and competitive analysis
+66d5813 Fix loop closing thread safety and improve eval script
 1fb546c Fix loop closing thread safety (atomic flag)
-66d5813 Fix poseGraph snapshot (root cause of segfault)
-e2a3680 OSS roadmap
-5639305 Comprehensive plan for Codex handoff
-f4fc265 Merge: precision stabilization, thread safety, README, unit tests
+b88dac3 Add evaluation scripts, DL depth frame skip
+5c48e38 Add gravity constraint in BA
+fffb3e6 Add deep learning depth estimation via ONNX Runtime
+6647223 Integrate depth sensor + accelerometer
 ```
+
+`6435a99` が「experiment surface + public docs + GitHub Pages」まで含む現在の起点である。
+
+---
+
+## 12. Claude への引き継ぎ
+
+### 12.1 最初に読む順番
+
+Claude が作業を始めるなら、読む順番はこれでよい。
+
+1. `plan.md` のこの章
+2. `docs/index.md`
+3. `docs/decisions.md`
+4. `docs/interfaces.md`
+5. `scripts/eval_reference_policies.sh`
+6. `src/core/reference_keyframe_policy.h`
+7. `src/tracking/tracking.cc` の policy input 生成箇所
+
+その後に必要なら `docs/experiments.md` と `tools/reference_policy_experiments.cc` を読む。
+
+### 12.2 Claude に期待する役割
+
+Claude に期待するのは「abstract architect」ではなく、「比較面を壊さずに探索空間を広げる worker」である。
+
+やってよいこと:
+
+- corpus の追加
+- repeat gate の強化
+- mode-specific dispatch を **新しい実験** として追加
+- `has_accel` のように、本当に surviving した field だけ interface に昇格
+
+やってはいけないこと:
+
+- `score` / `pipeline` を早計に core へ移す
+- policy から `Frame*`, `Keyframe*`, `Map*` を見せて比較可能性を壊す
+- docs regen を飛ばして `docs/` を stale にする
+- `room mono` の variance を無視して single-run の勝敗だけで判断する
+
+### 12.3 まずやるべき次タスク
+
+最優先はこれ。
+
+1. `experiments/reference_keyframe/room_focus_corpus.tsv` を拡張し、`room mono` の中盤・後半・回復局面を増やす
+2. `bash scripts/eval_reference_policies.sh --repeat 5 --mode mono ...` を回す
+3. `score` と `pipeline` の順位が repeat-5 でも維持されるかを見る
+4. 必要なら mode-specific dispatch を experiment 実装として追加する
+5. 結果を docs regen で GitHub / Pages に反映する
+
+### 12.4 policy seam を触るときの実務ルール
+
+policy 入力を増減させるなら、必ず「なぜその field が surviving したか」を説明できなければならない。
+
+チェックリスト:
+
+- curated corpus で使うか
+- real-trace replay でも使うか
+- implementation ごとの差ではなく input として比較可能か
+- field を消したときに policy 間比較がむしろ明快になるか
+
+説明できない field は足さない。抽象は **後から発見** する。
+
+### 12.5 public repo としての注意
+
+repo は public、Pages も public である。
+
+- GitHub repo: `https://github.com/rsasaki0109/simple_visual_slam`
+- Pages: `https://rsasaki0109.github.io/simple_visual_slam/`
+
+したがって、`docs/` の内容は external-facing artifact でもある。内部メモのつもりで壊れた表や stale な数字を push しないこと。
+
+### 12.6 触らないもの
+
+少なくとも引き継ぎ開始時点では、以下は今回の PR scope 外だったため勝手に巻き込まない。
+
+- `slam_result.jpg`
+- `.claude/`
+- `AGENTS.md`
+- `data/`
+- `scripts/__pycache__/`
+
+### 12.7 終了条件
+
+Claude の 1 ターンの終了条件は「抽象が美しいこと」ではない。以下のどれかを満たしたら十分である。
+
+- corpus / repeat gate を1段前進させた
+- docs / decisions を fresh な結果で更新した
+- mode-specific dispatch の可否を比較可能な形で追加した
+- universal default を据え置く理由を、より明快な証拠で補強した
+
+---
+
+## 13. Public URLs / 公開物
+
+- Repository: `https://github.com/rsasaki0109/simple_visual_slam`
+- GitHub Pages: `https://rsasaki0109.github.io/simple_visual_slam/`
+- Landing page: `docs/index.md`
+- Decision record: `docs/decisions.md`
+- Experiment tables: `docs/experiments.md`
+- Minimal interface: `docs/interfaces.md`
+
+`plan.md` は内部 handoff 文書、`docs/` は public digest、`README.md` は入口、という役割分担で考えること。
