@@ -533,7 +533,7 @@ bash scripts/eval_reference_policies.sh --repeat 5 \
 # docs 再生成
 ./scripts/update_reference_policy_docs.py
 
-# ローカル回帰ゲート（TUM xyz+room 配置 + evo_ape 推奨）
+# ローカル回帰ゲート（TUM xyz+room、mono/depth/depth+accel、evo_ape 推奨。全ゲートで数分）
 python3 scripts/check_regression_gate.py --all-gates --quiet
 ```
 
@@ -701,7 +701,7 @@ TUM / EuRoC 固定で、設定ファイル読み込みはまだない。実験�
 |------|--------|------|
 | E-1 | 未着手 | チュートリアル記事 |
 | E-2 | ✅完了（最小） | GitHub Actions: Ubuntu で Ninja ビルド + `ctest`。`workflow_dispatch` 可。docs/replay は未 |
-| E-3 | 未着手 | Contributing guide |
+| E-3 | ✅完了 | `CONTRIBUTING.md`（ビルド・ゲート・コミット方針） |
 | E-4 | ✅完了 | リポジトリ直下 `LICENSE`（BSD-2-Clause） |
 
 ---
