@@ -8,6 +8,15 @@
     "0.05"
   ],
   "gates": {
+    "xyz_mono_head_repro": {
+      "description": "TUM freiburg1 xyz, mono, frames 0-250, heuristic, --repro-eval (README 'Seq A' class).",
+      "tum_sequence": "rgbd_dataset_freiburg1_xyz",
+      "reference_policy": "heuristic",
+      "skip_frames": 0,
+      "max_frames": 250,
+      "repro_eval": true,
+      "max_mean_ape_m": 0.04
+    },
     "room_mono_head_repro": {
       "description": "TUM freiburg1 room, mono, frames 0-250, heuristic, --repro-eval; same window as experiments/reference_keyframe/room_focus_corpus.tsv room_mono_head.",
       "tum_sequence": "rgbd_dataset_freiburg1_room",
