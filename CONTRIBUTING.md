@@ -24,6 +24,10 @@
 
 - `data/` (datasets), `build/`, `eval_results/`, large artifacts — see `.gitignore`.
 
+## Maintainers
+
+Release and version bumps: [RELEASING.md](RELEASING.md). User-facing changes: [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 By contributing, you agree your contributions are under the same **BSD-2-Clause** terms as [LICENSE](LICENSE).

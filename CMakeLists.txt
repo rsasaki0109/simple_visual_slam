@@ -223,8 +223,16 @@ if(USE_DEPTH_DL)
 endif()
 
 
-# App
+# App (generated headers: semver matches project(VERSION))
+set(SVSLAM_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/svslam_version.h.in
+    ${SVSLAM_GENERATED_INCLUDE_DIR}/svslam_version.h
+    @ONLY
+)
+
 add_executable(run_mono apps/run_mono.cc)
+target_include_directories(run_mono PRIVATE ${SVSLAM_GENERATED_INCLUDE_DIR})
 target_link_libraries(run_mono PRIVATE svslam_core svslam_reference_policy_experiments)
 
 add_executable(reference_policy_experiments

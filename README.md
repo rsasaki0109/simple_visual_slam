@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/rsasaki0109/simple_visual_slam/actions/workflows/ci.yml/badge.svg)](https://github.com/rsasaki0109/simple_visual_slam/actions/workflows/ci.yml)
 
-A lightweight, readable visual SLAM system with deep learning depth integration.
+A lightweight, readable visual SLAM system with deep learning depth integration. Version **0.1.x** (see `project(VERSION)` in CMake; run `./build/run_mono --version`). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Features
 

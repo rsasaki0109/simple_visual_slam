@@ -30,11 +30,19 @@
 #include <stdexcept>
 #include <thread>
 
+#include "svslam_version.h"
+
 using namespace svslam;
 
 int main(int argc, char** argv) {
+    if (argc >= 2 && (std::string(argv[1]) == "--version" || std::string(argv[1]) == "-V")) {
+        std::cout << "SimpleVisualSLAM " << SVSLAM_VERSION_STRING << std::endl;
+        return 0;
+    }
+
     if (argc < 2) {
         std::cerr << "Usage:\n"
+                  << "  ./run_mono --version | -V     (print semver from CMake project VERSION)\n"
                   << "  ./run_mono <video_path> [vocab_path]\n"
                   << "  ./run_mono --euroc <sequence_dir> [vocab_path]\n"
                   << "  ./run_mono --tum <sequence_dir> [--depth] [--accel] [--repro-eval] [--reference-policy <heuristic|score|pipeline>] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [vocab_path]\n" << std::endl;
