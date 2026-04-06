@@ -533,7 +533,7 @@ bash scripts/eval_reference_policies.sh --repeat 5 \
 # docs 再生成
 ./scripts/update_reference_policy_docs.py
 
-# ローカル回帰ゲート（TUM xyz+room、mono/depth/depth+accel、evo_ape 推奨。全ゲートで数分）
+# ローカル回帰ゲート（TUM xyz+room、mono/depth/depth+accel 計5シナリオ、evo_ape 推奨。全ゲートで ~10 分級）
 python3 scripts/check_regression_gate.py --all-gates --quiet
 ```
 

@@ -18,7 +18,7 @@
    python3 scripts/check_regression_gate.py --all-gates --quiet
    ```
 
-   Adjust ceilings in `eval/regression_baselines.json` only when a change **intentionally** shifts accuracy (document why in the commit message).
+   This runs every entry in `eval/regression_baselines.json` (several TUM windows; full run is often ~10+ minutes locally). Adjust ceilings in that file only when a change **intentionally** shifts accuracy (document why in the commit message).
 
 ## What not to commit
 
