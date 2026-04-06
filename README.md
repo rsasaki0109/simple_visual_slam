@@ -76,7 +76,7 @@ Current snapshot:
 - Full repeat-2 replay: `score` stays best overall, but no single policy wins every mode
 - Runtime default remains `heuristic` until one policy wins across curated, replay, and repeat gates
 
-**Local regression gate (data required):** With TUM sequences under `data/tum/` (see `eval/regression_baselines.json`) and `evo_ape` installed, run `python3 scripts/check_regression_gate.py --quiet` from the repo root. This checks `--repro-eval` bitwise trajectory match on two runs and compares mean ATE (same `evo_ape` flags as `scripts/eval_reference_policies.sh`) to per-scenario ceilings. Use `--all-gates` to run every scenario in the JSON (mono / depth / depth+accel on room, mono on xyz), `--gate <name>` for one scenario, and `--skip-ate` for reproducibility only. Contributor-oriented notes: [CONTRIBUTING.md](CONTRIBUTING.md).
+**Local regression gate (data required):** With TUM sequences under `data/tum/` (see `eval/regression_baselines.json`) and `evo_ape` installed, run `python3 scripts/check_regression_gate.py --quiet` from the repo root. This checks `--repro-eval` bitwise trajectory match on two runs and compares mean ATE (same `evo_ape` flags as `scripts/eval_reference_policies.sh`) to per-scenario ceilings. Use `--all-gates` to run every scenario in the JSON (room: mono, depth, depth+accel; xyz: mono, depth), `--gate <name>` for one scenario, and `--skip-ate` for reproducibility only. Contributor-oriented notes: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Ceres parallelism:** Bundle adjustment and pose-graph solves default to **one thread** for repeatable results. For faster (possibly run-to-run variable) solves, set e.g. `export SVSLAM_CERES_NUM_THREADS=8` before running `run_mono`.
 
