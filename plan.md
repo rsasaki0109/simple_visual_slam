@@ -702,7 +702,7 @@ TUM / EuRoC 固定で、設定ファイル読み込みはまだない。実験�
 | E-1 | 未着手 | チュートリアル記事 |
 | E-2 | ✅完了（最小） | GitHub Actions: Ubuntu で Ninja ビルド + `ctest`。`workflow_dispatch` 可。docs/replay は未 |
 | E-3 | 未着手 | Contributing guide |
-| E-4 | 未着手 | `LICENSE` 作成（BSD-2-Clause） |
+| E-4 | ✅完了 | リポジトリ直下 `LICENSE`（BSD-2-Clause） |
 
 ---
 

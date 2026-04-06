@@ -13,7 +13,7 @@ A lightweight, readable visual SLAM system with deep learning depth integration.
 - **Loop closing** -- DBoW2 place recognition with Sim(3) pose graph optimization
 - **Map persistence** -- save and load maps for relocalization across sessions
 - **~6,000 lines of C++** -- designed to be readable and educational rather than maximally optimized
-- **BSD-2-Clause license** -- all dependencies are GPL-free
+- **BSD-2-Clause license** ([LICENSE](LICENSE)) -- all dependencies are GPL-free
 
 ## Architecture
 

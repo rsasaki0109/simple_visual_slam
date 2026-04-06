@@ -42,18 +42,22 @@ def run_slam(build_dir: Path, tum_dir: Path, gate: dict, *, quiet: bool) -> None
         sys.stderr.write(f"Missing {exe}; build the project first.\n")
         sys.exit(1)
 
-    cmd = [
-        str(exe),
-        "--tum",
-        str(tum_dir),
-        "--reference-policy",
-        str(gate["reference_policy"]),
-        "--skip-frames",
-        str(int(gate["skip_frames"])),
-        "--max-frames",
-        str(int(gate["max_frames"])),
-        "--no-viz",
-    ]
+    cmd = [str(exe), "--tum", str(tum_dir)]
+    if gate.get("use_depth"):
+        cmd.append("--depth")
+    if gate.get("use_accel"):
+        cmd.append("--accel")
+    cmd.extend(
+        [
+            "--reference-policy",
+            str(gate["reference_policy"]),
+            "--skip-frames",
+            str(int(gate["skip_frames"])),
+            "--max-frames",
+            str(int(gate["max_frames"])),
+            "--no-viz",
+        ]
+    )
     if gate.get("repro_eval", True):
         cmd.append("--repro-eval")
 

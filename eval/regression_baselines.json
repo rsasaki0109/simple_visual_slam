@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "comment": "evo_ape flags must stay aligned with scripts/eval_reference_policies.sh (mean ATE after Sim(3)).",
+  "comment": "evo_ape flags must stay aligned with scripts/eval_reference_policies.sh (mean ATE after Sim(3)). Optional gate fields: use_depth, use_accel (TUM flags).",
   "evo_ape_extra_args": [
     "--align",
     "--correct_scale",
@@ -8,14 +8,15 @@
     "0.05"
   ],
   "gates": {
-    "xyz_mono_head_repro": {
-      "description": "TUM freiburg1 xyz, mono, frames 0-250, heuristic, --repro-eval (README 'Seq A' class).",
-      "tum_sequence": "rgbd_dataset_freiburg1_xyz",
+    "room_depth_head_repro": {
+      "description": "TUM freiburg1 room, RGB-D (--depth), frames 0-250, heuristic, --repro-eval.",
+      "tum_sequence": "rgbd_dataset_freiburg1_room",
       "reference_policy": "heuristic",
       "skip_frames": 0,
       "max_frames": 250,
       "repro_eval": true,
-      "max_mean_ape_m": 0.04
+      "use_depth": true,
+      "max_mean_ape_m": 0.2
     },
     "room_mono_head_repro": {
       "description": "TUM freiburg1 room, mono, frames 0-250, heuristic, --repro-eval; same window as experiments/reference_keyframe/room_focus_corpus.tsv room_mono_head.",
@@ -25,6 +26,15 @@
       "max_frames": 250,
       "repro_eval": true,
       "max_mean_ape_m": 0.34
+    },
+    "xyz_mono_head_repro": {
+      "description": "TUM freiburg1 xyz, mono, frames 0-250, heuristic, --repro-eval (README 'Seq A' class).",
+      "tum_sequence": "rgbd_dataset_freiburg1_xyz",
+      "reference_policy": "heuristic",
+      "skip_frames": 0,
+      "max_frames": 250,
+      "repro_eval": true,
+      "max_mean_ape_m": 0.04
     }
   }
 }
