@@ -533,8 +533,8 @@ bash scripts/eval_reference_policies.sh --repeat 5 \
 # docs 再生成
 ./scripts/update_reference_policy_docs.py
 
-# ローカル回帰ゲート（TUM room 配置 + evo_ape 推奨）
-python3 scripts/check_regression_gate.py --quiet
+# ローカル回帰ゲート（TUM xyz+room 配置 + evo_ape 推奨）
+python3 scripts/check_regression_gate.py --all-gates --quiet
 ```
 
 注意: CMake キャッシュが別パスで作られていた場合は `rm -rf build` してから再構成する必要がある（2026-04-06 にこの問題に遭遇）。Ceres のスレッド数は未設定時 **1**（再現性優先）。`SVSLAM_CERES_NUM_THREADS` で上書き可（`README.md` 参照）。

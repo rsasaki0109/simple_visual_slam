@@ -76,7 +76,7 @@ Current snapshot:
 - Full repeat-2 replay: `score` stays best overall, but no single policy wins every mode
 - Runtime default remains `heuristic` until one policy wins across curated, replay, and repeat gates
 
-**Local regression gate (data required):** With `data/tum/rgbd_dataset_freiburg1_room` present and `evo_ape` installed, run `python3 scripts/check_regression_gate.py --quiet` from the repo root. This checks `--repro-eval` bitwise trajectory match on two runs and compares mean ATE (same `evo_ape` flags as `scripts/eval_reference_policies.sh`) to the ceiling in `eval/regression_baselines.json`. Use `--skip-ate` for the reproducibility check only.
+**Local regression gate (data required):** With TUM sequences under `data/tum/` (see `eval/regression_baselines.json`) and `evo_ape` installed, run `python3 scripts/check_regression_gate.py --quiet` from the repo root. This checks `--repro-eval` bitwise trajectory match on two runs and compares mean ATE (same `evo_ape` flags as `scripts/eval_reference_policies.sh`) to per-scenario ceilings. Use `--all-gates` to run every scenario in the JSON, `--gate <name>` for one scenario, and `--skip-ate` for reproducibility only.
 
 **Ceres parallelism:** Bundle adjustment and pose-graph solves default to **one thread** for repeatable results. For faster (possibly run-to-run variable) solves, set e.g. `export SVSLAM_CERES_NUM_THREADS=8` before running `run_mono`.
 
