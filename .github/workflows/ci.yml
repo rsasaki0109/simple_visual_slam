@@ -39,5 +39,12 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      - name: run_mono --help
+        run: ./build/run_mono --help
+
       - name: Regression gate script (syntax)
-        run: python3 -m py_compile scripts/check_regression_gate.py && python3 scripts/check_regression_gate.py --help
+        run: |
+          python3 -m py_compile scripts/eval_lib.py scripts/check_regression_gate.py scripts/build_leaderboard.py scripts/print_ate_mean.py
+          python3 scripts/check_regression_gate.py --help
+          python3 scripts/build_leaderboard.py --help
+          python3 scripts/build_leaderboard.py --dry-run

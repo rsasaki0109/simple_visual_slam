@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "core/common.h"
 #include "core/frame.h"
 #include "core/map.h"
@@ -20,6 +22,14 @@ enum class TrackingState {
     LOST = 3
 };
 
+// Aggregated counters for a tracking session (useful for health monitoring / automation).
+struct TrackingRunStatistics {
+    uint64_t reloc_attempts = 0;
+    uint64_t reloc_successes = 0;
+    uint64_t frames_tracking_lost = 0;
+    uint64_t reinit_successes = 0;
+};
+
 class Tracking {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -31,6 +41,8 @@ public:
     void setLocalMapping(std::shared_ptr<LocalMapping> local_mapping);
     void setReferenceKeyframePolicy(std::unique_ptr<ReferenceKeyframePolicy> policy);
     bool addFrame(Frame::Ptr frame);
+
+    TrackingRunStatistics runStatistics() const { return run_stats_; }
 
     // Callback from LocalMapping when BA is completed
     void onBACompleted();
@@ -87,6 +99,8 @@ private:
     Frame::Ptr reinit_reference_frame_;
     Initializer::Ptr reinit_initializer_;
     static constexpr int reinit_trigger_frames_ = 20;  // Start re-init after this many lost frames
+
+    TrackingRunStatistics run_stats_;
 };
 
 }

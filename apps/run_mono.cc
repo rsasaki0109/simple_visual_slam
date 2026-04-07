@@ -16,6 +16,7 @@
 #include "core/map.h"
 #include "io/euroc_dataset.h"
 #include "io/tum_dataset.h"
+#include "io/tum_pinhole_calibration.h"
 #include "io/map_io.h"
 #include "core/heuristic_reference_keyframe_policy.h"
 #include "experiments/reference_keyframe/pipeline_reference_keyframe_policy.h"
@@ -34,18 +35,80 @@
 
 using namespace svslam;
 
+namespace {
+
+constexpr const char* kRunSummarySchema = "svslam.run_summary.v1";
+
+void print_help(std::ostream& os) {
+    os << "SimpleVisualSLAM " << SVSLAM_VERSION_STRING << " - run_mono\n\n"
+       << "USAGE\n"
+       << "  run_mono --version | -V\n"
+       << "  run_mono --help | -h\n"
+       << "  run_mono <video_path> [ORBvocab.txt]\n"
+       << "  run_mono --euroc <sequence_dir> [ORBvocab.txt]\n"
+       << "  run_mono --tum <sequence_dir> [options] [ORBvocab.txt]\n"
+       << "\n"
+       << "TUM OPTIONS\n"
+       << "  --tum-camera-config <calib.json>   Pinhole intrinsics (+optional distortion); else fr1 defaults\n"
+       << "  --depth                             Use depth.txt / sensor depth when available\n"
+       << "  --accel                             Load accelerometer.txt into tracker when available\n"
+       << "  --repro-eval                        Synchronous mapping; deterministic BA ordering for replay\n"
+       << "  --reference-policy <heuristic|score|pipeline>\n"
+       << "  --skip-frames N   --max-frames N\n"
+       << "  --depth-model <model.onnx>          DL depth (build with -DUSE_DEPTH_DL=ON)\n"
+       << "  --no-viz                            No OpenCV imshow window\n"
+       << "  --run-summary-json <path>          Machine-readable run stats (see schema in source)\n"
+       << "  --strict-exit                       Exit 3 if tracking did not finish in OK state\n"
+       << "\n"
+       << "ORB vocabulary: last positional argument, or search data/ORBvoc.txt then ORBvoc.txt\n";
+}
+
+bool write_run_summary_json(const std::string& path,
+                            int final_tracking_state,
+                            int processed_frames,
+                            int skipped_frames,
+                            std::size_t keyframe_count,
+                            std::size_t landmark_count,
+                            const TrackingRunStatistics& st,
+                            bool map_saved) {
+    std::ofstream out(path);
+    if (!out) {
+        std::cerr << "Failed to open --run-summary-json: " << path << std::endl;
+        return false;
+    }
+    out << "{\"schema\":\"" << kRunSummarySchema << "\","
+        << "\"version\":\"" << SVSLAM_VERSION_STRING << "\","
+        << "\"final_tracking_state\":" << final_tracking_state << ','
+        << "\"processed_frames\":" << processed_frames << ','
+        << "\"skipped_frames\":" << skipped_frames << ','
+        << "\"keyframes\":" << keyframe_count << ','
+        << "\"landmarks\":" << landmark_count << ','
+        << "\"reloc_attempts\":" << st.reloc_attempts << ','
+        << "\"reloc_successes\":" << st.reloc_successes << ','
+        << "\"frames_tracking_lost\":" << st.frames_tracking_lost << ','
+        << "\"reinit_successes\":" << st.reinit_successes << ','
+        << "\"map_saved\":" << (map_saved ? "true" : "false") << "}\n";
+    return static_cast<bool>(out);
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     if (argc >= 2 && (std::string(argv[1]) == "--version" || std::string(argv[1]) == "-V")) {
         std::cout << "SimpleVisualSLAM " << SVSLAM_VERSION_STRING << std::endl;
         return 0;
     }
+    if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+        print_help(std::cout);
+        return 0;
+    }
 
     if (argc < 2) {
-        std::cerr << "Usage:\n"
+        std::cerr << "Usage: run_mono --help   (full options)\n"
                   << "  ./run_mono --version | -V     (print semver from CMake project VERSION)\n"
                   << "  ./run_mono <video_path> [vocab_path]\n"
                   << "  ./run_mono --euroc <sequence_dir> [vocab_path]\n"
-                  << "  ./run_mono --tum <sequence_dir> [--depth] [--accel] [--repro-eval] [--reference-policy <heuristic|score|pipeline>] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [vocab_path]\n" << std::endl;
+                  << "  ./run_mono --tum <sequence_dir> [--tum-camera-config <calib.json>] [--depth] [--accel] [--repro-eval] [--reference-policy <heuristic|score|pipeline>] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [--run-summary-json <path>] [--strict-exit] [vocab_path]\n" << std::endl;
         return -1;
     }
 
@@ -59,6 +122,9 @@ int main(int argc, char** argv) {
     int skip_frames = 0;
     std::string reference_policy_name = "heuristic";
     std::string depth_model_path;
+    std::string tum_camera_config;
+    std::string run_summary_json_path;
+    bool strict_exit = false;
     std::string euroc_seq_dir;
     std::string tum_seq_dir;
     std::string input_path;
@@ -133,6 +199,12 @@ int main(int argc, char** argv) {
                 max_frames = parse_non_negative_int(argv[++i], "--max-frames");
             } else if (arg == "--depth-model" && i + 1 < argc) {
                 depth_model_path = argv[++i];
+            } else if (arg == "--tum-camera-config" && i + 1 < argc) {
+                tum_camera_config = argv[++i];
+            } else if (arg == "--run-summary-json" && i + 1 < argc) {
+                run_summary_json_path = argv[++i];
+            } else if (arg == "--strict-exit") {
+                strict_exit = true;
             }
         }
     } catch (const std::exception& e) {
@@ -166,7 +238,17 @@ int main(int argc, char** argv) {
             }
         }
         if (use_tum) {
-            tum = TumRgbdDataset(tum_seq_dir);
+            if (!tum_camera_config.empty()) {
+                TumPinholeCalibration cal;
+                std::string cal_err;
+                if (!TumPinholeCalibration::load_json_file(tum_camera_config, cal, cal_err)) {
+                    std::cerr << "Failed to load --tum-camera-config: " << cal_err << std::endl;
+                    return -1;
+                }
+                tum = TumRgbdDataset(tum_seq_dir, cal);
+            } else {
+                tum = TumRgbdDataset(tum_seq_dir);
+            }
             if (!tum.isValid()) {
                 std::cerr << "Failed to open TUM dataset: " << tum_seq_dir << "\n"
                           << "Reason: " << tum.error() << std::endl;
@@ -213,12 +295,13 @@ int main(int argc, char** argv) {
     // Find vocab path: last argument that isn't a flag
     for (int i = positional_idx; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--depth-model" || arg == "--reference-policy" ||
-            arg == "--skip-frames" || arg == "--max-frames") {
+        if (arg == "--depth-model" || arg == "--reference-policy" || arg == "--tum-camera-config" ||
+            arg == "--run-summary-json" || arg == "--skip-frames" || arg == "--max-frames") {
             ++i;
             continue;
         }
-        if (arg != "--depth" && arg != "--accel" && arg != "--repro-eval" && arg != "--no-viz") {
+        if (arg != "--depth" && arg != "--accel" && arg != "--repro-eval" && arg != "--no-viz" &&
+            arg != "--strict-exit") {
             vocab_path = arg;
             break;
         }
@@ -453,7 +536,8 @@ int main(int argc, char** argv) {
     
     // Save Map
     std::cout << "Saving map to map.bin..." << std::endl;
-    if (MapIO::saveMap("map.bin", map)) {
+    const bool map_saved_ok = MapIO::saveMap("map.bin", map);
+    if (map_saved_ok) {
         std::cout << "Map saved successfully." << std::endl;
     } else {
         std::cerr << "Failed to save map." << std::endl;
@@ -462,6 +546,17 @@ int main(int argc, char** argv) {
     if (save_keyframe_trajectory("trajectory_keyframes.txt")) {
         std::cout << "Keyframe trajectory saved to trajectory_keyframes.txt (" << map->getAllKeyframes().size()
                   << " keyframes)" << std::endl;
+    }
+
+    const TrackingRunStatistics tr_stats = tracker->runStatistics();
+    if (!run_summary_json_path.empty()) {
+        if (!write_run_summary_json(run_summary_json_path, static_cast<int>(tracker->state_), processed_frames,
+                                    skipped_frames, map->getAllKeyframes().size(), map->getAllLandmarks().size(),
+                                    tr_stats, map_saved_ok)) {
+            std::cerr << "Run summary was not written." << std::endl;
+        } else {
+            std::cout << "Run summary written to " << run_summary_json_path << std::endl;
+        }
     }
 
     // Plan comments for future steps
@@ -495,5 +590,8 @@ int main(int argc, char** argv) {
      *    - Serialize Camera, Keyframes (Pose, Features), Landmarks (Pos, Descriptors), Graph (Weights).
      */
 
+    if (strict_exit && tracker->state_ != TrackingState::OK) {
+        return 3;
+    }
     return 0;
 }

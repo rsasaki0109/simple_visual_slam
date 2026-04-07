@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "io/tum_pinhole_calibration.h"
+
 namespace svslam {
 
 struct AccelEntry {
@@ -25,6 +27,7 @@ public:
     };
 
     explicit TumRgbdDataset(const std::string& seq_dir);
+    TumRgbdDataset(const std::string& seq_dir, const TumPinholeCalibration& calib);
 
     bool isValid() const;
     const std::string& error() const;

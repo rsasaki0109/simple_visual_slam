@@ -1,0 +1,24 @@
+# https://citation-file-format.github.io/
+cff-version: 1.2.0
+title: SimpleVisualSLAM
+message: >-
+  If you use this software in academic work, please cite this repository.
+  For reproducibility, include the version (`./build/run_mono --version`) or git commit hash.
+type: software
+license: BSD-2-Clause
+version: 0.1.0
+date-released: "2026-04-01"
+repository-code: "https://github.com/rsasaki0109/simple_visual_slam"
+url: "https://github.com/rsasaki0109/simple_visual_slam"
+abstract: >-
+  A compact, readable C++17 visual SLAM stack with optional RGB-D, DL depth (ONNX),
+  accelerometer priors, and DBoW2 loop closing, aimed at research and teaching.
+keywords:
+  - SLAM
+  - visual odometry
+  - simultaneous localization and mapping
+  - robotics
+  - computer vision
+  - bundle adjustment
+authors:
+  - name: The SimpleVisualSLAM authors

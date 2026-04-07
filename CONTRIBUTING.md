@@ -1,5 +1,7 @@
 # Contributing
 
+We want this project to stay **trustworthy research OSS**: small, reviewable diffs; runnable evaluation hooks; and honest docs. Improvements that tighten reproducibility (tests, `check_regression_gate`, `build_leaderboard`) or clarify behavior usually beat large refactors with no measurement.
+
 ## Quick start
 
 1. **Build** (with tests):
@@ -16,6 +18,12 @@
 
    ```bash
    python3 scripts/check_regression_gate.py --all-gates --quiet
+   ```
+
+   **Comparison baseline (single preset, fast sanity vs external OSS prep):**
+
+   ```bash
+   bash scripts/verify_comparison_benchmark.sh xyz_depth
    ```
 
    This runs every entry in `eval/regression_baselines.json` (several TUM windows; full run is often ~10+ minutes locally). Adjust ceilings in that file only when a change **intentionally** shifts accuracy (document why in the commit message).

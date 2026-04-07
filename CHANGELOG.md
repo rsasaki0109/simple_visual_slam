@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file. The format is b
 ## [Unreleased]
 
 - Ongoing work toward broader product readiness (see `plan.md`).
+- TUM runner: optional `--tum-camera-config <calib.json>` to override built-in freiburg1 intrinsics (see `config/examples/tum_pinhole_fr1.json`).
+- Operations hooks: `Tracking::runStatistics()` (reloc / lost-frame / re-init counters), `--run-summary-json <path>` (single-line JSON), `--strict-exit` (exit code 3 if tracking did not finish in `OK`).
+- Research benchmark matrix: `eval/leaderboard_suite.json` plus `scripts/build_leaderboard.py` (TUM windows × methods, mean ATE, mean rank; not a KITTI-leaderboard clone); shared `scripts/eval_lib.py` with `check_regression_gate.py`.
+- Academic reuse: `CITATION.cff` and a **Citing** section in `README.md` (BibTeX + reproducibility note).
+- CLI: `run_mono --help` / `-h` (full TUM flags); fix vocab path selection when `--strict-exit` is present; `build_leaderboard.py --dry-run` (planned matrix only). CI runs `run_mono --help` and leaderboard dry-run.
+- Evaluation: `eval/comparison_protocol.md` — fair ATE comparison vs other OSS (stella_vslam as primary BSD peer; match modality and `evo_ape` alignment).
+- Comparison verification: `scripts/verify_comparison_benchmark.sh` (preset TUM runs + mean ATE) and `scripts/print_ate_mean.py` (uses `regression_baselines.json` evo flags).
 
 ## [0.1.0] — 2026-04
 

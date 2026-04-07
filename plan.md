@@ -1,6 +1,6 @@
 # SimpleVisualSLAM 開発計画
 
-> **この文書はAIコーディングエージェント（Codex等）への完全な引き継ぎ資料である。**
+> **この文書はAIコーディングエージェント（Claude / Codex / Cursor 等）への完全な引き継ぎ資料である。**
 > この文書だけでコードベースの全体像を理解し、次のタスクに着手できることを目標に書いている。
 > plan.mdの内容とコードの実態が矛盾する場合は、コードが正（plan.mdを修正せよ）。
 
@@ -20,22 +20,96 @@ SimpleVisualSLAMは6k行のC++17で、特徴点ベースSLAM + 深度センサ�
 
 **直近の競合ターゲット:** stella_vslam に精度・安定性で並び、DL深度統合で差別化する。
 
-### 1.1 2026-04-06 現在地（2026-04-06 Claude Code session で更新）
+### 1.1 リポジトリの現状（2026-04-08 時点のサマリ）
 
-- `master` は `3b11008` まで到達。前回 `6435a99` からの差分:
-  - `402b196` expand Claude handoff plan
-  - `3b11008` expand room corpus and clean up README
-- GitHub repository は public 化済み: `https://github.com/rsasaki0109/simple_visual_slam`
-- GitHub Pages も公開済み: `https://rsasaki0109.github.io/simple_visual_slam/`
-- 以後の開発方針は「正しい抽象を先に固定する」ではなく、「比較可能な複数実装を先に作り、repeat replay で収束させる」。
-- この文書は Codex / Claude Code / Cursor 等の AI コーディングエージェントへの handoff を意図して更新している。後半の「引き継ぎ」セクションは作業開始前に必読。
-- **今回の Claude Code session で実施したこと:**
-  1. `room_focus_corpus.tsv` を 6→10 行に拡張（`tail`, `recovery` 窓を追加）
-  2. `real_trace_corpus.tsv` を 10→13 行に拡張（`mid` 窓を追加）
-  3. `slam_result.jpg` を README / repo から削除（デバッグ画像で品質不十分）
-  4. `update_reference_policy_docs.py` の room focus 説明文を動的化
-  5. repeat-5 room focus 評価 + repeat-2 real trace 評価を実行（結果は Section 3 に記載）
-  6. CMake ビルドキャッシュを修復（パス変更対応）
+- **Public OSS:** `https://github.com/rsasaki0109/simple_visual_slam` / Pages `https://rsasaki0109.github.io/simple_visual_slam/`
+- **版:** CMake `project(VERSION 0.1.0)`、`./build/run_mono --version` と一致。**引用:** ルート `CITATION.cff`（リリース時は `RELEASING.md` で `version` / `date-released` を CMake と同期）。
+- **方針:** Reference-keyframe **policy 実験（Phase F）は収束済み**。いまの主戦場は **SLAM コア（tracking / BA / ループ）**、**再現性**、**外部OSSとの公平な数値比較**、**研究としての引用可能性**。
+- **哲学:** 「KITTI全部勝ち」を掲げない。**BSD のまま読めるコード**として、**TUM 等の選んだ窓**で stella_vslam 等と並べ、**RGB-D / DL 深度**の統合価値を示すライン。
+- **master HEAD:** `52d3547`（Product release scaffolding）。これに加えて **未コミットの作業ツリー変更あり**（Section 1.2 参照）。
+
+### 1.2 未コミット変更の全容（2026-04-08 — 次の Claude が最初に確認すべき項目）
+
+`git status` で staged/unstaged の diff がある。以下が変更内容の完全リスト。
+
+**新規ファイル（untracked）:**
+
+| ファイル | 行数 | 役割 |
+|---------|------|------|
+| `src/io/tum_pinhole_calibration.h` | 27行 | TUM キャリブ構造体（`fx,fy,cx,cy` + optional distortion）。`fr1_default()` で freiburg1 固定値 |
+| `src/io/tum_pinhole_calibration.cc` | 124行 | 最小 JSON パーサ（外部ライブラリ不要）。`load_json_file()` で `config/examples/tum_pinhole_fr1.json` 等を読む |
+| `config/examples/tum_pinhole_fr1.json` | — | `--tum-camera-config` 用のサンプル（freiburg1 固有値） |
+| `CITATION.cff` | 25行 | GitHub "Cite this repository" 用メタ。`version: 0.1.0`, `date-released: 2026-04-01` |
+| `eval/comparison_protocol.md` | 94行 | **外部OSSと数を並べるときの必読**。同一 TUM 窓・モダリティ・`evo_ape` フラグ（`--align --correct_scale --t_max_diff 0.05`）を揃えるルール。Step 1 は `verify_comparison_benchmark.sh` |
+| `eval/leaderboard_suite.json` | — | 研究用 methods×sequences マトリクス。2 sequences (xyz_250, room_250) × 7 methods |
+| `scripts/eval_lib.py` | — | `sha256_file`, `clean_traj_artifacts`, `run_slam`, `evo_mean_ape` の共通化。`check_regression_gate.py` と `build_leaderboard.py` が import |
+| `scripts/build_leaderboard.py` | — | methods×seq 排名ハーネス。`--dry-run` で計画のみ、`--build` で実行、`--json-out` で raw 数値 |
+| `scripts/print_ate_mean.py` | — | GT + trajectory → mean ATE（`regression_baselines.json` の `evo_ape_extra_args` を利用） |
+| `scripts/verify_comparison_benchmark.sh` | — | 比較検証 Step 1: プリセット `xyz_mono|xyz_depth|room_mono|room_depth` |
+| `tests/test_tum_pinhole_calibration.cc` | 52行 | JSON ロード・バリデーションのユニットテスト |
+| `tests/test_tracking_run_statistics.cc` | 14行 | `TrackingRunStatistics` のデフォルトゼロ確認 |
+
+**変更ファイル（既存）:**
+
+| ファイル | 変更概要 |
+|---------|---------|
+| `apps/run_mono.cc` (+112行) | `--help`/`-h`（`print_help()`）、`--tum-camera-config`、`--run-summary-json`（JSON 出力）、`--strict-exit`（exit 3）追加。vocab パス探索で `--strict-exit` / `--run-summary-json` / `--tum-camera-config` をスキップするよう修正 |
+| `src/tracking/tracking.h` (+14行) | `TrackingRunStatistics` 構造体（reloc_attempts, reloc_successes, frames_tracking_lost, reinit_successes）と `runStatistics()` アクセサ |
+| `src/tracking/tracking.cc` (+7行) | `track()` 内で `run_stats_` カウンタをインクリメント（reloc / LOST / reinit） |
+| `src/io/tum_dataset.h` (+3行) | `TumPinholeCalibration` 付きコンストラクタ追加 |
+| `src/io/tum_dataset.cc` (+40行/-30行) | K_ / dist_coeffs_ を `TumPinholeCalibration` から構築。distortion 空なら undistort スキップ |
+| `CMakeLists.txt` (+3行) | `tum_pinhole_calibration.cc`、`test_tum_pinhole_calibration.cc`、`test_tracking_run_statistics.cc` を追加 |
+| `.github/workflows/ci.yml` (+9行) | `run_mono --help` ステップ追加、`py_compile` に `eval_lib`/`build_leaderboard`/`print_ate_mean` 追加、`--dry-run` 追加 |
+| `CHANGELOG.md` (+7行) | `[Unreleased]` に TUM runner, operations hooks, leaderboard, citing, CLI, comparison 等を記載 |
+| `CONTRIBUTING.md` (+8行) | 冒頭に研究OSSの品質バー、`verify_comparison_benchmark.sh` セクション追加 |
+| `README.md` (+22行) | Citing セクション（BibTeX）、comparison protocol / leaderboard / `--help` 情報追加 |
+| `RELEASING.md` (+11行/-10行) | `CITATION.cff` の `version`/`date-released` 同期手順を追加 |
+| `scripts/check_regression_gate.py` (+18行/-102行) | `eval_lib` をインポートして共通関数に移行（`sha256_file`, `run_slam`, `evo_mean_ape` を削除） |
+
+**これらの変更はまだコミットされていない。** 次の Claude はこの状態を前提に作業を始める。コミットするなら `git add` → `git commit` でまとめるか、機能単位で分割する。
+
+### 1.3 2026-04 コミット済み成果（`52d3547` まで）
+
+以下は **2026-04 のコーディングセッションでコミット済み**の成果物。`git log` が最終真理。
+
+| コミット | 内容 |
+|---------|------|
+| `52d3547` | Product release scaffolding: `--version`, `CHANGELOG.md`, `RELEASING.md`, semver ヘッダ |
+| `4288203` | xyz depth 回帰ゲート追加（freiburg1_xyz RGB-D） |
+| `78b3b47` | room depth+accel 回帰ゲート + `CONTRIBUTING.md` |
+| `9db75b4` | BSD-2-Clause LICENSE + room depth 回帰ゲート |
+| `6b32b5c` | 回帰ゲート拡張: xyz sequence + `--all-gates` |
+| `31fbd1a` | Ceres スレッド数 `SVSLAM_CERES_NUM_THREADS` 環境変数 |
+| `785a923` | 回帰ゲート: repro SHA + ATE 上限 |
+| `edd8805` | repro-eval bitwise determinism 復元: BA 入力順序 + covisibility tie-break |
+| `45def39` | 2フレーム初期化改善: KNN ratio test + parallax gate |
+| `fb46f82` | GitHub Actions CI、OpenCV RNG 固定、BA 入力順安定化 |
+| `4890411` | plan.md repeat-5 評価結果 + phase shift |
+| `3b11008` | room corpus 拡張 + README 整理 |
+
+### 1.4 未コミット変更の機能別グループ（コミット分割案）
+
+次の Claude がコミットする場合の推奨分割:
+
+1. **キャリブ外部化:** `tum_pinhole_calibration.{h,cc}` + `tum_dataset.{h,cc}` 変更 + `config/examples/` + `test_tum_pinhole_calibration.cc` + CMakeLists.txt 該当行
+2. **運用フック:** `TrackingRunStatistics` + `tracking.{h,cc}` 変更 + `run_mono.cc`（`--run-summary-json`, `--strict-exit`）+ `test_tracking_run_statistics.cc` + CMakeLists.txt 該当行
+3. **CLI ヘルプ:** `run_mono.cc`（`--help`/`-h`, `print_help()`）
+4. **評価スクリプト共通化:** `eval_lib.py` + `check_regression_gate.py` リファクタ + `build_leaderboard.py` + `print_ate_mean.py` + `verify_comparison_benchmark.sh`
+5. **比較プロトコル:** `eval/comparison_protocol.md` + `eval/leaderboard_suite.json`
+6. **学術引用:** `CITATION.cff` + README Citing + RELEASING.md 更新
+7. **CI 拡張 + ドキュメント:** `ci.yml` + `CHANGELOG.md` + `CONTRIBUTING.md` + README 追記
+
+**あるいは**、全部まとめて1コミットでも可（maintainer 判断）。
+
+### 1.5 過去メモ（2026-04-06 Claude Code session 当時）
+
+当時 `master` は `3b11008` 付近まで到達。実施内容の要約:
+
+1. `room_focus_corpus.tsv` 拡張、`real_trace_corpus.tsv` 拡張
+2. `slam_result.jpg` 削除、`update_reference_policy_docs.py` 調整
+3. repeat 評価、CMake キャッシュ修復
+
+以降も master は継続更新。**詳細コミットは `git log` を見よ。**
 
 ---
 
@@ -49,12 +123,23 @@ simple_visual_slam/           # 6393行（テスト含む）
 ├── CMakeLists.txt            # FetchContent: Sophus, Ceres 2.1, DBoW2, ONNX Runtime 1.17, Google Test 1.14
 │                             # オプション: USE_DBOW2(ON), USE_DEPTH_DL(OFF), BUILD_TESTS(ON)
 ├── plan.md                   # この文書
+├── CITATION.cff              # 学術引用メタ（GitHub “Cite this repository”）
 ├── README.md                 # 英語README（Mermaidアーキテクチャ図、結果テーブル付き）
+├── CONTRIBUTING.md / RELEASING.md / CHANGELOG.md / LICENSE
+├── config/examples/
+│   └── tum_pinhole_fr1.json  # --tum-camera-config 用サンプル
 ├── .gitignore                # *.bin, *.jpg, *.onnx, models/, eval_results/, trajectory*.txt, *.html
 │
 ├── apps/
-│   └── run_mono.cc           # [392行] エントリポイント
-│       # CLI: --tum/--euroc/--depth/--accel/--depth-model <path>/--no-viz
+│   └── run_mono.cc           # [597行] エントリポイント
+│       # CLI: --tum [--tum-camera-config <calib.json>] [--depth] [--accel] [--repro-eval]
+│       #       [--reference-policy heuristic|score|pipeline] [--skip-frames N] [--max-frames N]
+│       #       [--depth-model <model.onnx>] [--run-summary-json <path>] [--strict-exit]
+│       #       [--no-viz] [--help/-h] [--version/-V]
+│       #       --euroc <seq_dir> / <video_path>、[ORBvocab.txt]
+│       # ★ --strict-exit: 終了時 OK でなければ exit 3
+│       # ★ --run-summary-json: JSON 1行出力（schema: svslam.run_summary.v1）
+│       # ★ vocab パス探索: --strict-exit / --run-summary-json / --tum-camera-config を正しくスキップ
 │       # メインループ: 画像読み込み → Frame生成 → ORB抽出 → tracker->addFrame() → 軌跡保存
 │       # DL depth: frame_id <= 1 || frame_id % 5 == 0 の時のみ推論（CPU高速化）
 │       # 出力: trajectory.txt, trajectory_online.txt, trajectory_keyframes.txt, map.bin
@@ -101,7 +186,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 │       # getAllKeyframes/getAllLandmarks — const参照を返す（コピーではない！）
 │
 ├── src/tracking/
-│   ├── tracking.h / .cc      # [1658行] ★最大のファイル。トラッキング全体を管理。
+│   ├── tracking.h / .cc      # [1833行] ★最大のファイル。トラッキング全体を管理。
 │   │   #
 │   │   # === 状態遷移 ===
 │   │   # NO_IMAGES_YET → NOT_INITIALIZED → OK ↔ LOST
@@ -147,6 +232,12 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   │   # - trackLocalMapのみloop_correcting_チェック（KF landmarks直接イテレート）
 │   │   # - trackReferenceKeyframeはチェックなし（frame-local landmarks参照のみ）
 │   │   # - track()冒頭にはチェックなし（motion modelは安全）
+│   │   #
+│   │   #
+│   │   # === 運用カウンタ（TrackingRunStatistics run_stats_） ===
+│   │   # reloc_attempts, reloc_successes, frames_tracking_lost, reinit_successes
+│   │   # track() 内で LOST / relocalize / reinitialize の結果に応じてインクリメント
+│   │   # runStatistics() で取得 → run_mono --run-summary-json で JSON 出力
 │   │   #
 │   │   # === 既知の問題 ===
 │   │   # - needNewKeyframe()の閾値がハードコード
@@ -231,13 +322,22 @@ simple_visual_slam/           # 6393行（テスト含む）
 │       # - cooldown: loop_cooldown_kf_ = 120（前回ループ成功から120KF以内は再検出しない）
 │
 ├── src/io/
+│   ├── tum_pinhole_calibration.h / .cc  # [27+124行] TUM 用ピンホールキャリブ
+│   │   # TumPinholeCalibration: fx, fy, cx, cy, image_width, image_height, distortion[]
+│   │   # fr1_default(): freiburg1 固定値（fx=517.3, fy=516.5, cx=318.6, cy=255.3 + 5係数）
+│   │   # load_json_file(): 最小 JSON パーサ（外部ライブラリなし）
+│   │   # 読み込み例: config/examples/tum_pinhole_fr1.json
+│   │   # distortion が空なら undistort / remap をスキップ
+│   │
 │   ├── tum_dataset.h / .cc   # [316行] TUM RGB-D データセット読み込み
 │   │   # AccelEntry: timestamp_sec, ax, ay, az
 │   │   # DepthEntry: timestamp_sec, depth_path
 │   │   # rgb.txt / depth.txt / accelerometer.txt パーサー
 │   │   # nextWithDepth(): RGB + depth を±30msでアソシエーション（binary search）
 │   │   # depth読み込み: CV_16UC1→float/5000.0, CV_32FC1→そのまま
-│   │   # K(): TUM freiburg1 固定値 (fx=517.3, fy=516.5, cx=318.6, cy=255.3)
+│   │   # コンストラクタ: TumRgbdDataset(seq_dir) → fr1_default() 使用
+│   │   #   TumRgbdDataset(seq_dir, TumPinholeCalibration) → 外部キャリブ
+│   │   # K(): TumPinholeCalibration から構築（旧: freiburg1 ハードコード）
 │   │   # allAccel(): 全accelerometerデータを返す
 │   │
 │   ├── euroc_dataset.h / .cc # [189行] EuRoC MAV: cam0/data/ + data.csv
@@ -265,7 +365,30 @@ simple_visual_slam/           # 6393行（テスト含む）
 │       # isStationary(): 分散 < threshold
 │       # computeGravityAlignment(): gravity→[0,0,-1] のRodrigues回転
 │
+├── eval/
+│   ├── regression_baselines.json   # 回帰ゲート: 5 gates (room_depth/depth_accel/mono, xyz_depth/mono)
+│   │   # evo フラグ: --align --correct_scale --t_max_diff 0.05
+│   │   # 各 gate: tum_sequence, skip/max_frames, repro_eval, use_depth/accel, max_mean_ape_m
+│   ├── leaderboard_suite.json      # 研究用比較マトリクス: 2 seq (xyz_250, room_250) × 7 methods
+│   │   # methods: mono/depth/depth_accel × heuristic, mono/depth × score/pipeline
+│   └── comparison_protocol.md      # 外部OSSと並べるときの公平性ルール（94行）
+│       # 同一 TUM 窓・モダリティ・evo_ape フラグでなければ比較不可
+│       # Step 1: verify_comparison_benchmark.sh で自前基準を固定
+│       # 推奨ピア: stella_vslam (BSD, 同クラス)
+│
 ├── scripts/
+│   ├── eval_lib.py                 # 共通ヘルパー（check_regression / leaderboard / print_ate_mean が import）
+│   │   # sha256_file, clean_traj_artifacts, run_slam, evo_mean_ape
+│   │   # ROOT = repo root
+│   ├── check_regression_gate.py   # ビット一致2回 + ATE 上限（--all-gates 可）
+│   │   # eval_lib を import（旧: 自前で sha256/run_slam/evo 実装を持っていた → 共通化済み）
+│   ├── build_leaderboard.py       # methods×seq 排名（--dry-run で計画のみ、--json-out で raw）
+│   │   # merge_run_gate(seq, method) で gate dict 合成
+│   │   # 出力: Markdown (eval_results/leaderboard.md) + optional JSON
+│   ├── print_ate_mean.py          # GT+trajectory → mean ATE（regression と同じ evo フラグ）
+│   ├── verify_comparison_benchmark.sh  # 比較検証 Step 1
+│   │   # プリセット: xyz_mono | xyz_depth | room_mono | room_depth
+│   │   # 250フレ head, --repro-eval, heuristic, print_ate_mean.py 経由で mean ATE 出力
 │   ├── eval_all.sh            # 全データセット×全モード一括評価（evo_ape使用）
 │   │   # build dirにcd → 各モード実行 → trajectory.txt → evo_ape → summary出力
 │   │   # ★trajectory.txtをrm -fしてから実行（stale data防止）
@@ -279,7 +402,9 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   ├── test_camera.cc         # [59行] project→unproject roundtrip, principal point, K matrix
 │   ├── test_landmark.cc       # [80行] addObservation, setPos/getPos, thread safety, isBad
 │   ├── test_map.cc            # [96行] add/remove KF/LM, count, concurrent add
-│   └── test_optimizer.cc      # [90行] 2KF+5LM BA: noise→BA→誤差減少確認
+│   ├── test_optimizer.cc      # [90行] 2KF+5LM BA: noise→BA→誤差減少確認
+│   ├── test_tum_pinhole_calibration.cc  # [52行] JSON 読み込み・バリデーション（fr1 defaults, load, missing keys）
+│   └── test_tracking_run_statistics.cc   # [14行] TrackingRunStatistics 既定ゼロ確認
 │
 ├── data/
 │   ├── ORBvoc.txt             # DBoW2語彙（gitignore、手動配置）
@@ -353,52 +478,49 @@ LoopClosing Thread (loop_closing->run())
 | onnx_depth | kInputW/H | 518 | DL推論入力サイズ |
 | onnx_depth | median_target | 1.5m | relative depthのscaling |
 
-### 2.5 2026-04-06 時点の増分（旧構成表の補足）
+### 2.5 追加コンポーネント一覧（2026-04-08 時点）
 
-旧来の「2.1 ファイル構成」は骨格として有効だが、現時点では以下が重要な増分である。
+**2.1 のファイルツリーに含まれないが重要な構成:**
 
-- `apps/run_mono.cc`
-  - `--reference-policy <heuristic|score|pipeline>` を追加済み
-  - `--skip-frames N`, `--max-frames N` で bounded replay が可能
-  - `--repro-eval` で local mapping を同期実行し、loop closing を止めた再現性重視モードへ入る
-- `src/core/reference_keyframe_policy.h`
-  - reference-keyframe 採用判断を切り出した最小契約
-  - 現在の surviving fields は `tracked_features`, `detected_keypoints`, `candidate_landmarks`, `frames_since_reference`, `lost_frames`, `has_depth`, `has_accel`
-- `src/core/heuristic_reference_keyframe_policy.{h,cc}`
-  - runtime default。既存挙動を切り出して `core` 側に置いたもの
-- `src/experiments/reference_keyframe/`
-  - `score_reference_keyframe_policy.{h,cc}`
-  - `pipeline_reference_keyframe_policy.{h,cc}`
-  - どちらも discardable な experiment 実装であり、まだ core へ昇格していない
-- `tools/reference_policy_experiments.cc`
-  - curated scenario corpus を同一 input / 同一 interface / 同一指標で比較する小さな実験バイナリ
-- `tests/test_reference_keyframe_policy.cc`
-  - policy seam 専用のテスト
-  - `depth_accel` 系の `has_accel` 分岐もカバー済み
-- `scripts/eval_reference_policies.sh`
-  - bounded real-trace replay を policy × corpus × repeat で回す主ハーネス
-  - `--mode`, `--policy`, `--repeat`, `--corpus`, `--output`, `--no-repro` を持つ
-- `scripts/update_reference_policy_docs.py`
-  - 実験 CSV を読み、`docs/index.md`, `docs/decisions.md`, `docs/experiments.md`, `docs/interfaces.md` を自動生成する
-- `experiments/reference_keyframe/`
-  - `scenarios.csv`: curated corpus
-  - `real_trace_corpus.tsv`: full bounded replay corpus
-  - `room_focus_corpus.tsv`: `room` hotspot 専用 follow-up corpus
-- `docs/`
-  - `index.md`: GitHub / Pages 向け landing page
-  - `decisions.md`: 採用/不採用の現時点判断
-  - `experiments.md`: 詳細比較表
-  - `interfaces.md`: surviving minimal interface の記録
+#### run_mono CLI フラグ全容（597行、旧392行から大幅増）
 
-この増分こそが現在の「実験 → 収束」開発の中心である。古い記述と矛盾する場合、こちらを優先する。
+```
+--version / -V          semver 表示
+--help / -h             全フラグ一覧（print_help()）
+--tum <seq_dir>         TUM RGB-D モード
+--tum-camera-config <json>  ピンホールキャリブ上書き（TumPinholeCalibration）
+--depth                 depth.txt / sensor depth 使用
+--accel                 accelerometer.txt 使用
+--repro-eval            同期 mapping, loop closing 停止, 決定論モード
+--reference-policy <heuristic|score|pipeline>
+--skip-frames N         先頭 N フレームスキップ
+--max-frames N          最大 N フレーム処理
+--depth-model <onnx>    DL depth（USE_DEPTH_DL=ON ビルド時のみ）
+--no-viz                OpenCV imshow 無効
+--run-summary-json <path>  JSON 1行出力（schema: svslam.run_summary.v1）
+--strict-exit           終了時 OK でなければ exit 3
+--euroc <seq_dir>       EuRoC モード
+<video_path>            動画ファイルモード
+[ORBvocab.txt]          最終位置引数 or data/ORBvoc.txt 自動検索
+```
 
-#### 2026-04-06 Claude Code session での変更
+#### Reference-keyframe policy（Phase F 収束済み、参考用）
 
-- `slam_result.jpg` 削除済み（README からの参照も除去）
-- `.gitignore` に `*.jpg` 追加、`!slam_result.jpg` の例外ルール除去
-- `experiments/reference_keyframe/room_focus_corpus.tsv`:
-  - 追加: `room_mono_tail` (750-250), `room_mono_recovery` (350-300), `room_depth_accel_tail` (750-250), `room_depth_accel_recovery` (350-300)
-- `experiments/reference_keyframe/real_trace_corpus.tsv`:
+- `src/core/reference_keyframe_policy.h` — 最小契約（`tracked_features`, `detected_keypoints`, `candidate_landmarks`, `frames_since_reference`, `lost_frames`, `has_depth`, `has_accel`）
+- `src/core/heuristic_reference_keyframe_policy.{h,cc}` — runtime default
+- `src/experiments/reference_keyframe/` — `score` / `pipeline`（discardable）
+- `tools/reference_policy_experiments.cc` — curated corpus 比較バイナリ
+- `tests/test_reference_keyframe_policy.cc` — policy seam テスト
+- `scripts/eval_reference_policies.sh` — policy × corpus × repeat ハーネス（`--mode`, `--policy`, `--repeat`, `--corpus`, `--output`, `--no-repro`）
+- `scripts/update_reference_policy_docs.py` — `docs/*.md` 自動生成
+- `experiments/reference_keyframe/` — `scenarios.csv`, `real_trace_corpus.tsv`(13cases), `room_focus_corpus.tsv`(10cases)
+- `docs/` — `index.md`(landing), `decisions.md`, `experiments.md`, `interfaces.md`
+
+#### 過去の変更記録（2026-04-06 Claude Code session）
+
+- `slam_result.jpg` 削除、`.gitignore` に `*.jpg` 追加
+- `room_focus_corpus.tsv`: `room_mono_tail`, `room_mono_recovery`, `room_depth_accel_tail`, `room_depth_accel_recovery` 追加
+- `real_trace_corpus.tsv`:
   - 追加: `room_mono_mid` (250-250), `room_depth_mid` (250-250), `room_depth_accel_head` (0-250)
 - `scripts/update_reference_policy_docs.py`: room focus 説明文をハードコードから `describe_repro_mode()` による動的生成に変更
 
@@ -509,17 +631,32 @@ repeat-5 にしても std は 0.078-0.094 で、mono の run-to-run variance は
 
 **重要な発見:** repeat gate を厚くするほど3ポリシーの差が消える。これは policy 差より SLAM コア（tracking / local mapping）の non-determinism が支配的であることを意味する。
 
-### 3.4 直近の確認コマンド（2026-04-06 更新）
+### 3.4 直近の確認コマンド（2026-04-08 更新）
 
 少なくとも以下は recent green path とみなしてよい。
 
 ```bash
-# ビルド（BUILD_TESTS=ON で全ターゲット）
-cmake -S . -B build -DBUILD_TESTS=ON
+# ビルド（BUILD_TESTS=ON で全ターゲット + 新テスト2件含む）
+cmake -S . -B build -G Ninja -DBUILD_TESTS=ON
 cmake --build build -j$(nproc)
 
-# テスト（20/20 pass 確認済み 2026-04-06）
+# テスト（test_tum_pinhole_calibration + test_tracking_run_statistics 含む）
 ctest --test-dir build --output-on-failure
+
+# CLI ヘルプ（CI でも実行）
+./build/run_mono --help
+
+# ローカル回帰ゲート（TUM xyz+room、5シナリオ、evo_ape 必須。全ゲートで ~10 分級）
+python3 scripts/check_regression_gate.py --all-gates --quiet
+
+# 比較検証プリセット（data/tum/ + evo_ape 必須）
+BUILD=build bash scripts/verify_comparison_benchmark.sh xyz_depth
+
+# 研究用マトリクス（重い、ローカルのみ）
+python3 scripts/build_leaderboard.py --build build --quiet
+
+# mean ATE のみ
+python3 scripts/print_ate_mean.py /path/to/groundtruth.txt /path/to/trajectory.txt
 
 # real trace repeat-2（13 cases × 3 policies × 2 = 78 runs, 約20分）
 bash scripts/eval_reference_policies.sh --repeat 2 \
@@ -530,14 +667,14 @@ bash scripts/eval_reference_policies.sh --repeat 5 \
   --corpus experiments/reference_keyframe/room_focus_corpus.tsv \
   --output eval_results/reference_keyframe_policy/room_focus_repeat5.csv
 
-# docs 再生成
+# docs 再生成（policy 実験用、通常は不要）
 ./scripts/update_reference_policy_docs.py
-
-# ローカル回帰ゲート（TUM xyz+room、mono/depth/depth+accel 計5シナリオ、evo_ape 推奨。全ゲートで ~10 分級）
-python3 scripts/check_regression_gate.py --all-gates --quiet
 ```
 
-注意: CMake キャッシュが別パスで作られていた場合は `rm -rf build` してから再構成する必要がある（2026-04-06 にこの問題に遭遇）。Ceres のスレッド数は未設定時 **1**（再現性優先）。`SVSLAM_CERES_NUM_THREADS` で上書き可（`README.md` 参照）。
+注意:
+- CMake キャッシュが別パスで作られていた場合は `rm -rf build` してから再構成（2026-04-06 にこの問題に遭遇）
+- Ceres スレッド数は未設定時 **1**（再現性優先）。`SVSLAM_CERES_NUM_THREADS` で上書き可
+- `build_nodbow2/`, `build_nodbow2_notests/`, `build_test_tumcal/` が作業ツリーに存在（gitignore 外の別ビルドディレクトリ）
 
 ### 3.5 テストの見方
 
@@ -624,9 +761,12 @@ corpus は厚くした（repeat-5 完了）。次の一手は **SLAM コアの n
 
 旧来どおり。将来 map IO を公開 feature として押し出すなら `version` を入れるべき。
 
-### 4.7 [低] camera parameter の一般化不足
+### 4.7 [低→進行中] camera parameter の一般化
 
-TUM / EuRoC 固定で、設定ファイル読み込みはまだない。実験基盤の整備が優先されたため後回し。
+TUM は `--tum-camera-config <calib.json>` で外部キャリブ可能になった（`tum_pinhole_calibration.*`）。ただし:
+- EuRoC は依然としてハードコード（`euroc_dataset.cc` の `K()`）
+- 動画ファイルモードにはキャリブ指定手段がない
+- 歪み係数が空の場合の undistort スキップは実装済み
 
 ---
 
@@ -700,7 +840,7 @@ TUM / EuRoC 固定で、設定ファイル読み込みはまだない。実験�
 | Task | Status | 内容 |
 |------|--------|------|
 | E-1 | 未着手 | チュートリアル記事 |
-| E-2 | ✅完了（最小） | GitHub Actions: Ubuntu で Ninja ビルド + `ctest`。`workflow_dispatch` 可。docs/replay は未 |
+| E-2 | ✅完了（拡張中） | GitHub Actions: Ubuntu Ninja ビルド + `ctest` + `run_mono --help` + `py_compile`(4スクリプト) + `build_leaderboard --dry-run`。`workflow_dispatch` 可。重い replay/ATE 計測は未 |
 | E-3 | ✅完了 | `CONTRIBUTING.md`（ビルド・ゲート・コミット方針） |
 | E-4 | ✅完了 | リポジトリ直下 `LICENSE`（BSD-2-Clause） |
 | E-5 | ✅完了 | セマンティックバージョンは `CMakeLists.txt` の `project(VERSION)`。`run_mono --version`、`CHANGELOG.md`、`RELEASING.md` |
@@ -796,13 +936,20 @@ bash scripts/eval_reference_policies.sh --repeat 2 \
 
 ---
 
-## 9. 優先順位（2026-04-06 更新）
+## 9. 優先順位（2026-04-08 更新）
 
 ```text
-安定性 > 精度 > 比較可能性 > 機能数 > 速度 > 見栄え
+比較可能性（公平な数値の蓄積） > 安定性 > 精度 > 機能数 > 速度 > 見栄え
 ```
 
-Phase F の policy 比較は収束した。今後は SLAM コアの安定性と精度が最優先。
+Phase F の policy 比較は収束。**外部OSSとの同一プロトコル比較**と **SLAM コア**を同列で進め、README で誇大なベンチ主張はしない。
+
+**直近の優先事項（2026-04-08 時点）:**
+
+1. **未コミット変更のコミット** — Section 1.2 / 1.4 参照。キャリブ外部化・運用フック・評価スクリプト共通化・学術引用等が作業ツリーに散在
+2. **stella_vslam との同一プロトコル比較** — `comparison_protocol.md` Step 1 は `verify_comparison_benchmark.sh` で実行可。Step 2（外部OSS実行）は未着手
+3. **SLAM コア品質** — `room_mono` 系の ATE 改善（tracking / 初期化 / 閾値チューニング）
+4. **Metric DL Depth** — Phase B（Metric3D v2 / UniDepth）は未着手だが差別化の鍵
 
 ---
 
@@ -819,13 +966,23 @@ Phase F の policy 比較は収束した。今後は SLAM コアの安定性と�
 ## 11. git 履歴（重要マイルストーン）
 
 ```text
+52d3547 Product release scaffolding: semver header, --version, CHANGELOG, RELEASING.  ← 2026-04 HEAD
+4288203 Add xyz depth regression gate (freiburg1_xyz RGB-D).
+78b3b47 Add room depth+accel regression gate and CONTRIBUTING.md.
+9db75b4 Add BSD-2-Clause LICENSE and room depth regression gate.
+6b32b5c Extend regression gate: xyz sequence + --all-gates.
+31fbd1a Ceres threads via SVSLAM_CERES_NUM_THREADS; CI checks regression script.
+785a923 Add local regression gate: repro SHA check + ATE ceiling vs baseline.
+edd8805 Restore repro-eval bitwise determinism: BA ordering and covisibility ties.
+45def39 Improve two-frame initialization: KNN ratio test and parallax gate.
+fb46f82 Add GitHub Actions CI, stabilize OpenCV RNG and BA ordering, refresh docs.
+4890411 update plan.md with repeat-5 evaluation results and phase shift
 3b11008 expand room corpus and clean up README          ← 2026-04-06 Claude Code session
 402b196 expand Claude handoff plan
 6435a99 Merge pull request #1 from rsasaki0109/codex/reference-policy-experiments
 b8ddbdd add reference policy experiment workflow
 73eda32 Final plan.md update for complete Codex handoff
 f4fc265 Merge worker results: precision stabilization, thread safety, README, unit tests
-5639305 Comprehensive plan update for Codex handoff: architecture, threading, constants, known issues, detailed roadmap
 e2a3680 Update plan with comprehensive OSS roadmap and competitive analysis
 66d5813 Fix loop closing thread safety and improve eval script
 1fb546c Fix loop closing thread safety (atomic flag)
@@ -835,102 +992,156 @@ fffb3e6 Add deep learning depth estimation via ONNX Runtime
 6647223 Integrate depth sensor + accelerometer
 ```
 
-`3b11008` が corpus 拡張 + README 整理を含む最新コミット。
-`6435a99` が「experiment surface + public docs + GitHub Pages」の起点。
+**注意:** `52d3547` が現在の HEAD だが、その上に **未コミットの変更** が多数ある（Section 1.2 参照）。**最新の正確な履歴は常に `git log` + `git status`。**
 
 ---
 
-## 12. AI エージェントへの引き継ぎ（2026-04-06 更新）
+## 12. AI エージェントへの引き継ぎ（2026-04-08 更新 — **Claude 向け**）
 
-### 12.1 最初に読む順番
+### 12.0 着手前チェック（最初の5分）
 
-作業を始めるなら、読む順番はこれでよい。
+**必ず `git status` を確認**。この文書の執筆時点（2026-04-08）では **未コミット変更が多数ある**。
 
-1. `plan.md` の Section 1.1（現在地）、Section 3（評価の真実）、Section 5（ロードマップ）
-2. `src/tracking/tracking.cc` — 最大のファイル、改善の中心
-3. `src/backend/optimizer.cc` — BA の実装
-4. `src/loop_closing/loop_closing.cc` — ループ検出・補正
-5. `docs/index.md` — public-facing な現状サマリ
+```bash
+git status          # 13ファイル modified + 12 untracked
+git diff --stat     # 変更量を確認
+```
 
-policy 実験は **Phase F で収束済み**。`src/experiments/` や `tools/reference_policy_experiments.cc` は歴史的参考のみ。
+未コミット変更の詳細は **Section 1.2** に全リストがある。**コミットするかどうかは maintainer（ユーザ）の判断を仰ぐこと。** 勝手にコミットしない。
+
+### 12.1 最初に読む順番（30分ルール）
+
+1. **本書 Section 1.1–1.4** — 現状サマリ、未コミット変更一覧、コミット済み成果、分割案
+2. **`eval/comparison_protocol.md`** — 外部OSSと数を並べるときの前提（窓・モダリティ・`evo_ape`）
+3. **`README.md`** — 入口、CI、Citing、比較・回帰のコマンドへのポインタ
+4. **`src/tracking/tracking.cc`** — 最大（1833行）・改善の主戦場
+5. **`src/backend/optimizer.cc`**、**`src/loop_closing/loop_closing.cc`**
+6. **`apps/run_mono.cc`** — CLI フラグの全容（597行）。`--help` で一覧表示
+7. **`docs/index.md`** — public 向け要約（更新するなら `update_reference_policy_docs.py` 経由で整合）
+
+**Phase F（reference-keyframe policy）は収束済み**。`src/experiments/`、`tools/reference_policy_experiments.cc` は参考。**policy 実験の再設計は非目標**（Section 10）。
 
 ### 12.2 期待する役割
 
-Phase F（policy 実験）は完了した。今後期待するのは **SLAM コア品質の改善** である。
+**研究 OSS として**: 再現可能な数値・正直なスコープ・BSD のままの再利用。
 
-やってよいこと:
+**やってよいこと:**
 
-- tracking 精度の改善（マッチング品質、PnP の robustness）
-- mono 初期化の安定性向上
-- non-determinism の源の特定と削減
-- loop closing の信頼性向上
-- テストの追加（特に tracking / optimizer 周り）
-- Phase B（DL 深度）、Phase D（機能拡張）の着手
+| 区分 | 例 |
+|------|-----|
+| 比較・評価 | stella_vslam 等と **同一プロトコル**での ATE 記録；`verify_comparison_benchmark.sh` の拡張；`leaderboard_suite.json` の拡張 |
+| コア | tracking（PnP、再局在、初期化）、BA、ループの信頼性向上 |
+| 再現性 | `--repro-eval` を壊さず、`evo` / 乱数の分離の改善 |
+| テスト | `tracking` / `merge_run_gate`（Python）等のカバレッジ |
+| DL / 機能 | Phase B（metric depth）、Phase D — **計測フック付き**で |
 
-やってはいけないこと:
+**やってはいけないこと:**
 
-- policy 実験を再開すること（収束済み）
-- `docs/` を stale にすること（変更したら regen を回す）
-- `--repro-eval` の仕組みを壊すこと
-- public repo に壊れた表や stale な数字を push すること
+- policy ablation の再開（収束済み）
+- `docs/` に古い表・未検証の数字をそのまま push
+- `--repro-eval` / 回帰 JSON の意味を変える変更を無言で入れる
+- KITTI 公式リーダーボードと **同条件だと嘘をつく** README 記述（「研究用 TUM 窓」と言い切る）
 
-### 12.3 まずやるべき次タスク
+### 12.3 推奨タスク優先度（**Claude が最初に着手するなら**）
 
-優先順位順:
+**トラック A — 比較検証を完成させる（論文・競合示唆に直結）**
 
-1. **docs regen を回す** — 今回の評価結果を反映
-   ```bash
-   ./scripts/update_reference_policy_docs.py
-   ```
-   ※ `update_reference_policy_docs.py` が `room_focus_repeat5.csv` を読むよう `ROOM_FOCUS_STABILITY_FILE` の参照先を更新する必要があるかもしれない
+1. 自前4プリセットの欠損があれば埋める: `xyz_mono`, `room_mono`（`verify_comparison_benchmark.sh`）。
+2. **stella_vslam**（または選定 OSS）を **同一 TUM ディレクトリ・250フレ方針・mono/depth** で実行し、`comparison_protocol.md` の表に列を追加。
+3. 負けたセルだけ **原因仮説**（初期化 / スケール / ループ有無等）を1行メモ → トラック B へ。
 
-2. **mono non-determinism の源を調査**
-   - `--repro-eval` でも残る variance (std 0.078-0.094) の原因特定
-   - 候補: ORB knnMatch の tie-break、PnP RANSAC seed、cv::solvePnPRansac の内部乱数
-   - 調査方法: RANSAC seed を固定して repeat-5 の std が減るか確認
+**トラック B — SLAM コア（数値で勝つ側）**
 
-   2026-04-06 追記（進捗）:
-   - `--repro-eval` での repeat 実行については **trajectory bitwise一致**まで改善できた。
-     次は「`--no-repro` 側の揺れ」と「評価窓を広げたrepeat-5で std が実際に下がるか」を確認する。
+1. `room_mono` 系の弱さ（歴史的に ATE 大）— `initializer.cc` / `trackLocalMap` / 閾値（Section 2.4、旧 12.3 の候補）を **1変更1ゲート**で。
+2. `--repro-eval` 以外の async 実行の分散調査（OpenCV RANSAC 等）。
+3. Metric DL depth（Depth Anything 以外の metric 化パイプ）。
 
-3. **SLAM コア改善の candidate**
-   - `room_mono_head` の ATE が 0.316-0.358 と大きい → 初期化品質の問題か tracking loss か
-   - 2パス PnP の reproj 閾値 (5.0px) のチューニング
-   - `needNewKeyframe()` のフレーム閾値 (20) / tracking ratio (0.75) の見直し
+**トラック C — メンテ・ドキュメント**
 
-4. **Phase B-1: Metric DL Depth** — Depth Anything v2 は relative depth。Metric3D v2 / UniDepth で metric 化すれば depth sensor なしでも高精度化
+1. `scripts/update_reference_policy_docs.py` と評価 CSV のパス整合（`ROOM_FOCUS_STABILITY_FILE` 等）。
+2. リリース時: `RELEASING.md` + `CITATION.cff` + `CHANGELOG` の三方同期。
 
-5. **Phase E-2: GitHub Actions CI** — `ctest` は `.github/workflows/ci.yml` で実行済み。次の拡張候補: docs regen（`eval_results/` を repo に載せるか要設計）
+**CI パイプライン（`.github/workflows/ci.yml`）:**
 
-   2026-04-06 追記（障害）:
-   - 現環境で `github.com` の名前解決/到達性が不安定なことがあり、FetchContent で `googletest`/`DBoW2` が取れない場合がある。
-     CI 導入時は runner 側のネットワーク前提を明確化し、必要なら依存を vendor する/ミラーを用意する。
+```
+ubuntu-latest / 30min timeout
+  → apt: build-essential cmake ninja-build git libopencv-dev libeigen3-dev libgoogle-glog-dev libgflags-dev libsuitesparse-dev
+  → cmake -S . -B build -G Ninja -DBUILD_TESTS=ON
+  → cmake --build build --parallel
+  → ctest --test-dir build --output-on-failure
+  → ./build/run_mono --help
+  → py_compile: eval_lib.py, check_regression_gate.py, build_leaderboard.py, print_ate_mean.py
+  → check_regression_gate.py --help
+  → build_leaderboard.py --help + --dry-run
+```
+
+データセット（`data/tum/`）と `evo_ape` は CI に **ない** ため、回帰ゲート実行（ATE 計測）はローカルのみ。CI は syntax check + ビルド + ユニットテスト。
+
+**FetchContent 注意:** ローカルで GitHub 到達性が悪い環境では `googletest`/`DBoW2` が取れないことがある。CI は `ubuntu-latest` 前提。
 
 ### 12.4 public repo としての注意
 
-repo は public、Pages も public である。
-
-- GitHub repo: `https://github.com/rsasaki0109/simple_visual_slam`
+- Repo: `https://github.com/rsasaki0109/simple_visual_slam`
 - Pages: `https://rsasaki0109.github.io/simple_visual_slam/`
 
-`docs/` は external-facing artifact。内部メモのつもりで壊れた表や stale な数字を push しないこと。
+`docs/` は external-facing。**壊れた表・未更新の性能表は push しない。** 内部の真実は `plan.md` + `git` + ログ。
 
-### 12.5 触らないもの
+### 12.5 触らないもの（メンテナポリシー）
 
-- `.claude/`
-- `AGENTS.md`
-- `data/` — ローカルデータセット。git 管理外
+- `.claude/`（ユーザ環境）
+- **親ワークスペースの `AGENTS.md`** が別リポ用なら、そのルールをこのリポのコードに誤適用しない（この repo の規約は `CONTRIBUTING.md` / `plan.md`）。
+- `data/` — データセットは git 管理外
 - `scripts/__pycache__/`
+- 巨大バイナリ・機密の混入
 
-### 12.6 終了条件
+### 12.6 1ターンの終了条件（満たせば十分）
 
-1 ターンの終了条件は「抽象が美しいこと」ではない。以下のどれかを満たしたら十分。
+- ATE（mean または std）を **同一プロトコルで**改善した、と根拠付きで言える
+- 再現性のバグを1つ潰した（または原因を特定した）
+- 外部比較表の **新しい列・行**を埋め、プロトコルを文書化した
+- テストまたは CI チェックを追加した
+- `docs/` を意図的に更新し、再生成パスが通った
 
-- SLAM コアの品質を計測可能に改善した（ATE の mean または std が減った）
-- non-determinism の源を1つ特定・修正した
-- 新しい機能（Phase B/D）を動作する形で追加した
-- テストカバレッジを拡大した
-- docs を fresh な状態に更新した
+### 12.7 コマンド早見表（Claude 用コピペ）
+
+```bash
+# ビルド + ユニットテスト
+cmake -S . -B build -G Ninja -DBUILD_TESTS=ON && cmake --build build && ctest --test-dir build --output-on-failure
+
+# 回帰（ローカル data/tum + evo_ape 必須、十分時間）
+python3 scripts/check_regression_gate.py --all-gates --quiet
+
+# 比較検証プリセット（BUILD を適宜）
+BUILD=build bash scripts/verify_comparison_benchmark.sh xyz_depth
+
+# 研究用マトリクス（重い）
+python3 scripts/build_leaderboard.py --build build --quiet
+
+# mean ATE のみ（GT と trajectory のパス）
+python3 scripts/print_ate_mean.py /path/to/groundtruth.txt /path/to/trajectory.txt
+
+# CLI ヘルプ
+./build/run_mono --help
+```
+
+### 12.8 ディレクトリ→目的（迷子防止）
+
+| パス | 目的 |
+|------|------|
+| `eval/regression_baselines.json` | CI/ローカル回帰の **基準線**（5 gates, ATE 上限） |
+| `eval/leaderboard_suite.json` | **内部** ablation 排名（外部 KITTI ではない） |
+| `eval/comparison_protocol.md` | **外部 OSS** と並べる約束事（必読） |
+| `scripts/eval_lib.py` | `run_mono` 起動 + `evo` 統計の **共通モジュール** |
+| `scripts/check_regression_gate.py` | ビット一致 + ATE 回帰ゲート |
+| `scripts/build_leaderboard.py` | methods×seq マトリクス（研究向け） |
+| `scripts/verify_comparison_benchmark.sh` | 比較検証 Step 1（プリセット実行） |
+| `scripts/print_ate_mean.py` | 単発 mean ATE 出力 |
+| `apps/run_mono.cc` | 全入力モード・運用フラグの集合（`--help` で一覧） |
+| `src/tracking/tracking.cc` | 追跡・初期化・再局在の中心（1833行） |
+| `src/io/tum_pinhole_calibration.*` | TUM キャリブ JSON パーサ |
+| `config/examples/` | `--tum-camera-config` サンプル |
+| `CITATION.cff` / `RELEASING.md` | 学術引用・リリース手順 |
+| `CHANGELOG.md` | Unreleased + 0.1.0 の変更記録 |
 
 ---
 
@@ -943,4 +1154,11 @@ repo は public、Pages も public である。
 - Experiment tables: `docs/experiments.md`
 - Minimal interface: `docs/interfaces.md`
 
-`plan.md` は内部 handoff 文書、`docs/` は public digest、`README.md` は入口、という役割分担で考えること。
+`plan.md` は **内部 handoff（Claude / Codex / Cursor）**、`docs/` は public digest、`README.md` は入口、という役割分担。
+
+---
+
+## 14. 変更履歴メモ（plan.md 自身）
+
+- **2026-04-08:** Section 1 を大幅拡充（1.1 → 2026-04-08 時点に更新、1.2 未コミット変更の完全リスト追加、1.3 コミット済み成果テーブル化、1.4 コミット分割案新設、1.5 旧過去メモ）。Section 2.1 に `tum_pinhole_calibration`・詳細コメント追加、`run_mono.cc` 行数と全 CLI フラグ更新、テスト行数更新、`eval/` と `scripts/` に詳細注釈追加。Section 11 git 履歴を `52d3547` まで拡張。Section 12 に 12.0（着手前チェック）新設、12.1 読む順番改訂、CI パイプライン詳細追加。
+- **2026-04（初版）:** Section 1 再構成（1.1 現状サマリ / 1.2 詳細差分 / 1.3 過去セッション）、Section 2.1 に `eval/`・`scripts/eval_*`・`config/examples`・新テストを反映、Section 12 を **Claude 引き継ぎ特化**で全面改稿（トラック A/B/C、12.7–12.8 追加）。
