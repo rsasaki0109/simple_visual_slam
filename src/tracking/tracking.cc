@@ -688,30 +688,31 @@ bool Tracking::trackLocalMap() {
         visible_lm_list.push_back(lm);
         visible_lm_pts.push_back(cv::Point3f(pos_w[0], pos_w[1], pos_w[2]));
         
-        // Search for match in current frame features
-        // Simple search: look for features near px
+        // Search for match in current frame features with ratio test
         int best_idx = -1;
         double best_dist = 64.0;
-        const double search_radius_sq = 120.0 * 120.0;
-        
-        // Radius search (naive O(N) per landmark)
-        // Ideally should use grid search
+        double second_best_dist = 256.0;
+        const double search_radius_sq = 100.0 * 100.0;
+
         for (size_t i = 0; i < current_frame_->keypoints_.size(); ++i) {
              if (keypoint_already_matched[i]) continue;
              const auto& kp = current_frame_->keypoints_[i];
              double dist_spatial = (kp.pt.x - px[0])*(kp.pt.x - px[0]) + (kp.pt.y - px[1])*(kp.pt.y - px[1]);
-             
+
              if (dist_spatial < search_radius_sq) {
-                 // Check descriptor distance
                  double dist_desc = cv::norm(current_frame_->descriptors_.row(i), lm->descriptor_, cv::NORM_HAMMING);
                  if (dist_desc < best_dist) {
+                     second_best_dist = best_dist;
                      best_dist = dist_desc;
                      best_idx = i;
+                 } else if (dist_desc < second_best_dist) {
+                     second_best_dist = dist_desc;
                  }
              }
         }
-        
-        if (best_idx != -1) {
+
+        // Ratio test: reject ambiguous matches
+        if (best_idx != -1 && best_dist < 0.7 * second_best_dist) {
             object_points.push_back(cv::Point3f(pos_w[0], pos_w[1], pos_w[2]));
             image_points.push_back(current_frame_->keypoints_[best_idx].pt);
             

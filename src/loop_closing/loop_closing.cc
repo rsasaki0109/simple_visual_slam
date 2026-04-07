@@ -521,11 +521,11 @@ void LoopClosing::correctLoop() {
         optimizer_edges.push_back(edge);
     }
 
-    Optimizer::poseGraphOptimization(map_, optimizer_edges, 60);
-
-    // Protect structural modifications (landmark merge, covisibility graph update)
+    // Block tracking before modifying poses/landmarks
     map_->loop_correcting_.store(true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    Optimizer::poseGraphOptimization(map_, optimizer_edges, 60);
 
     fuseLoopLandmarks();
 
