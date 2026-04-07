@@ -379,7 +379,7 @@ void LocalMapping::optimization() {
     std::vector<Keyframe::Ptr> local_keyframes;
     local_keyframes.push_back(current_processed_kf_);
 
-    auto neighbors = current_processed_kf_->getBestCovisibilityKeyframes(10);
+    auto neighbors = current_processed_kf_->getBestCovisibilityKeyframes(15);
     for (auto& kf : neighbors) {
         if (!kf) continue;
         local_keyframes.push_back(kf);
@@ -426,7 +426,7 @@ void LocalMapping::optimization() {
 
     if (local_keyframes.size() < 2 || local_landmarks.size() < 10) return;
 
-    Optimizer::bundleAdjustment(local_keyframes, local_landmarks, 5);
+    Optimizer::bundleAdjustment(local_keyframes, local_landmarks, 10);
 
     // Notify Tracking that BA is complete so it can recompute current frame pose
     if (on_ba_completed_) {
