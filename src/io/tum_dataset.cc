@@ -1,4 +1,5 @@
 #include "io/tum_dataset.h"
+#include "io/tum_pinhole_calibration.h"
 
 #include <filesystem>
 #include <fstream>
@@ -25,7 +26,9 @@ static std::string trim(const std::string& s) {
 
 }  // namespace
 
-TumRgbdDataset::TumRgbdDataset(const std::string& seq_dir) : seq_dir_(seq_dir) {
+TumRgbdDataset::TumRgbdDataset(const std::string& seq_dir) : TumRgbdDataset(seq_dir, TumPinholeCalibration::fr1_default()) {}
+
+TumRgbdDataset::TumRgbdDataset(const std::string& seq_dir, const TumPinholeCalibration& calib) : seq_dir_(seq_dir) {
     const std::string rgb_txt = (std::filesystem::path(seq_dir_) / "rgb.txt").string();
     const std::string rgb_dir = (std::filesystem::path(seq_dir_) / "rgb").string();
 
@@ -38,21 +41,28 @@ TumRgbdDataset::TumRgbdDataset(const std::string& seq_dir) : seq_dir_(seq_dir) {
         return;
     }
 
-    // TUM RGB-D fr1 camera intrinsics (RGB camera)
     K_ = cv::Mat::eye(3, 3, CV_64F);
-    K_.at<double>(0, 0) = 517.3;
-    K_.at<double>(1, 1) = 516.5;
-    K_.at<double>(0, 2) = 318.6;
-    K_.at<double>(1, 2) = 255.3;
+    K_.at<double>(0, 0) = calib.fx;
+    K_.at<double>(1, 1) = calib.fy;
+    K_.at<double>(0, 2) = calib.cx;
+    K_.at<double>(1, 2) = calib.cy;
 
-    dist_coeffs_ = (cv::Mat_<double>(5, 1) << 0.2624, -0.9531, -0.0054, 0.0026, 1.1633);
-
-    // Pre-compute undistortion maps for efficiency
-    cv::Size img_size(640, 480);  // TUM fr1 image size
-    new_K_ = cv::getOptimalNewCameraMatrix(K_, dist_coeffs_, img_size, 0, img_size);
-    cv::initUndistortRectifyMap(K_, dist_coeffs_, cv::Mat(), new_K_, img_size, CV_32FC1, undist_map1_, undist_map2_);
-    // Use undistorted intrinsics going forward
-    K_ = new_K_.clone();
+    if (calib.distortion.empty()) {
+        dist_coeffs_ = cv::Mat();
+        new_K_ = cv::Mat();
+        undist_map1_.release();
+        undist_map2_.release();
+    } else {
+        dist_coeffs_.create(static_cast<int>(calib.distortion.size()), 1, CV_64F);
+        for (size_t i = 0; i < calib.distortion.size(); ++i) {
+            dist_coeffs_.at<double>(static_cast<int>(i), 0) = calib.distortion[i];
+        }
+        const cv::Size img_size(calib.image_width, calib.image_height);
+        new_K_ = cv::getOptimalNewCameraMatrix(K_, dist_coeffs_, img_size, 0, img_size);
+        cv::initUndistortRectifyMap(K_, dist_coeffs_, cv::Mat(), new_K_, img_size, CV_32FC1, undist_map1_,
+                                    undist_map2_);
+        K_ = new_K_.clone();
+    }
 
     if (!loadRgbTxt(rgb_txt, rgb_dir)) return;
     if (entries_.empty()) {

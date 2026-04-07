@@ -380,9 +380,11 @@ bool Tracking::track() {
     } else {
         // Tracking failed - attempt relocalization
         std::cout << "Tracking: Lost, attempting relocalization..." << std::endl;
+        run_stats_.reloc_attempts++;
 
         if (relocalize()) {
             std::cout << "Tracking: Relocalization successful!" << std::endl;
+            run_stats_.reloc_successes++;
             state_ = TrackingState::OK;
             consecutive_tracking_failures_ = 0;
             lost_frame_count_ = 0;
@@ -405,6 +407,7 @@ bool Tracking::track() {
                           << " frames, attempting re-initialization..." << std::endl;
                 if (reinitialize()) {
                     std::cout << "Tracking: Re-initialization successful!" << std::endl;
+                    run_stats_.reinit_successes++;
                     state_ = TrackingState::OK;
                     consecutive_tracking_failures_ = 0;
                     lost_frame_count_ = 0;
@@ -417,6 +420,10 @@ bool Tracking::track() {
                 std::cout << "Tracking: Completely lost for " << lost_frame_count_ << " frames" << std::endl;
             }
         }
+    }
+
+    if (state_ == TrackingState::LOST) {
+        run_stats_.frames_tracking_lost++;
     }
 
     // 5. Check if we need a new Keyframe (only if tracking is OK)

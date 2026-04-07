@@ -15,6 +15,22 @@ A lightweight, readable visual SLAM system with deep learning depth integration.
 - **~6,000 lines of C++** -- designed to be readable and educational rather than maximally optimized
 - **BSD-2-Clause license** ([LICENSE](LICENSE)) -- all dependencies are GPL-free
 
+## Citing
+
+For papers and reports, please cite the repository (GitHub also reads [`CITATION.cff`](CITATION.cff)). Example BibTeX:
+
+```bibtex
+@software{simple_visual_slam,
+  title        = {SimpleVisualSLAM},
+  year         = {2026},
+  publisher    = {GitHub},
+  howpublished = {\url{https://github.com/rsasaki0109/simple_visual_slam}},
+  license      = {BSD-2-Clause},
+  version      = {0.1.0},
+  note         = {For reproducibility, record the git commit and run ./build/run_mono --version.}
+}
+```
+
 ## Architecture
 
 ```mermaid
@@ -60,6 +76,8 @@ Absolute Trajectory Error (ATE) mean in meters, evaluated with Sim(3) alignment.
 
 Depth sensor integration significantly improves metric-scale accuracy. Accelerometer data provides gravity alignment and helps with stationary detection but shows marginal improvement when depth is already available.
 
+**Comparing to other OSS (stella_vslam, ORB-SLAM, …):** use the same TUM window, modality, and `evo_ape` flags or the numbers are not comparable. See [eval/comparison_protocol.md](eval/comparison_protocol.md). **Start with baseline verification:** `bash scripts/verify_comparison_benchmark.sh xyz_depth` (presets: `xyz_mono`, `room_mono`, …) prints mean ATE with the same `evo_ape` extras as `eval/regression_baselines.json`. This project’s design target is to stay **BSD-clean** and **readable** while competing on selected clips—especially where **RGB-D or DL depth** is in play—not to win every KITTI row.
+
 ## Experiment Status
 
 The reference-keyframe policy work now lives as a compareable experiment surface rather than a one-off implementation tweak.
@@ -77,6 +95,8 @@ Current snapshot:
 - Runtime default remains `heuristic` until one policy wins across curated, replay, and repeat gates
 
 **Local regression gate (data required):** With TUM sequences under `data/tum/` (see `eval/regression_baselines.json`) and `evo_ape` installed, run `python3 scripts/check_regression_gate.py --quiet` from the repo root. This checks `--repro-eval` bitwise trajectory match on two runs and compares mean ATE (same `evo_ape` flags as `scripts/eval_reference_policies.sh`) to per-scenario ceilings. Use `--all-gates` to run every scenario in the JSON (room: mono, depth, depth+accel; xyz: mono, depth), `--gate <name>` for one scenario, and `--skip-ate` for reproducibility only. Contributor-oriented notes: [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Research comparison table (TUM; data required):** `scripts/build_leaderboard.py` prints a ranked matrix (methods × short TUM windows) for ablations and papers. It is intentionally **not** a KITTI odometry substitute—KITTI’s sequences, sensors, and reporting rules are a different game, and forcing this repo into that mold mostly squeezes what you can evaluate. Edit `eval/leaderboard_suite.json` to choose windows and method presets; use `python3 scripts/build_leaderboard.py --dry-run` to preview the matrix, then e.g. `python3 scripts/build_leaderboard.py --build build --quiet` to evaluate. Rows sort by **mean ATE** (lower better) with an optional **mean rank** across sequences. Default Markdown: `eval_results/leaderboard.md`; `--json-out` for raw numbers.
 
 **Ceres parallelism:** Bundle adjustment and pose-graph solves default to **one thread** for repeatable results. For faster (possibly run-to-run variable) solves, set e.g. `export SVSLAM_CERES_NUM_THREADS=8` before running `run_mono`.
 
@@ -133,6 +153,8 @@ bash scripts/eval_all.sh --repeat 5
 This runs each dataset/mode pair five times, keeps per-run trajectories and logs in `eval_results/`, and writes aggregate `mean/std` ATE statistics to `eval_results/summary.txt`.
 
 ## Usage
+
+All modes: run `./build/run_mono --help` for TUM flags (`--repro-eval`, `--run-summary-json`, `--strict-exit`, calibration JSON, etc.).
 
 ### Video File
 

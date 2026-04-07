@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "comment": "Research harness: multi-sequence × method matrix on TUM (edit freely). Run: python3 scripts/build_leaderboard.py --build build",
+  "evo_ape_extra_args": [
+    "--align",
+    "--correct_scale",
+    "--t_max_diff",
+    "0.05"
+  ],
+  "sequences": [
+    {
+      "id": "xyz_250",
+      "tum_sequence": "rgbd_dataset_freiburg1_xyz",
+      "skip_frames": 0,
+      "max_frames": 250,
+      "repro_eval": true
+    },
+    {
+      "id": "room_250",
+      "tum_sequence": "rgbd_dataset_freiburg1_room",
+      "skip_frames": 0,
+      "max_frames": 250,
+      "repro_eval": true
+    }
+  ],
+  "methods": [
+    {
+      "id": "mono_heuristic",
+      "reference_policy": "heuristic",
+      "use_depth": false,
+      "use_accel": false
+    },
+    {
+      "id": "depth_heuristic",
+      "reference_policy": "heuristic",
+      "use_depth": true,
+      "use_accel": false
+    },
+    {
+      "id": "depth_accel_heuristic",
+      "reference_policy": "heuristic",
+      "use_depth": true,
+      "use_accel": true
+    },
+    {
+      "id": "mono_score",
+      "reference_policy": "score",
+      "use_depth": false,
+      "use_accel": false
+    },
+    {
+      "id": "depth_score",
+      "reference_policy": "score",
+      "use_depth": true,
+      "use_accel": false
+    },
+    {
+      "id": "mono_pipeline",
+      "reference_policy": "pipeline",
+      "use_depth": false,
+      "use_accel": false
+    },
+    {
+      "id": "depth_pipeline",
+      "reference_policy": "pipeline",
+      "use_depth": true,
+      "use_accel": false
+    }
+  ]
+}
