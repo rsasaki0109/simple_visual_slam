@@ -35,6 +35,11 @@ LoopConstraintWeighting computeLoopConstraintWeighting(int inlier_count,
                                                        double inlier_ratio,
                                                        bool has_metric_depth);
 double computeStaleLoopEdgeDecay(double translation_error, double scale_error);
+double computeLoopConstraintOverlapDecay(unsigned long newest_from_id,
+                                         unsigned long newest_to_id,
+                                         unsigned long existing_from_id,
+                                         unsigned long existing_to_id,
+                                         unsigned long overlap_window_kf = 140);
 void mergeLandmarks(Map::Ptr map,
                     const Landmark::Ptr& target,
                     const Landmark::Ptr& source);
@@ -125,6 +130,7 @@ private:
     double max_sim3_residual_ = 0.25;
     double min_sim3_scale_ = 0.7;
     double max_sim3_scale_ = 1.4;
+    unsigned long loop_constraint_overlap_window_kf_ = 140;
 
     bool has_metric_depth_ = false;
     bool has_successful_loop_ = false;

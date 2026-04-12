@@ -1,0 +1,126 @@
+{
+  "generated_at": "2026-04-13T13:11:19+09:00",
+  "comparison_protocol": {
+    "reference": "eval/comparison_protocol.md",
+    "evo_ape_flags": [
+      "--align",
+      "--correct_scale",
+      "--t_max_diff",
+      "0.05"
+    ],
+    "simple_visual_slam": {
+      "build_dir": "build_codex",
+      "git_head": "6429d9b9ba34697c668b474acac8ca456653f8fe",
+      "version": "SimpleVisualSLAM 0.1.0",
+      "tracked_frame_window": 250,
+      "common_flags": [
+        "--max-frames",
+        "250",
+        "--repro-eval",
+        "--no-viz",
+        "--reference-policy",
+        "heuristic"
+      ],
+      "depth_extra_flag": "--depth",
+      "loop_closing": {
+        "status": "disabled",
+        "reason": "Repro eval mode disables loop closing; logs also report ORBvoc.txt not found from build_codex cwd."
+      }
+    },
+    "stella_vslam": {
+      "results_root": "/media/sasaki/aiueo/ai_coding_ws/stella_eval",
+      "loop_closing_status": "unknown",
+      "artifact_note": "Provided stella_eval frame_trajectory.txt files were not canonical 250-frame windows; fair comparison uses the first 250 poses from each provided trajectory."
+    }
+  },
+  "scenarios": {
+    "xyz_depth": {
+      "sequence": "rgbd_dataset_freiburg1_xyz",
+      "modality": "depth",
+      "simple_visual_slam": {
+        "trajectory_path": "build_codex/trajectory_xyz_depth.txt",
+        "ate_mean_m": 0.01136912
+      },
+      "stella_vslam": {
+        "provided_trajectory_path": "/media/sasaki/aiueo/ai_coding_ws/stella_eval/xyz_depth/frame_trajectory.txt",
+        "provided_pose_count": 798,
+        "provided_ate_mean_m": 0.00832365,
+        "fair_head250_pose_count": 250,
+        "fair_head250_ate_mean_m": 0.00889256
+      },
+      "comparison": {
+        "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
+        "delta_simple_minus_stella_m": 0.00247656,
+        "winner": "stella_vslam",
+        "simple_loses": true,
+        "loss_hypothesis": "Slightly higher local RGB-D pose noise from the current heuristic keyframe/depth stack than stella_vslam's more mature ORB + local BA pipeline on this short translation-heavy clip."
+      }
+    },
+    "xyz_mono": {
+      "sequence": "rgbd_dataset_freiburg1_xyz",
+      "modality": "mono",
+      "simple_visual_slam": {
+        "trajectory_path": "build_codex/trajectory_xyz_mono.txt",
+        "ate_mean_m": 0.04827879
+      },
+      "stella_vslam": {
+        "provided_trajectory_path": "/media/sasaki/aiueo/ai_coding_ws/stella_eval/xyz_mono/frame_trajectory.txt",
+        "provided_pose_count": 792,
+        "provided_ate_mean_m": 0.01076242,
+        "fair_head250_pose_count": 250,
+        "fair_head250_ate_mean_m": 0.01413570
+      },
+      "comparison": {
+        "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
+        "delta_simple_minus_stella_m": 0.03414309,
+        "winner": "stella_vslam",
+        "simple_loses": true,
+        "loss_hypothesis": "Monocular initialization and early map maintenance drift more than stella_vslam's ORB front-end/local optimization, producing a much larger head-250 pose error."
+      }
+    },
+    "room_depth": {
+      "sequence": "rgbd_dataset_freiburg1_room",
+      "modality": "depth",
+      "simple_visual_slam": {
+        "trajectory_path": "build_codex/trajectory_room_depth.txt",
+        "ate_mean_m": 0.08606639
+      },
+      "stella_vslam": {
+        "provided_trajectory_path": "/media/sasaki/aiueo/ai_coding_ws/stella_eval/room_depth/frame_trajectory.txt",
+        "provided_pose_count": 1362,
+        "provided_ate_mean_m": 0.03321209,
+        "fair_head250_pose_count": 250,
+        "fair_head250_ate_mean_m": 0.02110508
+      },
+      "comparison": {
+        "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
+        "delta_simple_minus_stella_m": 0.06496131,
+        "winner": "stella_vslam",
+        "simple_loses": true,
+        "loss_hypothesis": "With loop closing disabled in --repro-eval, the room sequence accumulates much more drift through revisits than stella_vslam on the same early trajectory segment."
+      }
+    },
+    "room_mono": {
+      "sequence": "rgbd_dataset_freiburg1_room",
+      "modality": "mono",
+      "simple_visual_slam": {
+        "trajectory_path": "build_codex/trajectory_room_mono.txt",
+        "ate_mean_m": 0.19982044
+      },
+      "stella_vslam": {
+        "provided_trajectory_path": "/media/sasaki/aiueo/ai_coding_ws/stella_eval/room_mono/frame_trajectory.txt",
+        "provided_pose_count": 548,
+        "provided_ate_mean_m": 0.02600812,
+        "fair_head250_pose_count": 250,
+        "fair_head250_ate_mean_m": 0.02743546
+      },
+      "comparison": {
+        "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
+        "delta_simple_minus_stella_m": 0.17238498,
+        "winner": "stella_vslam",
+        "simple_loses": true,
+        "loss_hypothesis": "Monocular scale drift plus no loop closure is especially costly on room_mono, where correspondence support thins out and the map degrades much earlier than stella_vslam."
+      }
+    }
+  }
+}

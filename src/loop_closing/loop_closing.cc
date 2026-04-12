@@ -274,6 +274,31 @@ double computeStaleLoopEdgeDecay(double translation_error, double scale_error) {
     return std::min(translation_decay, scale_decay);
 }
 
+double computeLoopConstraintOverlapDecay(unsigned long newest_from_id,
+                                         unsigned long newest_to_id,
+                                         unsigned long existing_from_id,
+                                         unsigned long existing_to_id,
+                                         unsigned long overlap_window_kf) {
+    if (overlap_window_kf == 0) {
+        return 1.0;
+    }
+
+    const auto endpoint_overlaps = [overlap_window_kf](unsigned long lhs, unsigned long rhs) {
+        const auto diff = (lhs > rhs) ? (lhs - rhs) : (rhs - lhs);
+        return diff < overlap_window_kf;
+    };
+
+    const bool from_overlaps = endpoint_overlaps(newest_from_id, existing_from_id);
+    const bool to_overlaps = endpoint_overlaps(newest_to_id, existing_to_id);
+    if (from_overlaps && to_overlaps) {
+        return 0.35;
+    }
+    if (from_overlaps || to_overlaps) {
+        return 0.60;
+    }
+    return 1.0;
+}
+
 void mergeLandmarks(Map::Ptr map,
                     const Landmark::Ptr& target,
                     const Landmark::Ptr& source) {
@@ -799,6 +824,7 @@ void LoopClosing::correctLoop() {
 
     std::vector<Optimizer::PoseGraphEdge> optimizer_edges;
     optimizer_edges.reserve(loop_constraints_.size());
+    const auto& newest_constraint = loop_constraints_.back();
     for (size_t idx = 0; idx < loop_constraints_.size(); ++idx) {
         const auto& loop_constraint = loop_constraints_[idx];
         double translation_weight = loop_constraint.translation_weight;
@@ -812,7 +838,7 @@ void LoopClosing::correctLoop() {
                 loop_constraint.from,
                 loop_constraint.to,
                 loop_constraint.relative_pose);
-            const double reuse_decay = computeLoopConstraintReuseDecay(consistency);
+            double reuse_decay = computeLoopConstraintReuseDecay(consistency);
             if (consistency.valid && reuse_decay < 0.999) {
                 std::cout << "LoopClosing: Reweighting stale loop edge from_kf="
                           << loop_constraint.from->id_
@@ -821,6 +847,22 @@ void LoopClosing::correctLoop() {
                           << " scale_err=" << consistency.scale_error
                           << " decay=" << reuse_decay << std::endl;
             }
+            const double overlap_decay =
+                loop_closing_internal::computeLoopConstraintOverlapDecay(
+                    newest_constraint.from->id_,
+                    newest_constraint.to->id_,
+                    loop_constraint.from->id_,
+                    loop_constraint.to->id_,
+                    loop_constraint_overlap_window_kf_);
+            if (overlap_decay < 0.999) {
+                std::cout << "LoopClosing: Downweighting overlapping loop edge from_kf="
+                          << loop_constraint.from->id_
+                          << " to_kf=" << loop_constraint.to->id_
+                          << " newest_from=" << newest_constraint.from->id_
+                          << " newest_to=" << newest_constraint.to->id_
+                          << " overlap_decay=" << overlap_decay << std::endl;
+            }
+            reuse_decay = std::min(reuse_decay, overlap_decay);
             translation_weight *= reuse_decay;
             rotation_weight *= reuse_decay;
             scale_weight *= reuse_decay;
