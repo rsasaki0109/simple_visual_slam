@@ -16,7 +16,7 @@
       "max_frames": 250,
       "repro_eval": true,
       "use_depth": true,
-      "max_mean_ape_m": 0.2
+      "max_mean_ape_m": 0.165
     },
     "room_depth_accel_head_repro": {
       "description": "TUM freiburg1 room, RGB-D + accelerometer (--depth --accel), frames 0-250, heuristic, --repro-eval.",
@@ -27,7 +27,7 @@
       "repro_eval": true,
       "use_depth": true,
       "use_accel": true,
-      "max_mean_ape_m": 0.17
+      "max_mean_ape_m": 0.145
     },
     "room_mono_head_repro": {
       "description": "TUM freiburg1 room, mono, frames 0-250, heuristic, --repro-eval; same window as experiments/reference_keyframe/room_focus_corpus.tsv room_mono_head.",
@@ -46,7 +46,7 @@
       "max_frames": 250,
       "repro_eval": true,
       "use_depth": true,
-      "max_mean_ape_m": 0.02
+      "max_mean_ape_m": 0.016
     },
     "xyz_mono_head_repro": {
       "description": "TUM freiburg1 xyz, mono, frames 0-250, heuristic, --repro-eval (README 'Seq A' class).",
@@ -55,7 +55,7 @@
       "skip_frames": 0,
       "max_frames": 250,
       "repro_eval": true,
-      "max_mean_ape_m": 0.04
+      "max_mean_ape_m": 0.03
     }
   }
 }
