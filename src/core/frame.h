@@ -31,7 +31,7 @@ public:
 
     // Depth image (CV_16UC1 in mm for sensor depth, or CV_32FC1 in meters for DL depth)
     cv::Mat depth_image_;
-    bool depth_is_metric_ = true;  // true for sensor depth, false for DL relative depth
+    bool depth_is_metric_ = true;  // true for sensor/metric DL depth, false for relative DL depth
 
     // Get depth at pixel (u,v) in meters. Returns <= 0 if invalid.
     float getDepth(float u, float v) const;
