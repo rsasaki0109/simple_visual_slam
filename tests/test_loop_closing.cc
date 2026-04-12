@@ -72,3 +72,12 @@ TEST(LoopClosingTest, StaleEdgeDecayClampsToSafetyFloor) {
     EXPECT_DOUBLE_EQ(loop_closing_internal::computeStaleLoopEdgeDecay(0.50, 0.01), 0.35);
     EXPECT_DOUBLE_EQ(loop_closing_internal::computeStaleLoopEdgeDecay(0.10, 0.04), 0.5);
 }
+
+TEST(LoopClosingTest, OverlapDecayDownweightsNearbySecondLoops) {
+    EXPECT_DOUBLE_EQ(
+        loop_closing_internal::computeLoopConstraintOverlapDecay(280, 121, 151, 22, 140), 0.35);
+    EXPECT_DOUBLE_EQ(
+        loop_closing_internal::computeLoopConstraintOverlapDecay(280, 240, 151, 22, 140), 0.60);
+    EXPECT_DOUBLE_EQ(
+        loop_closing_internal::computeLoopConstraintOverlapDecay(400, 260, 151, 22, 140), 1.0);
+}

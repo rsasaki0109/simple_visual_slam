@@ -37,3 +37,21 @@ TEST(TrackingPoseRecomputeTest, AcceptsStrongStableUpdateDuringRecovery) {
     EXPECT_TRUE(Tracking::shouldAcceptLocalMapPoseUpdate(
         344, 217, false, 0.03, 0.03, 1));
 }
+
+TEST(TrackingPoseRecomputeTest, RelocalizationCandidatePolicyStaysLocalDuringLoopRecovery) {
+    EXPECT_TRUE(Tracking::shouldConsiderRelocalizationCandidate(
+        3.5, true, true, 2));
+    EXPECT_TRUE(Tracking::shouldConsiderRelocalizationCandidate(
+        2.0, false, true, 2));
+    EXPECT_FALSE(Tracking::shouldConsiderRelocalizationCandidate(
+        3.0, false, true, 2));
+}
+
+TEST(TrackingPoseRecomputeTest, RelocalizationCandidatePolicyRelaxesAfterLoopPendingClears) {
+    EXPECT_TRUE(Tracking::shouldConsiderRelocalizationCandidate(
+        3.5, false, false, 1));
+    EXPECT_FALSE(Tracking::shouldConsiderRelocalizationCandidate(
+        4.5, false, false, 1));
+    EXPECT_TRUE(Tracking::shouldConsiderRelocalizationCandidate(
+        10.0, false, false, 0));
+}

@@ -52,6 +52,10 @@ public:
                                                double trans_change,
                                                double rot_change,
                                                int stabilization_frames_remaining);
+    static bool shouldConsiderRelocalizationCandidate(double distance_to_anchor,
+                                                      bool is_reference_candidate,
+                                                      bool pending_loop_correction,
+                                                      int stabilization_frames_remaining);
 
     // Callback from LocalMapping when BA is completed
     void onBACompleted();
@@ -111,12 +115,13 @@ private:
     bool trackReferenceKeyframe();
     bool trackLocalMap();
     bool needNewKeyframe();
-    void applyPendingLoopCorrection(const char* phase);
+    bool applyPendingLoopCorrection(const char* phase);
     bool recomputeCurrentPose();
     bool relocalize();  // Attempt to recover from tracking loss
     bool reinitialize();  // Re-initialize from scratch when lost for too long
     void setReferenceKeyframe(Keyframe::Ptr kf);
     void setKeyframeGravity(Keyframe::Ptr kf);  // Set gravity from accel data
+    static std::size_t countValidFrameLandmarks(const Frame::Ptr& frame);
 
     cv::Ptr<cv::DescriptorMatcher> matcher_;
     std::mutex pose_mutex_;  // For thread-safe pose updates
@@ -126,6 +131,8 @@ private:
     static constexpr int max_loop_correction_deferrals_ = 6;
     static constexpr size_t min_loop_correction_correspondences_ = 80;
     static constexpr int recovery_stabilization_window_frames_ = 3;
+    static constexpr double loop_relocalization_radius_m_ = 2.5;
+    static constexpr double recovery_relocalization_radius_m_ = 4.0;
     static constexpr std::size_t min_stable_support_ = 120;
     static constexpr double recovery_max_change_strict_ = 0.12;
     static constexpr double recovery_max_change_relaxed_ = 0.18;

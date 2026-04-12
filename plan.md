@@ -20,96 +20,190 @@ SimpleVisualSLAMは6k行のC++17で、特徴点ベースSLAM + 深度センサ�
 
 **直近の競合ターゲット:** stella_vslam に精度・安定性で並び、DL深度統合で差別化する。
 
-### 1.1 リポジトリの現状（2026-04-08 時点のサマリ）
+### 1.1 リポジトリの現状（2026-04-12 時点のサマリ）
 
 - **Public OSS:** `https://github.com/rsasaki0109/simple_visual_slam` / Pages `https://rsasaki0109.github.io/simple_visual_slam/`
-- **版:** CMake `project(VERSION 0.1.0)`、`./build/run_mono --version` と一致。**引用:** ルート `CITATION.cff`（リリース時は `RELEASING.md` で `version` / `date-released` を CMake と同期）。
-- **方針:** Reference-keyframe **policy 実験（Phase F）は収束済み**。いまの主戦場は **SLAM コア（tracking / BA / ループ）**、**再現性**、**外部OSSとの公平な数値比較**、**研究としての引用可能性**。
-- **哲学:** 「KITTI全部勝ち」を掲げない。**BSD のまま読めるコード**として、**TUM 等の選んだ窓**で stella_vslam 等と並べ、**RGB-D / DL 深度**の統合価値を示すライン。
-- **master HEAD:** `52d3547`（Product release scaffolding）。これに加えて **未コミットの作業ツリー変更あり**（Section 1.2 参照）。
+- **版:** CMake `project(VERSION 0.1.0)`、`./build/run_mono --version` と一致。**引用:** ルート `CITATION.cff`。
+- **master HEAD:** `6429d9b`（`d3c81a7` の後続。Refactor SLAM core, stabilize loop closing, and enrich test suite.）。
+- **本日反映済み:** 2026-04-09 時点で未コミットだったループ補正安定化・tracking handoff・recovery guard 群は `6429d9b` に整理・コミット済み。Section 1.2 は当時の実験ログとして残す。
+- **テスト:** `ctest` **48/48 pass**（旧 24〜26 件帯から拡充）。
+- **回帰ゲート:** `python3 scripts/check_regression_gate.py --all-gates --quiet` **5/5 pass**。
+- **リファクタ:** `tracking.cc` の helper 抽出、状態の `RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への集約、`loop_closing` の internal helper 化、`optimizer` の cleanup を実施。
+- **新規テスト:** `test_frame.cc`, `test_keyframe.cc`, `test_initializer.cc`, `test_loop_closing.cc`, `test_tracking.cc`, `test_tracking_pose_recompute.cc`, `test_synthetic_scene.h` を追加。
+- **方針:** Reference-keyframe policy 実験は収束済み。**SLAM コア品質向上**（特にループ補正の安定化）と**外部OSSとの公平な比較**が主戦場。
+- **retained best state:** metric-depth で `rigid Sim3 + confidence-weighted loop edge + pose-graph snapshot + pending strict accept` を保持。fresh `trajectory.txt` 評価の 400-frame rerun は **0.07351221** まで戻せる。
+- **未解決の本丸:** 600-frame では second-loop / stale-edge reuse が入る long run でまだ **0.10〜0.19 m** 帯に揺れる。loop candidate 検出や callback 配線よりも、**late-run tracking quality / relocalization 連鎖 / pose graph 後の handoff** が残課題。
+- **stella_vslam との比較実測済み** — Section 1.3 参照。
 
-### 1.2 未コミット変更の全容（2026-04-08 — 次の Claude が最初に確認すべき項目）
+### 1.2 未コミット変更（2026-04-09 — ループ補正安定化の途中）
 
-`git status` で staged/unstaged の diff がある。以下が変更内容の完全リスト。
+**9ファイル、約 +691/-178行。** ビルド・テスト通過済み（24/24 pass、`build_bench`）。2026-04-08 深夜から 2026-04-09 にかけて、`run_mono.cc` の callback 配線、`fuseLoopLandmarks()` の KF mutex 保護、`mergeLandmarks()` の生存側変更に加え、loop candidate を usable 3D correspondence 数で再選別する処理、`computeSim3()` 失敗理由の可視化、metric-depth 時の rigid (`scale=1`) 仮説生成、pose graph の metric-depth scale 固定、loop edge の confidence weighting、metric-depth final inlier 下限の引き上げ、pose-graph 入力の keyframe snapshot 化、さらに loop-correction handoff を tracking thread の safe point に移す処理まで含む。加えて、複数 loop constraint が残る metric-depth run に備えて、**古い loop edge を current map との整合性（translation/scale error）で再利用減衰する safety valve** を入れた。
 
-**新規ファイル（untracked）:**
-
-| ファイル | 行数 | 役割 |
-|---------|------|------|
-| `src/io/tum_pinhole_calibration.h` | 27行 | TUM キャリブ構造体（`fx,fy,cx,cy` + optional distortion）。`fr1_default()` で freiburg1 固定値 |
-| `src/io/tum_pinhole_calibration.cc` | 124行 | 最小 JSON パーサ（外部ライブラリ不要）。`load_json_file()` で `config/examples/tum_pinhole_fr1.json` 等を読む |
-| `config/examples/tum_pinhole_fr1.json` | — | `--tum-camera-config` 用のサンプル（freiburg1 固有値） |
-| `CITATION.cff` | 25行 | GitHub "Cite this repository" 用メタ。`version: 0.1.0`, `date-released: 2026-04-01` |
-| `eval/comparison_protocol.md` | 94行 | **外部OSSと数を並べるときの必読**。同一 TUM 窓・モダリティ・`evo_ape` フラグ（`--align --correct_scale --t_max_diff 0.05`）を揃えるルール。Step 1 は `verify_comparison_benchmark.sh` |
-| `eval/leaderboard_suite.json` | — | 研究用 methods×sequences マトリクス。2 sequences (xyz_250, room_250) × 7 methods |
-| `scripts/eval_lib.py` | — | `sha256_file`, `clean_traj_artifacts`, `run_slam`, `evo_mean_ape` の共通化。`check_regression_gate.py` と `build_leaderboard.py` が import |
-| `scripts/build_leaderboard.py` | — | methods×seq 排名ハーネス。`--dry-run` で計画のみ、`--build` で実行、`--json-out` で raw 数値 |
-| `scripts/print_ate_mean.py` | — | GT + trajectory → mean ATE（`regression_baselines.json` の `evo_ape_extra_args` を利用） |
-| `scripts/verify_comparison_benchmark.sh` | — | 比較検証 Step 1: プリセット `xyz_mono|xyz_depth|room_mono|room_depth` |
-| `tests/test_tum_pinhole_calibration.cc` | 52行 | JSON ロード・バリデーションのユニットテスト |
-| `tests/test_tracking_run_statistics.cc` | 14行 | `TrackingRunStatistics` のデフォルトゼロ確認 |
-
-**変更ファイル（既存）:**
-
-| ファイル | 変更概要 |
+| ファイル | 変更内容 |
 |---------|---------|
-| `apps/run_mono.cc` (+112行) | `--help`/`-h`（`print_help()`）、`--tum-camera-config`、`--run-summary-json`（JSON 出力）、`--strict-exit`（exit 3）追加。vocab パス探索で `--strict-exit` / `--run-summary-json` / `--tum-camera-config` をスキップするよう修正 |
-| `src/tracking/tracking.h` (+14行) | `TrackingRunStatistics` 構造体（reloc_attempts, reloc_successes, frames_tracking_lost, reinit_successes）と `runStatistics()` アクセサ |
-| `src/tracking/tracking.cc` (+7行) | `track()` 内で `run_stats_` カウンタをインクリメント（reloc / LOST / reinit） |
-| `src/io/tum_dataset.h` (+3行) | `TumPinholeCalibration` 付きコンストラクタ追加 |
-| `src/io/tum_dataset.cc` (+40行/-30行) | K_ / dist_coeffs_ を `TumPinholeCalibration` から構築。distortion 空なら undistort スキップ |
-| `CMakeLists.txt` (+3行) | `tum_pinhole_calibration.cc`、`test_tum_pinhole_calibration.cc`、`test_tracking_run_statistics.cc` を追加 |
-| `.github/workflows/ci.yml` (+9行) | `run_mono --help` ステップ追加、`py_compile` に `eval_lib`/`build_leaderboard`/`print_ate_mean` 追加、`--dry-run` 追加 |
-| `CHANGELOG.md` (+7行) | `[Unreleased]` に TUM runner, operations hooks, leaderboard, citing, CLI, comparison 等を記載 |
-| `CONTRIBUTING.md` (+8行) | 冒頭に研究OSSの品質バー、`verify_comparison_benchmark.sh` セクション追加 |
-| `README.md` (+22行) | Citing セクション（BibTeX）、comparison protocol / leaderboard / `--help` 情報追加 |
-| `RELEASING.md` (+11行/-10行) | `CITATION.cff` の `version`/`date-released` 同期手順を追加 |
-| `scripts/check_regression_gate.py` (+18行/-102行) | `eval_lib` をインポートして共通関数に移行（`sha256_file`, `run_slam`, `evo_mean_ape` を削除） |
+| `apps/run_mono.cc` | `loop_closing->on_loop_corrected_` を `tracker->onLoopCorrected()` に接続。LoopClosing thread は callback 登録後に起動し、`on_ba_completed_` / `on_loop_corrected_` は `weak_ptr<Tracking>` capture にして循環参照を回避 |
+| `src/backend/local_mapping.cc` | `processPendingWork()` 内で `map_->loop_correcting_` チェック追加。ループ補正中は `optimization()`（BA）をスキップ。**目的:** ループ補正中に Local BA が同時にポーズ/ランドマークを書き換えるデータレースを防止 |
+| `src/backend/optimizer.h` | `poseGraphOptimization()` に `fix_scale` 引数を追加 |
+| `src/backend/optimizer.cc` | metric-depth pose graph 用に各 KF の log-scale へ prior を追加し、covisibility edge の scale residual も強化。さらに solver 入力前に `T_cw_` と `connected_keyframes_` を mutex 下で snapshot して、pose graph に入る covisibility edge を同一時点の状態へ揃える。`PoseGraph: scale_stats min/max/mean` をログ出力して scale drift を可視化 |
+| `src/loop_closing/loop_closing.h` | `on_loop_corrected_` コールバック（`std::function<void()>`）を public メンバとして追加 |
+| `src/loop_closing/loop_closing.cc` | `correctLoop()` 末尾で `on_loop_corrected_()` を呼び出し。`computeSim3()` / `fuseLoopLandmarks()` で KF の landmark slot を mutex 下で snapshot / 更新し、landmark merge は current 側を生存側に変更。さらに loop closing 専用 descriptor match を Lowe ratio **0.8** に緩和し、BoW / fallback candidate は descriptor match 数に加えて usable 3D correspondence 数（`corr3d`）でも再選別。`computeSim3()` は `insufficient_ransac_inliers` などの failure reason に加え、relaxed residual (`0.35`) 時の inlier 数をログ出力。metric-depth では refinement seed を **15本** に緩和した上で rigid (`scale=1`) 仮説生成を使い、最終判定は **22 inlier + ratio guard** で実施。loop constraint は inlier 数と inlier ratio に応じた confidence weight を持つように変更。さらに、複数 loop constraint を pose graph に再投入する際は、古い edge を current map との translation/scale 整合で減衰する safety valve を追加 |
+| `src/tracking/tracking.h` | `onLoopCorrected()` に加えて pending loop-correction state と safe-point helper (`applyPendingLoopCorrection()`) を追加 |
+| `src/tracking/tracking.cc` | loop thread から `current_frame_` を直接触らず、`onLoopCorrected()` は pending flag だけ立てる形へ変更。tracking thread 側で `trackReferenceKeyframe()` 後・`trackLocalMap()` 後・`relocalize()` 成功直後の safe point に `applyPendingLoopCorrection()` を挿し、PnP が失敗した場合は pending を保持して同フレーム / 次フレームで再試行。pending loop correction の pose 再計算は **reprojection error が実際に改善した場合のみ採用**し、`err_after < 20` の absolute fallback は使わない。成功時にだけ velocity をリセット |
 
-**これらの変更はまだコミットされていない。** 次の Claude はこの状態を前提に作業を始める。コミットするなら `git add` → `git commit` でまとめるか、機能単位で分割する。
+**検証状況:** `build_bench` で build + `ctest` 24/24 pass。初期の **0.0647〜0.0822 m** は `build_bench/trajectory.txt` を誤って評価した時期の値で、現在の authoritative な評価対象ではない。repo root で fresh `trajectory.txt` を作る rerun（`rm -f trajectory.txt trajectory_online.txt` 後に `build_bench/run_mono ...`）では、callback 配線と rigid metric-depth Sim3 までを含む retained baseline の ATE は **0.20401715 m** だった。loop correction 後に保存済み `trajectory.txt` の該当 frame を後追い更新し、worker thread join 後に軌跡を書き出す experiment は **0.20486272 m**、各 frame に `reference KF id + T_cr` を持たせて final keyframe pose から `trajectory.txt` を再構成する experiment は **0.28865224 m**、同 run の raw `trajectory_online.txt` でも **0.16064598 m** に留まったため、どちらも**不採用**。つまり repo root rerun では「保存済み軌跡の更新」や「final keyframe pose からの後段再構成」は gap の本命ではない。ここから pose graph 側へ移り、metric-depth pose graph に全 KF scale prior を追加して `PoseGraph: scale_stats min=0.99999.. max=1.00002` まで scale を固定したところ、ATE は **0.18181217** と **0.20063109** で、scale drift 自体は潰れたが改善は不安定だった。さらに loop constraint の translation/rotation weight を `inliers + inlier_ratio` ベースの confidence weight（例: `22 inliers / 0.392857 -> weight 4.94234`, `36 / 0.6 -> 6.79473`）にした rerun では、fresh `trajectory.txt` の ATE が **0.12247207** と **0.16569322** まで改善した。そこから metric-depth の final support を **22 inliers** に引き上げたところ、weak 20-inlier loop は reject されるようになり、fresh `trajectory.txt` rerun は **0.15802252** と **0.09035673** だった。さらに pose graph に入る `T_cw_` と covisibility edge を mutex 下で snapshot するようにした rerun では、fresh `trajectory.txt` の ATE が **0.13723747** と **0.07901260** まで改善した。ここに加えて、loop thread から `current_frame_` を直接触らず `onLoopCorrected()` は pending flag だけ立て、tracking thread 側の safe point で pose 再計算するよう変更した。`trackReferenceKeyframe()` 後だけで吸収する variant は **0.16352909** と **0.12553793** で、`pairs=0` callback miss は消えたものの初回試行が薄い frame に当たる run が残った。そこから pending を成功時まで保持し、`trackLocalMap()` 後にも同フレームで再試行する variant では、loop correction は `after local map` で `pairs=1041` / `1050` を使って吸収され、fresh `trajectory.txt` rerun は **0.12315088** と **0.12105041** だった。さらに `relocalize()` 成功直後も safe point 化した variant は、`after relocalization` で `pairs=1019` / `462` を使えた一方、reprojection が **悪化しても** pending recompute を採用してしまい、400-frame rerun は **0.18307474** と **0.22821251** で**不採用**。そこから pending loop correction に限って **`err_after < err_before` のときだけ採用**する strict accept に切り替えたところ、early handoff は `pairs=668/404/601/294` で reject され、`pairs=946` で初めて `1.53608 -> 1.53387` の改善が出た run は **0.07522716**、別 rerun は `pairs=1046` を reject して `pairs=589` で `1.56168 -> 1.55973` の改善が出て **0.08267831** だった。現時点ではこれが retained best state で、snapshot-only 時代の **0.07901260** に並ぶ帯まで戻せている。safe-point handoff を保持したまま `151->22` を通すために、metric-depth borderline accept と cooldown `140 KF` を組み合わせる experiment も試したが、1本目 **0.09094504** の後に rerun で `328->202` の second-loop が入り **0.41877315** まで崩れたため**不採用**。また、relaxed residual の inlier で Sim3 を再推定し `151->22` を strict `22 inliers` へ rescue する experiment も試したが、`280->121` の second-loop を防げず **0.23805287** に悪化したため**不採用**。metric-depth の loop cooldown を **180 KF** に伸ばして late second-loop を抑える experiment は、1本目こそ **0.07250512** だったものの rerun が **0.47003467** まで崩れたため**不採用**。constraint の prune/update を入れる experiment は 400-frame rerun が **0.37298953** と **0.36328082** まで崩れたため**不採用**。sleep ベース同期を coordinator に置き換える experiment も、tracking 全体を待つ版が **0.07198198** の後に **0.24692610** へ悪化、`trackLocalMap()` 限定版も **0.40753267** まで崩れたため**不採用**。local mapping 完了後に loop-closing queue へ handoff する experiment も **0.37072499** まで悪化したため**不採用**。`loop_correcting_` を `correctLoop()` 冒頭で早めに立て、local BA の開始直前に再チェックする experiment も **0.37356453** まで崩れたため**不採用**。従来の BoW false positive は descriptor match gating でかなり減り、実ループ候補では `desc_matches=50〜74` / `corr3d=32〜69` まで到達することを確認した。`residual_thresh=0.25` を **0.35** に緩めても `relaxed_inliers=7〜23` に留まる事実は変わらず、依然として本丸は correspondence quality / Sim3 仮説品質である。なお、2D 幾何（Fundamental RANSAC）で candidate を再選別する実験は決定打にならず、ATE が **0.08956200 m** まで悪化したため**不採用**。また、covisibility edge の相対測定値を保存して pose graph に使う構造変更は、1本目こそ **0.07266019 m** だったものの rerun で **0.18586552 m** まで悪化したため**不採用**。metric-depth の loop edge を support に応じて単純に弱める experiment（`trans/rot=4.60666`, `scale=589.286`）も **0.23616777 m** まで崩れたため**不採用**。さらに、reference keyframe の pose delta を tracking frame に直接適用する experiment は `trans=0.330026 / rot=0.658964 rad` の correction がそのまま世界ジャンプになり、frame 257 以降の pose が急崩壊したため**不採用**。loop 中の keyframe insertion defer を組み合わせても改善しなかった。loop correction 後の 2フレームだけ tracking gate / jump threshold を緩める recovery experiment は、1回目の loop 直後に `3D-2D correspondences=128 -> 419` と回復したものの、正しい出力先である repo root の `trajectory.txt` で評価すると ATE は **0.34410088 m** で**不採用**。同 experiment に加えて metric-depth で 2本目以降の loop correction を落とす one-shot experiment も、`trajectory.txt` 評価では改善しなかったため**不採用**。なお `build_bench/trajectory.txt` は古い run の残骸で、正しい評価対象ではない。
 
-### 1.3 2026-04 コミット済み成果（`52d3547` まで）
+#### 1.2.1 2026-04-09 追記: 400-frame / 600-frame の現在地
 
-以下は **2026-04 のコーディングセッションでコミット済み**の成果物。`git log` が最終真理。
+2026-04-09 の追加検証では、**retained state 自体は変えず**に「400-frame では良いのに 600-frame で late-run が崩れる」理由を切り分けた。ここで重要なのは、今回の turn では新しい keep change は増えていないこと、および `plan.md` には retained / not-retained の境界を明示して残すこと、の2点である。
+
+**まず retained state の再確認:**
+
+- `build_bench` で再build、`ctest --test-dir build_bench --output-on-failure` は継続して **24/24 pass**
+- retained codeのまま fresh `trajectory.txt` を作る **400-frame** rerun では **0.07351221**
+- この run では `151->22` loop correction 後、pending loop correction は `pairs=4` から始まり、safe point で複数回 defer / failed recompute を挟んだ後に expire した
+- その直後、`TrackLocalMap()` の local-map PnP が `support=184 / prior_support=409` で `trans=0.174787`, `rot=0.301117` の危険な update を出しており、実験 guard を入れた版ではここを reject できた。この reject 自体は**症状の可視化**として有益だった
+- 400-frame の最終 ATE が `0.07351221` まで戻ったことから、少なくとも short run では retained state はまだ competitive で、`safe-point handoff + pending strict accept` の方向性は正しい
+
+**一方で 600-frame retained baseline の実態:**
+
+- 以前の retained baseline rerun は **0.17683183**
+- この run では `151->22` に続いて `280->121` の second-loop も通り、`Reweighting stale loop edge ... decay=0.35` まで踏めた
+- しかし second-loop 後の pending loop correction は `pairs=0` から始まり、`after reference tracking` / `after local map` で 6 回失敗して expire
+- その後は late tail で `Lost -> Relocalization successful!` が繰り返され、local-map overwrite、relocalization、BA callback recompute の複合で姿勢が揺れる
+- つまり 600-frame の現状課題は、「loop が通らない」ことではなく、**loop correction 後の long-tail tracking quality をどう安定化するか** に移っている
+
+#### 1.2.2 2026-04-09 追記: `TrackLocalMap()` thin-support overwrite guard 実験の詳細
+
+この turn では、late-run の主犯候補として `TrackLocalMap()` の local-map PnP が、すでに十分な support を持つ prior pose を弱い support で上書きしている点を疑い、**3段階の guard 実験**を行った。結論から言うと、**short run では効くが long run 全体では安定改善にならない**ため不採用である。
+
+**実験の発想:**
+
+- `trackReferenceKeyframe()` や pending loop correction で一度まともな pose が得られた後でも、同フレーム後段の `trackLocalMap()` が support の薄い PnP を受理して pose を飛ばすことがある
+- とくに late run では、`support=119` や `support=110` 程度の local-map PnP が `0.08m` 級 update を出し、その次フレームで `TrackReferenceKeyframe: 3D-2D correspondences: 0` へ崩れるケースが見えた
+- そのため、`prior pose` に対する update 量を `support` / `prior_support` / `used_global_fallback` に応じて制限する案を試した
+
+**Variant A: 基本 guard**
+
+- `prior pose` と `new_pose` の差分（translation / rotation）を診断ログ出力
+- `prior_support >= 120` か `used_global_fallback` のときだけ、low-support な local-map update に stricter threshold をかける
+- 400-frame rerun は **0.07351221**
+- この run では `support=184 / prior_support=409` の危険 update を reject し、そのまま `Lost -> Relocalization successful!` へ落としても最終 ATE は悪化しなかった
+- ただし 600-frame rerun は **0.19205861**。late tail では別の箇所の relocalization 連鎖へ failure が移っただけで、baseline 超えには届かなかった
+
+**Variant B: fallback を常時 anchored とみなす版**
+
+- `used_global_fallback` の update は、`prior_support` が 120 未満でも guard 対象とするよう変更
+- 目的は `support=32 / prior_support=96 / fallback=1` のような late-tail false jump を止めること
+- 実際に fallback 由来の大ジャンプは止められたが、600-frame rerun は **0.18324189**
+- baseline `0.17683183` よりは近づいたものの、まだ**改善とは言えない**
+- さらに late tail では `support=83 / prior_support=164` や `support=78 / prior_support=162` の non-fallback update が別途 reject され、そのたびに relocalization へ落ちる構図が残った
+
+**Variant C: `support < 120` を 6cm / 0.06rad まで締めた版**
+
+- `support=119` / `110` あたりの borderline local-map update を止めるため、non-fallback でも `support < 120` なら `max_update_trans=0.06`, `max_update_rot=0.06`
+- 実際に `support=116` の `trans=0.0877587`, `rot=0.0668969` や `support=53` の `trans=0.118261`, `rot=0.0627472` は reject できた
+- しかし 600-frame rerun は **0.19566213**
+- これは guard が**効かなかった**のではなく、guard が効いた結果として早めに relocalization へ落ち、別の誤差経路で total ATE がむしろ悪化した形
+
+**この実験から得た知見:**
+
+1. `TrackLocalMap()` が weak-support pose で prior pose を壊す事象は実在する。ログで捕まえられた
+2. ただしその局所的な overwrite を止めても、600-frame 全体では relocalization 連鎖や別経路の drift が残る
+3. つまり主問題は `TrackLocalMap()` 1箇所の gate だけではなく、**post-loop / post-relocalization の数フレーム全体の handoff 設計**
+4. このため thin-support overwrite guard 自体は、観測のための診断としては有益だが、現時点では keep しない
+
+#### 1.2.3 2026-04-09 追記: 現時点の読み筋
+
+今回の長めの rerun で、次に触るべきポイントはかなり絞れた。
+
+- **候補 1: first-loop / second-loop 後の直近フレームで `TrackReferenceKeyframe()` が 0〜1 correspondence に落ちる件**
+  - 例: 600-frame retained baseline の first-loop 直後では `Frame 258` で `TrackReferenceKeyframe: 3D-2D correspondences: 0`
+  - 例: late-run でも `Frame 500` 直後に `TrackReferenceKeyframe: Propagated landmarks: 1`
+  - ここは `TrackLocalMap()` overwrite より上流で、reference propagation / current_frame landmark handoff の質を見直すべき可能性が高い
+  - **2026-04-09 実施:** first-loop 後の collapse を `room_depth` 400-frame rerun で再確認すると、loop correction handoff 成功フレームの次フレームで `Matches with last frame: 1191` に対し `Propagated landmarks: 12` / `3D-2D correspondences: 12` まで落ちていた。原因は `applyPendingLoopCorrection()` 成功時に `velocity_ = SE3()` へ戻しても、同フレーム末尾の `track()` 成功パスが **`velocity_ = current_frame_->getPose() * last_frame_->getPose().inverse()` で上書き**しており、loop-corrected current pose と pre-correction last pose の組で壊れた velocity を次フレームへ持ち越していた点
+  - **fix:** `skip_velocity_update_once_` を追加し、pending loop correction を採用したフレームでは end-of-frame の通常 velocity 更新を 1 回だけスキップして identity を次フレームへ持ち越す
+  - **結果:** 同じ 400-frame rerun で `Tracking: Preserving identity velocity after loop-correction handoff` を確認。loop correction 直後の次フレームは `Propagated landmarks: 540` / `3D-2D correspondences: 540`、さらに次フレームは `708` まで回復し、旧 run の `12` collapse は再現しなかった。一方、この 1-run の fresh `trajectory.txt` ATE は **0.20676216** で、post-loop propagation collapse の局所症状は潰せたが short-run 全体の数値改善はまだ未確定
+
+- **候補 2: 通常 BA callback (`onBACompleted()`) 側の `recomputeCurrentPose()` はまだ absolute fallback を持っている件**
+  - pending loop correction path は strict accept (`err_after < err_before`) だが、通常 BA callback は `err_after < 20.0` fallback により、reprojection が悪化しても pose を採用しうる
+  - late-run ログでは `before=1.8447 after=2.15016` や `before=1.90384 after=1.9079` のようなケースでも pose update が通っている
+  - これが long-tail の小さな不安定性を積み上げている可能性があり、次の有力候補
+  - **2026-04-09 実施:** `recomputeCurrentPose()` の absolute fallback を削除し、BA callback も pending loop correction と同じ **strict accept (`err_after < err_before`)** に統一。`Tracking::shouldAcceptRecomputedPose()` を追加して unit test 化し、`BUILD=build_bench bash scripts/verify_comparison_benchmark.sh room_mono` では `before=2.24825 after=6.35709` の BA pose update が `"New pose rejected (no reprojection improvement)"` として落ちることを確認した
+
+- **候補 3: second-loop 後の pending correction expire 後に何を reset すべきか**
+  - 現状は expire 時に `velocity_` を reset するだけ
+  - ただし second-loop 後の run では、それだけでは subsequent frame の reference tracking collapse を防げていない
+  - `reference_keyframe_` 選び直し、`previous_reference_keyframe_` の扱い、または `current_frame_->landmarks_` の clean handoff まで見る価値がある
+  - **2026-04-09 実施:** expire path 用に `force_keyframe_insertion_once_` / `force_reference_refresh_once_` を追加し、pending loop correction が最大 deferral に達したら **次フレームで keyframe insertion を強制し、その KF を reference に昇格、さらに `previous_reference_keyframe_` を捨てる** 形へ変更。狙いは、expire 後も stale reference を引きずらず現在位置の局所 map へ張り直すこと
+  - **検証メモ:** 変更前の 600-frame rerun では `Frame 292` で `Pending loop correction expired after failed recomputes` が出ていたが、変更後 rerun では同じ 600-frame でも今回その expire 自体が再現せず、forced refresh marker は未発火。fresh `trajectory.txt` ATE は **0.22985886**。つまりコード上の fallback reset は入ったが、この path の効果はまだ run-to-run variability に埋もれており、引き続き second-loop / late-tail の複数 rerun が必要
+
+### 1.3 stella_vslam との実測比較結果（2026-04-08 実施）
+
+**条件:** TUM freiburg1（全フレーム）、`evo_ape tum ... --align --correct_scale --t_max_diff 0.05`
+
+| Scenario | SimpleVisualSLAM (ループなし) | stella_vslam | 差 |
+|----------|---------------------------|-------------|-----|
+| **xyz_depth** | 0.011 m | **0.008 m** | 1.4x |
+| **xyz_mono** | 0.025 m | **0.011 m** | 2.3x |
+| **room_depth** | 0.161 m | **0.033 m** | **4.9x** |
+| **room_mono** | 0.817 m | **0.026 m** | **31x** |
+
+**注意:**
+- stella_vslam はループクロージング有効（FBoW + g2o ポーズグラフ最適化）
+- SimpleVisualSLAM はループクロージングを有効にすると room 系で ATE が**悪化**する（0.161→0.196〜0.341）
+- stella_vslam の room_mono は 549/1362 フレームしか追跡成功（195→994 が LOST）。ATE は追跡成功区間のみ
+- stella_vslam のビルド一式は `` 以下に残っている（g2o, stella_vslam, stella_vslam_examples, stella_eval）
+- ORB 語彙: `data/ORBvoc.txt`（139MB、gitignore 対象）をダウンロード済み
+
+### 1.4 コア改善の実測結果（2026-04-08 コミット `d3c81a7`）
+
+**repro-eval（ループなし、決定論的）での比較:**
+
+| Scenario | Before (`fcbde0a`) | After (`d3c81a7`) | 変化 |
+|----------|-------------------|-------------------|------|
+| xyz_depth | 0.0117 | **0.0105** | **-10%** |
+| room_depth | 0.2748 | **0.2296** | **-16%** |
+
+**実施した変更（`d3c81a7` でコミット済み）:**
+
+1. `trackLocalMap()`: projection matching に **Lowe ratio test (0.7)** 追加 + search radius 120→100px
+2. Local BA: iterations **5→10**（収束改善）、covisible KF **10→15**（BA 窓拡大）
+3. `correctLoop()`: `loop_correcting_` フラグを `poseGraphOptimization()` の**前**に設定（旧: 後）、sleep 10→50ms
+
+**ループあり実行では改善しなかった（むしろ悪化）**。ループ補正の安定化が未完了のため。
+
+### 1.5 ループクロージングの根本問題（詳細分析結果）
+
+2026-04-08 セッションで tracking.cc / optimizer.cc / loop_closing.cc の徹底分析を実施。以下が特定された**重要度順の問題リスト**:
+
+| # | 問題 | 深刻度 | 状態 |
+|---|------|--------|------|
+| 1 | `poseGraphOptimization()` が全 `kf->T_cw_` を書き換えた後に `loop_correcting_` を設定していた → tracking がレース中に半更新のポーズを読む | Critical | **`d3c81a7` で修正済み**（フラグを先に設定） |
+| 2 | `current_frame_` のポーズがループ補正後に更新されない → 次フレームの motion model が暴走 | Critical | **未コミット変更で修正済み**。`onLoopCorrected()` 追加 + `run_mono.cc` で callback 接続済み |
+| 3 | Local mapping がループ補正中も BA を実行 → 同時書き込みレース | High | **未コミット変更で `loop_correcting_` チェック追加済み** |
+| 4 | Covisibility edges がドリフト済みポーズから計算される（元の測定値を保存していない） | High | **未着手。** 根本的なデータ構造変更が必要 |
+| 5 | `fuseLoopLandmarks()` で `kf->landmarks_[]` への書き込みが `kf->mutex_` なし | High | **未コミット変更で修正済み**。KF mutex 下で slot を snapshot / 更新 |
+| 6 | 50ms sleep は tracking サイクル（33ms@30fps）に対して不十分な場合がある | Medium | `d3c81a7` で 10→50ms に延長したが根本解決ではない |
+| 7 | `mergeLandmarks()` が candidate landmark の位置を保持（optimizer が移動させた current を破棄） | Medium | **未コミット変更で修正済み**。current 側 landmark を生存側に変更 |
+| 8 | `loop_constraints_` が無制限に蓄積 | Low | **未着手** |
+
+### 1.6 コミット履歴（2026-04-12 時点）
 
 | コミット | 内容 |
 |---------|------|
-| `52d3547` | Product release scaffolding: `--version`, `CHANGELOG.md`, `RELEASING.md`, semver ヘッダ |
-| `4288203` | xyz depth 回帰ゲート追加（freiburg1_xyz RGB-D） |
-| `78b3b47` | room depth+accel 回帰ゲート + `CONTRIBUTING.md` |
-| `9db75b4` | BSD-2-Clause LICENSE + room depth 回帰ゲート |
-| `6b32b5c` | 回帰ゲート拡張: xyz sequence + `--all-gates` |
-| `31fbd1a` | Ceres スレッド数 `SVSLAM_CERES_NUM_THREADS` 環境変数 |
-| `785a923` | 回帰ゲート: repro SHA + ATE 上限 |
-| `edd8805` | repro-eval bitwise determinism 復元: BA 入力順序 + covisibility tie-break |
-| `45def39` | 2フレーム初期化改善: KNN ratio test + parallax gate |
-| `fb46f82` | GitHub Actions CI、OpenCV RNG 固定、BA 入力順安定化 |
-| `4890411` | plan.md repeat-5 評価結果 + phase shift |
-| `3b11008` | room corpus 拡張 + README 整理 |
+| `6429d9b` | **Refactor SLAM core, stabilize loop closing, and enrich test suite**: `tracking.cc` helper 抽出、`RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への状態集約、`loop_closing` internal helper 化、`optimizer` cleanup、テスト **48/48**、回帰ゲート **5/5** |
+| `d3c81a7` | **Improve tracking accuracy**: ratio test, BA iterations 5→10, covisible KF 10→15, loop correction ordering |
+| `fcbde0a` | Add calibration override, run statistics, CLI help, eval tooling, citation, plan update |
+| `52d3547` | Product release scaffolding: `--version`, `CHANGELOG.md`, `RELEASING.md` |
+| `4288203` | xyz depth regression gate |
+| `78b3b47` | room depth+accel regression gate + CONTRIBUTING.md |
+| ... | （以前のコミットは `git log` 参照） |
 
-### 1.4 未コミット変更の機能別グループ（コミット分割案）
+### 1.7 過去セッション履歴
 
-次の Claude がコミットする場合の推奨分割:
-
-1. **キャリブ外部化:** `tum_pinhole_calibration.{h,cc}` + `tum_dataset.{h,cc}` 変更 + `config/examples/` + `test_tum_pinhole_calibration.cc` + CMakeLists.txt 該当行
-2. **運用フック:** `TrackingRunStatistics` + `tracking.{h,cc}` 変更 + `run_mono.cc`（`--run-summary-json`, `--strict-exit`）+ `test_tracking_run_statistics.cc` + CMakeLists.txt 該当行
-3. **CLI ヘルプ:** `run_mono.cc`（`--help`/`-h`, `print_help()`）
-4. **評価スクリプト共通化:** `eval_lib.py` + `check_regression_gate.py` リファクタ + `build_leaderboard.py` + `print_ate_mean.py` + `verify_comparison_benchmark.sh`
-5. **比較プロトコル:** `eval/comparison_protocol.md` + `eval/leaderboard_suite.json`
-6. **学術引用:** `CITATION.cff` + README Citing + RELEASING.md 更新
-7. **CI 拡張 + ドキュメント:** `ci.yml` + `CHANGELOG.md` + `CONTRIBUTING.md` + README 追記
-
-**あるいは**、全部まとめて1コミットでも可（maintainer 判断）。
-
-### 1.5 過去メモ（2026-04-06 Claude Code session 当時）
-
-当時 `master` は `3b11008` 付近まで到達。実施内容の要約:
-
-1. `room_focus_corpus.tsv` 拡張、`real_trace_corpus.tsv` 拡張
-2. `slam_result.jpg` 削除、`update_reference_policy_docs.py` 調整
-3. repeat 評価、CMake キャッシュ修復
-
-以降も master は継続更新。**詳細コミットは `git log` を見よ。**
+- **2026-04-06 Claude Code:** corpus 拡張、repeat 評価、CMake キャッシュ修復
+- **2026-04-08 Claude Code (前半):** plan.md 大更新、キャリブ外部化、評価スクリプト共通化、学術引用
+- **2026-04-08 Claude Code (後半):** stella_vslam 比較実測、コア改善、ループ補正安定化（途中）
 
 ---
 
@@ -118,7 +212,7 @@ SimpleVisualSLAMは6k行のC++17で、特徴点ベースSLAM + 深度センサ�
 ### 2.1 ファイル構成（全ファイル、行数、役割）
 
 ```
-simple_visual_slam/           # 6393行（テスト含む）
+simple_visual_slam/           # 8767行（テスト含む）
 │
 ├── CMakeLists.txt            # FetchContent: Sophus, Ceres 2.1, DBoW2, ONNX Runtime 1.17, Google Test 1.14
 │                             # オプション: USE_DBOW2(ON), USE_DEPTH_DL(OFF), BUILD_TESTS(ON)
@@ -131,7 +225,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 ├── .gitignore                # *.bin, *.jpg, *.onnx, models/, eval_results/, trajectory*.txt, *.html
 │
 ├── apps/
-│   └── run_mono.cc           # [597行] エントリポイント
+│   └── run_mono.cc           # [607行] エントリポイント
 │       # CLI: --tum [--tum-camera-config <calib.json>] [--depth] [--accel] [--repro-eval]
 │       #       [--reference-policy heuristic|score|pipeline] [--skip-frames N] [--max-frames N]
 │       #       [--depth-model <model.onnx>] [--run-summary-json <path>] [--strict-exit]
@@ -149,7 +243,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   ├── common.h              # [30行] Vec2/Vec3/Mat33/SE3/Sim3 型エイリアス
 │   │                         # Eigen, Sophus include。全ファイルがこれをinclude。
 │   │
-│   ├── camera.h / .cc        # [50行] ピンホールカメラ: fx_, fy_, cx_, cy_
+│   ├── camera.h / .cc        # [78行] ピンホールカメラ: fx_, fy_, cx_, cy_
 │   │                         # project(Vec3→Vec2), unproject(Vec2→Vec3), K()→cv::Mat
 │   │
 │   ├── frame.h / .cc         # [108行] フレーム
@@ -161,7 +255,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   │   # getDepth(u,v): bilinear風、CV_16UC1は/5000.0(TUM), CV_32FC1はそのまま
 │   │   # backprojectWithDepth(kp, depth): unproject * depth → T_wc変換で世界座標
 │   │
-│   ├── keyframe.h / .cc      # [157行] Keyframe extends Frame相当
+│   ├── keyframe.h / .cc      # [168行] Keyframe extends Frame相当
 │   │   # T_cw_ (SE3), depth_image_, depth_is_metric_
 │   │   # gravity_in_camera_ (Vec3), has_gravity_ (bool) — 加速度計から推定した重力方向
 │   │   # landmarks_ (vector<Landmark::Ptr>)
@@ -170,7 +264,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   │   # getBestCovisibilityKeyframes(N): weight降順でN個返す
 │   │   # getDepth(u,v): Frame::getDepthと同じ
 │   │
-│   ├── landmark.h / .cc      # [40行] 3Dランドマーク
+│   ├── landmark.h / .cc      # [67行] 3Dランドマーク
 │   │   # id_, pos_w_ (Vec3)
 │   │   # observations_ (map<weak_ptr<KF>, size_t>) — KF→特徴点index
 │   │   # descriptor_ (cv::Mat)
@@ -178,7 +272,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   │   # mutable mutex_ — setPos, getPos, addObservation, removeObservation で使用
 │   │   # ★getPos()もmutexロック済み（Worker C-1で修正）
 │   │
-│   └── map.h / .cc           # [60行] マップ
+│   └── map.h / .cc           # [75行] マップ
 │       # keyframes_ (map<id, KF::Ptr>), landmarks_ (map<id, LM::Ptr>)
 │       # mutex_ — 汎用mutex（現在は一部のみ使用）
 │       # loop_correcting_ (atomic<bool>) — ループ補正中フラグ
@@ -186,10 +280,11 @@ simple_visual_slam/           # 6393行（テスト含む）
 │       # getAllKeyframes/getAllLandmarks — const参照を返す（コピーではない！）
 │
 ├── src/tracking/
-│   ├── tracking.h / .cc      # [1833行] ★最大のファイル。トラッキング全体を管理。
+│   ├── tracking.h / .cc      # [2148行] ★最大のファイル。トラッキング全体を管理。
 │   │   #
 │   │   # === 状態遷移 ===
 │   │   # NO_IMAGES_YET → NOT_INITIALIZED → OK ↔ LOST
+│   │   # helper 抽出と `RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への状態整理を実施済み
 │   │   #
 │   │   # === 主要メソッド ===
 │   │   # addFrame(frame): state分岐 → initialize() or track()
@@ -244,12 +339,12 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   │   # - loop_correcting_中のtrackLocalMapスキップで1-5フレーム精度劣化
 │   │   # - reinitialize()で新マップセグメントと旧マップの接続がない
 │   │
-│   └── initializer.h / .cc   # [378行] 2フレーム初期化
+│   └── initializer.h / .cc   # [486行] 2フレーム初期化
 │       # H/F推定(RANSAC) → モデル選択(スコア比) → R|t復元 → 三角測量
 │       # 三角測量: cv::triangulatePoints → 正depth/reproj error/max distance フィルタ
 │
 ├── src/backend/
-│   ├── local_mapping.h / .cc  # [481行] 局所マッピング（別スレッド）
+│   ├── local_mapping.h / .cc  # [502行] 局所マッピング（別スレッド）
 │   │   # insertKeyframe → processNewKeyframe → createNewMapPoints → mapPointCulling → optimization
 │   │   # processNewKeyframe: KFをmap追加、covisibility更新、LoopClosingへ転送
 │   │   # createNewMapPoints: covisible KFペアで三角測量
@@ -258,7 +353,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   │   # optimization: bundleAdjustment呼び出し → on_ba_completed_コールバック
 │   │   # on_ba_completed_: Tracking::onBACompleted()を呼ぶ（ポーズ再計算）
 │   │
-│   └── optimizer.h / .cc     # [721行] Ceres最適化
+│   └── optimizer.h / .cc     # [889行] Ceres最適化
 │       #
 │       # === コスト関数 ===
 │       # ReprojectionError: 2残差 [px] — (predicted_uv - observed_uv)
@@ -290,20 +385,24 @@ simple_visual_slam/           # 6393行（テスト含む）
 │       # 現在はcorrectLoop()内で呼ばれない（コメントアウト）
 │
 ├── src/loop_closing/
-│   └── loop_closing.h / .cc  # [543行] ループ検出・補正（別スレッド）
+│   └── loop_closing.h / .cc  # [1004行] ループ検出・補正（別スレッド）
 │       #
 │       # === パイプライン ===
 │       # insertKeyframe → processNewKeyframe:
 │       #   1. detectLoop(): DBoW2で候補検索 (min_score=0.01, interval≥30KF)
+│       #      - BoW候補は descriptor match 数でも再選別（ratio 0.8）
+│       #      - 弱い候補しかなければ descriptor fallback scan に降格
 │       #   2. computeSim3(): 3D-3D対応 → Sim3 RANSAC (200iter)
 │       #      - metric depth: scale 0.85-1.15 に制限
 │       #      - mono: scale 0.7-1.4
+│       #      - failure reason をログ出力（insufficient_ransac_inliers 等）
 │       #   3. correctLoop():
 │       #      - poseGraphOptimization(60iter)
 │       #      - map_->loop_correcting_ = true + sleep 20ms
 │       #      - fuseLoopLandmarks()
 │       #      - updateConnections() 全KF
 │       #      - map_->loop_correcting_ = false
+│       #      - on_loop_corrected_() で tracking に再計算通知
 │       #
 │       # === mergeLandmarks() ===
 │       # deadlock-free double lock (ID順) — target + source 両方のmutexをロック
@@ -317,8 +416,8 @@ simple_visual_slam/           # 6393行（テスト含む）
 │       #
 │       # === 既知の問題 ===
 │       # - loop検出は非決定的（DBoW2スコアのバラつき）
-│       # - fuseLoopLandmarks中のkf->landmarks_[]書き換えはkf->mutex_でロックするが、
-│       #   同時にtrackingが同じkfのlandmarks_を読む可能性（loop_correcting_で緩和）
+│       # - computeSim3()/fuseLoopLandmarks() の KF landmark access は mutex 化済みだが、
+│       #   covisibility edge 自体はドリフト後ポーズ由来で、根本修正は未着手
 │       # - cooldown: loop_cooldown_kf_ = 120（前回ループ成功から120KF以内は再検出しない）
 │
 ├── src/io/
@@ -329,7 +428,7 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   │   # 読み込み例: config/examples/tum_pinhole_fr1.json
 │   │   # distortion が空なら undistort / remap をスキップ
 │   │
-│   ├── tum_dataset.h / .cc   # [316行] TUM RGB-D データセット読み込み
+│   ├── tum_dataset.h / .cc   # [329行] TUM RGB-D データセット読み込み
 │   │   # AccelEntry: timestamp_sec, ax, ay, az
 │   │   # DepthEntry: timestamp_sec, depth_path
 │   │   # rgb.txt / depth.txt / accelerometer.txt パーサー
@@ -340,17 +439,17 @@ simple_visual_slam/           # 6393行（テスト含む）
 │   │   # K(): TumPinholeCalibration から構築（旧: freiburg1 ハードコード）
 │   │   # allAccel(): 全accelerometerデータを返す
 │   │
-│   ├── euroc_dataset.h / .cc # [189行] EuRoC MAV: cam0/data/ + data.csv
+│   ├── euroc_dataset.h / .cc # [227行] EuRoC MAV: cam0/data/ + data.csv
 │   │   # K(): EuRoC固定値
 │   │
-│   └── map_io.h / .cc        # [269行] バイナリマップ保存/読み込み
+│   └── map_io.h / .cc        # [287行] バイナリマップ保存/読み込み
 │       # ヘッダ "SVSLAM" + camera params + KFs + LMs + covisibility edges
 │       # バージョニングなし（既知の制限）
 │
 ├── src/depth/
-│   ├── depth_estimator.h      # [15行] 抽象基底: virtual estimate(cv::Mat) → cv::Mat
+│   ├── depth_estimator.h      # [19行] 抽象基底: virtual estimate(cv::Mat) → cv::Mat
 │   │                          # virtual isMetric() → false
-│   ├── onnx_depth_estimator.h # [30行] #ifdef USE_DEPTH_DL でガード
+│   ├── onnx_depth_estimator.h # [38行] #ifdef USE_DEPTH_DL でガード
 │   └── onnx_depth_estimator.cc # [181行] Depth Anything v2 推論
 │       # preprocess: BGR→RGB, resize 518x518, float/255, ImageNet正規化, HWC→CHW
 │       # postprocess: disparity→depth(1/d), median-based scaling(1.5m), clamp[0.1,20]
@@ -400,11 +499,19 @@ simple_visual_slam/           # 6393行（テスト含む）
 │
 ├── tests/
 │   ├── test_camera.cc         # [59行] project→unproject roundtrip, principal point, K matrix
+│   ├── test_frame.cc          # [90行] pose/depth/ORB accessor, backprojection
+│   ├── test_initializer.cc    # [29行] 2-frame initializer smoke / triangulation gate
+│   ├── test_keyframe.cc       # [74行] covisibility, depth access, best-KF selection
 │   ├── test_landmark.cc       # [80行] addObservation, setPos/getPos, thread safety, isBad
+│   ├── test_loop_closing.cc   # [74行] loop candidate selection, metric-depth / cooldown helpers
 │   ├── test_map.cc            # [96行] add/remove KF/LM, count, concurrent add
-│   ├── test_optimizer.cc      # [90行] 2KF+5LM BA: noise→BA→誤差減少確認
+│   ├── test_optimizer.cc      # [149行] BA / pose-graph helper coverage
+│   ├── test_reference_keyframe_policy.cc  # [88行] policy seam contract / heuristic baseline
+│   ├── test_tracking.cc       # [84行] tracking helper / recovery gate coverage
+│   ├── test_tracking_pose_recompute.cc    # [39行] reprojection-improvement accept/reject
+│   ├── test_tracking_run_statistics.cc   # [14行] TrackingRunStatistics 既定ゼロ確認
 │   ├── test_tum_pinhole_calibration.cc  # [52行] JSON 読み込み・バリデーション（fr1 defaults, load, missing keys）
-│   └── test_tracking_run_statistics.cc   # [14行] TrackingRunStatistics 既定ゼロ確認
+│   └── test_synthetic_scene.h  # [79行] synthetic scene fixture / test helper
 │
 ├── data/
 │   ├── ORBvoc.txt             # DBoW2語彙（gitignore、手動配置）
@@ -459,6 +566,10 @@ LoopClosing Thread (loop_closing->run())
 | tracking.cc | lowe_ratio | 0.75 | ORBマッチのLowe ratio |
 | tracking.cc | max_lost_frames_ | 30 | LOST最大許容フレーム |
 | tracking.cc | reinit_trigger_ | 20 | 再初期化開始LOSTフレーム |
+| tracking.cc | recovery_stabilization_window_frames_ | 3 | relocalization / loop handoff 後に厳しめの pose update guard を維持するフレーム数 |
+| tracking.cc | min_stable_support_ | 120 | local-map pose update を「stable support」とみなす最小対応数 |
+| tracking.cc | recovery_max_change_strict_ | 0.12 | thin-support / support regression 時の pose update 最大変化量 |
+| tracking.cc | recovery_max_change_relaxed_ | 0.18 | support が十分な recovery window 中の pose update 最大変化量 |
 | tracking.cc | 2nd_pnp_reproj | 5.0px | 2パスPnPの除外閾値 |
 | tracking.cc | gravity_window | 0.05s | KF gravity推定のaccel窓 |
 | tracking.cc | stationary_threshold | 5.0 | isStationary閾値 |
@@ -687,29 +798,57 @@ bash scripts/eval_reference_policies.sh --repeat 5 \
 
 ## 4. 既知の問題と技術的負債
 
-### 4.1 [最重要→結論に近い] universal default は決まらなかった（意図的）
+### 4.1 [最重要] ループクロージングの安定化（2026-04-08 分析済み、部分修正中）
 
-repeat-5 room focus + repeat-2 real trace の結果、**3ポリシーは実質同等**と判明。
+ループクロージングを有効にすると room 系で ATE が **悪化** する（0.161→0.196〜0.341）。stella_vslam（g2o ベース、ループあり）は room_depth 0.033m を達成しており、**ループ補正の安定化が精度差の最大要因**。
 
-- 差が最も大きい `room_mono_head` でも mean 差は 0.04m（0.316 vs 0.358）
-- overall では 0.01m 以下の差で、std の範囲内
-- corpus を厚くするほど差が消えるのは、policy 差より SLAM コアの non-determinism が支配的であることの証拠
+**修正済み（`d3c81a7`）:**
+- `correctLoop()` で `loop_correcting_` フラグを `poseGraphOptimization()` の前に設定
+- sleep 10→50ms に延長
 
-**結論:** policy 間比較はこれ以上深追いしない。`heuristic` を default として確定し、今後の改善は SLAM コア品質（tracking 精度、loop closing 安定性、mono 初期化）に向ける。
+**未コミット（作業ツリーにある）:**
+- `onLoopCorrected()`: loop thread では pending flag を立てるだけに変更。tracking thread 側で `after reference tracking` / `after local map` の safe point に `recomputeCurrentPose()` を実行し、成功時に velocity をリセット
+- `processPendingWork()`: `loop_correcting_` 中は BA スキップ
+- `run_mono.cc`: `on_loop_corrected_` callback 接続済み。BA / loop callback は `weak_ptr<Tracking>` capture で循環参照を回避
+- `poseGraphOptimization()`: metric-depth 時は全 KF の log-scale へ prior を追加し、covisibility edge の scale residual も強化。さらに `T_cw_` と `connected_keyframes_` を mutex 下で snapshot してから solver に渡す。`PoseGraph: scale_stats` で min/max/mean を診断
+- `detectLoop()`: BoW 候補を descriptor match 数と usable 3D correspondence 数（`corr3d`）で再選別。弱い候補は descriptor fallback に降格
+- `matchLoopCandidate()`: loop closing 専用 descriptor match は Lowe ratio 0.8
+- `fuseLoopLandmarks()`: KF landmark slot を mutex 下で snapshot / 更新
+- `mergeLandmarks()`: current 側 landmark を生存側に変更
+- `computeSim3()` / `correctLoop()`: failure reason をログ出力。`residual=0.35` 診断時の `relaxed_inliers` も出す。metric-depth では rigid (`scale=1`) 仮説生成 + `15 seed / 22 final / ratio guard` に変更し、loop constraint の translation/rotation weight は `inliers + inlier_ratio` ベースの confidence weight にした。pose-graph snapshot 化まで含む fresh `trajectory.txt` rerun では **0.13723747** / **0.07901260**
+- `Tracking::track()` / `onLoopCorrected()`: loop callback を tracking thread の safe point に移し、初回 PnP が薄い frame に当たっても pending を保持して `trackLocalMap()` 後に同フレーム再試行するようにした。さらに pending loop correction は **`pairs >= 80`** のときだけ適用し、thin-support handoff は defer するように変更。`relocalize()` 成功直後も safe point に加えたが、それだけでは **0.18307474 / 0.22821251** と不安定だったため、pending recompute では **`err_after < err_before`** のときだけ採用する strict accept に変更。これにより early handoff を数フレーム reject して support が揃った所でだけ loop correction を吸収でき、fresh `trajectory.txt` rerun は 400-frame で **0.07522716** / **0.08267831**。strict 化前の retained `pairs>=80` 版は **0.08262759** / **0.18692874**、600-frame では second-loop + stale-edge reuse が入った run でも **0.14493733** まで改善（旧 `pairs=54` 即適用 run は **0.45154200**）。別 600-frame rerun は単発 loop で **0.10084369**
+- `correctLoop()`: metric-depth で複数 loop constraint を pose graph に再利用する場合、古い edge を current map との translation/scale 整合で減衰する safety valve を追加。400-frame rerun は **0.15208171** / **0.07948407** で単発 loop のみだったが、600-frame rerun では `280->121` の second-loop 時に `Reweighting stale loop edge from_kf=151 to_kf=22 ... decay=0.35` を確認。`pairs<80` defer と組み合わせた 600-frame rerun は **0.14493733**、別 rerun は単発 loop で **0.10084369**
+- `TrackLocalMap()` の thin-support overwrite guard も試した。`prior pose` に対する update 量を support / fallback ベースで絞る案は 400-frame では **0.07351221** まで改善し、`support=184` の危険な local-map 上書きも reject できたが、600-frame rerun は **0.19205861**, **0.18324189**, **0.19566213** で retained baseline を超えなかった。`support=119/110` や fallback `32` の update を止めても、別の箇所で relocalization 連鎖が出るだけで安定改善には繋がらなかったため**不採用**
+- loop correction pending 中の frame で relocalization を 1 回遅らせる experiment も試したが、400-frame rerun は **0.16231753** で明確な改善証拠が取れず、bad run を確実に潰せる状態でもなかったため**不採用**。同様に `relocalize()` 成功直後に pending recompute を即適用するだけの variant も **0.18307474 / 0.22821251** で不採用。retained state は `pairs>=80` gate + pending strict accept まで
 
-`score` / `pipeline` は historical experiment として `src/experiments/` に残すが、active development の対象ではない。
+**未着手（次の改善候補）:**
+- rigid metric-depth loop が入った後でも ATE が no-loop ベストを安定して超えない理由の解明。候補再選別と rigid 仮説生成で correction 自体は通るようになったので、次は **loop constraint の質 / pose graph 反映量** を詰める必要あり
+- metric-depth の loop edge は **confidence weighting + final_min_inliers=22 + pose-graph snapshot + tracking-thread safe-point handoff** まで入れて、fresh `trajectory.txt` rerun が **0.12315088** / **0.12105041** に安定した。一方で best run は snapshot-only 時代の **0.07901260** なので、次にやるなら aging, schedule/timing, covisibility との相対バランスまで含めて設計する
+- `151->22` を通すための borderline accept + cooldown `140 KF` や、relaxed residual での Sim3 再推定 rescue はどちらも rerun で second-loop に負けた。threshold 緩和方向で押すより、次は **2本目 loop の扱い** と **複数 constraint の設計** を見直す方が筋
+- 古い loop edge の current-map consistency 減衰そのものは 600-frame で踏めるようになった。残る論点は **edge 再利用** より **loop correction handoff の support gate** と **late-run tracking quality** で、`pairs<80` defer は有効だったが、600-frame でも単発 loop run / second-loop run の揺れはまだ残る
+- `loop_constraints_` の prune/update を素朴に入れるだけでも 400-frame rerun が **0.36〜0.37 m** に崩れたため、ここも schedule/timing 影響を含めてかなり慎重に扱う必要あり
+- `sleep_for(50ms)` を coordinator / barrier で置き換える方向は筋が良いが、tracking 全体待ち版も `trackLocalMap()` 限定版も rerun で大崩れした。同期粒度を再設計しないまま入れるのは危険
+- loop-closing queue への handoff を local mapping 完了後へ遅らせる案や、`loop_correcting_` を早めに立てる案も 400-frame rerun で **0.37 m** 級に崩れた。local mapping / loop closing のタイミングはかなり敏感
+- Covisibility edges がドリフト済みポーズから計算される問題は依然あるが、元の相対測定値を保存する構造変更は rerun で **0.18586552 m** まで悪化したため、現時点では design を再考してから再挑戦
+- `loop_constraints_` の無制限蓄積
+- sleep ベースの同期を condition variable / barrier に置き換え
 
-### 4.2 [重要→昇格: 最重要] room / mono 系の残留 non-determinism
+**分析の詳細は Section 1.5 を参照。**
 
-`--repro-eval` で local mapping / loop closing の非決定性はかなり減ったが、mono の replay variance はまだ残る。
+### 4.2 [重要] stella_vslam との精度差（2026-04-08 実測）
 
-残候補:
-1. loop closing を切っても残る tracking 側の離散的分岐
-2. relocalization の candidate 選択
-3. データ窓の狭さによる順位逆転
+Section 1.3 の実測結果を参照。主な差:
+- **xyz:** 1.4〜2.3x 差 → コアの tracking/BA 品質で追える距離
+- **room:** 5〜31x 差 → ループ補正なしのドリフト蓄積が支配的
+- **構造的差異:** stella_vslam は g2o のグラフ最適化（Schur complement + スパース構造利用）、SimpleVisualSLAM は Ceres の密ソルバー。特にポーズグラフ最適化の品質が異なる
 
-corpus は厚くした（repeat-5 完了）。次の一手は **SLAM コアの non-determinism 源を特定・削減すること**。
-候補: ORB マッチングの tie-break、PnP RANSAC の乱数 seed、relocalization 候補選択。
+### 4.3 [結論済み] reference-keyframe policy は収束
+
+3ポリシーは実質同等。`heuristic` が default。`score` / `pipeline` は `src/experiments/` に残すが active development 対象外。
+
+### 4.4 [重要] room / mono 系の残留 non-determinism
+
+`--repro-eval` で bitwise determinism を達成済み。async 実行（ループあり）では非決定性が残る。
 
 #### 2026-04-06 追記: `--repro-eval` の bitwise determinism を達成（進捗）
 
@@ -777,8 +916,8 @@ TUM は `--tum-camera-config <calib.json>` で外部キャリブ可能になっ�
 | Task | Status | 内容 |
 |------|--------|------|
 | A-1 | ✅完了 | ORB決定論化、BA収束強化、2パスPnP |
-| A-2 | 進行中 | `eval_all.sh --repeat N` と README 反映までは完了。追加シーケンス拡充は未完 |
-| A-3 | ✅完了 | Google Test導入 |
+| A-2 | 進行中 | `eval_all.sh --repeat N`、README 反映、回帰ゲート **5/5** までは完了。追加シーケンス拡充は未完 |
+| A-3 | ✅完了 | Google Test suite 拡充（`ctest` **48/48**。`frame` / `keyframe` / `initializer` / `loop_closing` / `tracking` / `tracking_pose_recompute` 追加） |
 | A-4 | ✅完了 | 英語 README と public-facing 結果表 |
 
 ### Phase F: Experiment-to-Convergence Workflow [収束完了]
@@ -1160,5 +1299,10 @@ python3 scripts/print_ate_mean.py /path/to/groundtruth.txt /path/to/trajectory.t
 
 ## 14. 変更履歴メモ（plan.md 自身）
 
+- **2026-04-12:** Section 1.1 を現行 HEAD `6429d9b` ベースへ更新。`d3c81a7` 後続コミットとして、`tracking.cc` helper 抽出、`RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への状態集約、`loop_closing` internal helper 化、`optimizer` cleanup、loop stabilization の反映、`ctest` **48/48 pass**、回帰ゲート **5/5 pass**、新規テスト（`test_frame.cc`, `test_keyframe.cc`, `test_initializer.cc`, `test_loop_closing.cc`, `test_tracking.cc`, `test_tracking_pose_recompute.cc`, `test_synthetic_scene.h`）を追記。Section 1.6 のコミット表、Section 2.1 の行数と test 一覧、Section 2.4 の recovery 系定数、Section 5 Phase A の testing 状態も更新。
+- **2026-04-09:** Section 1.1 を 2026-04-09 時点へ更新（未コミット差分量、retained best state、600-frame の未解決課題を反映）。Section 1.2 を拡張し、400-frame / 600-frame の rerun 結果、late-run での second-loop / relocalization 連鎖の現状、`TrackLocalMap()` thin-support overwrite guard 実験 3 variant（400-frame **0.07351221**、600-frame **0.19205861 / 0.18324189 / 0.19566213**、いずれも不採用）を長文で記録。次に触る候補として `TrackReferenceKeyframe()` の post-loop collapse、通常 BA callback 側 `recomputeCurrentPose()` の absolute fallback、pending correction expire 後の handoff 再設計を明記。
+- **2026-04-09:** 候補 2 を着手済みに更新。`src/tracking/tracking.cc` で BA callback の pose recompute から `err_after < 20.0` absolute fallback を除去し、strict reprojection improvement のみ許可する形へ統一。`tests/test_tracking_pose_recompute.cc` を追加し、`build_bench` の `ctest` 26/26 pass、`verify_comparison_benchmark.sh room_mono` で worsened BA update の reject ログを確認。
+- **2026-04-09:** 候補 1 の first-loop collapse を追加調査。`room_depth` 400-frame rerun で、loop correction handoff 成功後に end-of-frame velocity 更新が identity reset を上書きし、次フレーム `TrackReferenceKeyframe` が `12` correspondences まで落ちる再現を確認。`skip_velocity_update_once_` によって loop-corrected frame の velocity 更新を 1 回抑止したところ、同条件 rerun では loop 直後の次フレームが `540` correspondences、次が `708` まで回復し、局所 collapse は消失。fresh `trajectory.txt` ATE は **0.20676216** で、全体改善はまだ評価継続。
+- **2026-04-09:** 候補 3 の expire-time reset も着手。pending loop correction が最大 deferral に達したら、次 frame で keyframe insertion を強制し、その keyframe を reference に昇格、`previous_reference_keyframe_` は clear する fallback を追加。`build_bench` の `ctest` は継続して 26/26 pass。変更後の 600-frame rerun では expire path 自体が今回は再現せず、forced refresh marker は未発火だったため、fresh `trajectory.txt` ATE **0.22985886** と合わせて「コードは入ったが効果は未確定」と記録。
 - **2026-04-08:** Section 1 を大幅拡充（1.1 → 2026-04-08 時点に更新、1.2 未コミット変更の完全リスト追加、1.3 コミット済み成果テーブル化、1.4 コミット分割案新設、1.5 旧過去メモ）。Section 2.1 に `tum_pinhole_calibration`・詳細コメント追加、`run_mono.cc` 行数と全 CLI フラグ更新、テスト行数更新、`eval/` と `scripts/` に詳細注釈追加。Section 11 git 履歴を `52d3547` まで拡張。Section 12 に 12.0（着手前チェック）新設、12.1 読む順番改訂、CI パイプライン詳細追加。
 - **2026-04（初版）:** Section 1 再構成（1.1 現状サマリ / 1.2 詳細差分 / 1.3 過去セッション）、Section 2.1 に `eval/`・`scripts/eval_*`・`config/examples`・新テストを反映、Section 12 を **Claude 引き継ぎ特化**で全面改稿（トラック A/B/C、12.7–12.8 追加）。

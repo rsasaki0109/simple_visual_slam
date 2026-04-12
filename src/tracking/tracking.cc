@@ -568,22 +568,31 @@ bool Tracking::track() {
     }
 
     // 2. Track Reference Keyframe (Frame-to-Frame matching for now)
+    bool pending_loop_applied = false;
     bool ref_tracking_ok = trackReferenceKeyframe();
     if (ref_tracking_ok) {
-        applyPendingLoopCorrection("after reference tracking");
+        pending_loop_applied = applyPendingLoopCorrection("after reference tracking");
     }
 
     // 3. Track Local Map
     bool local_map_ok = false;
     if (ref_tracking_ok) {
         local_map_ok = trackLocalMap();
-        if (local_map_ok) {
-            applyPendingLoopCorrection("after local map");
-        }
+        pending_loop_applied =
+            applyPendingLoopCorrection("after local map") || pending_loop_applied;
     }
 
+    const bool recovered_with_pending_loop =
+        ref_tracking_ok && pending_loop_applied && !local_map_ok;
+
     // 4. Handle tracking success/failure
-    if (local_map_ok) {
+    if (local_map_ok || recovered_with_pending_loop) {
+        if (recovered_with_pending_loop) {
+            num_tracked_features_ =
+                static_cast<int>(countValidFrameLandmarks(current_frame_));
+            std::cout << "Tracking: Using reference-tracking pose after pending loop correction"
+                      << " (tracked=" << num_tracked_features_ << ")" << std::endl;
+        }
         state_ = TrackingState::OK;
         recovery_state_.consecutive_tracking_failures = 0;
         recovery_state_.lost_frame_count = 0;
@@ -1479,6 +1488,26 @@ bool Tracking::shouldAcceptLocalMapPoseUpdate(std::size_t support,
            rot_change <= max_recovery_rot_change;
 }
 
+bool Tracking::shouldConsiderRelocalizationCandidate(double distance_to_anchor,
+                                                     bool is_reference_candidate,
+                                                     bool pending_loop_correction,
+                                                     int stabilization_frames_remaining) {
+    if (is_reference_candidate) {
+        return true;
+    }
+    if (!pending_loop_correction && stabilization_frames_remaining <= 0) {
+        return true;
+    }
+    if (!std::isfinite(distance_to_anchor)) {
+        return false;
+    }
+
+    const double max_distance = pending_loop_correction
+        ? loop_relocalization_radius_m_
+        : recovery_relocalization_radius_m_;
+    return distance_to_anchor <= max_distance;
+}
+
 void Tracking::onBACompleted() {
     std::lock_guard<std::mutex> lock(pose_mutex_);
 
@@ -1496,26 +1525,37 @@ void Tracking::onBACompleted() {
     recomputeCurrentPose();
 }
 
-void Tracking::applyPendingLoopCorrection(const char* phase) {
+std::size_t Tracking::countValidFrameLandmarks(const Frame::Ptr& frame) {
+    if (!frame) {
+        return 0;
+    }
+
+    std::size_t correspondences = 0;
+    for (const auto& lm : frame->landmarks_) {
+        if (!lm || lm->isBad()) continue;
+        const Vec3 pos = lm->getPos();
+        if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) {
+            continue;
+        }
+        ++correspondences;
+    }
+    return correspondences;
+}
+
+bool Tracking::applyPendingLoopCorrection(const char* phase) {
     std::lock_guard<std::mutex> lock(pose_mutex_);
 
     if (!loop_correction_state_.pending) {
-        return;
+        return false;
     }
     if (map_ && map_->loop_correcting_.load()) {
-        return;
+        return false;
     }
     if (!current_frame_ || !current_frame_->camera_) {
-        return;
+        return false;
     }
 
-    size_t correspondences = 0;
-    for (const auto& lm : current_frame_->landmarks_) {
-        if (!lm || lm->isBad()) continue;
-        const Vec3 pos = lm->getPos();
-        if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) continue;
-        ++correspondences;
-    }
+    const std::size_t correspondences = countValidFrameLandmarks(current_frame_);
 
     const auto expire_pending_loop_correction = [&](const char* message) {
         loop_correction_state_.pending = false;
@@ -1539,7 +1579,7 @@ void Tracking::applyPendingLoopCorrection(const char* phase) {
             expire_pending_loop_correction(
                 "Tracking: Pending loop correction expired, reset velocity only");
         }
-        return;
+        return false;
     }
 
     std::cout << "Tracking: Applying pending loop correction at " << phase
@@ -1551,7 +1591,7 @@ void Tracking::applyPendingLoopCorrection(const char* phase) {
         loop_correction_state_.skip_velocity_update_once = true;
         recovery_state_.stabilization_frames_remaining =
             recovery_stabilization_window_frames_;
-        return;
+        return true;
     }
 
     ++loop_correction_state_.pending_deferrals;
@@ -1562,6 +1602,7 @@ void Tracking::applyPendingLoopCorrection(const char* phase) {
         expire_pending_loop_correction(
             "Tracking: Pending loop correction expired after failed recomputes; forcing reference refresh");
     }
+    return false;
 }
 
 bool Tracking::recomputeCurrentPose() {
@@ -1667,8 +1708,16 @@ bool Tracking::relocalize() {
         std::vector<cv::DMatch> matches;
         int score;
         int valid_3d_matches;
+        double distance_to_anchor = std::numeric_limits<double>::infinity();
+        bool local_to_anchor = false;
     };
     std::vector<Candidate> candidates;
+
+    const bool prefer_local_candidates =
+        loop_correction_state_.pending || recovery_state_.stabilization_frames_remaining > 0;
+    const Vec3 anchor_position = recovery_state_.last_good_pose.inverse().translation();
+    const bool anchor_valid = anchor_position.allFinite();
+    bool have_local_candidate = false;
 
     cv::BFMatcher matcher(cv::NORM_HAMMING);
 
@@ -1676,6 +1725,19 @@ bool Tracking::relocalize() {
     for (auto& kf_pair : keyframes) {
         auto& kf = kf_pair.second;
         if (!kf || kf->descriptors_.empty()) continue;
+
+        const bool is_reference_candidate =
+            kf == reference_keyframe_ || kf == previous_reference_keyframe_;
+        double distance_to_anchor = std::numeric_limits<double>::infinity();
+        if (prefer_local_candidates && anchor_valid) {
+            const Vec3 candidate_position = kf->T_cw_.inverse().translation();
+            if (candidate_position.allFinite()) {
+                distance_to_anchor = (candidate_position - anchor_position).norm();
+            }
+        }
+        const bool local_to_anchor = shouldConsiderRelocalizationCandidate(
+            distance_to_anchor, is_reference_candidate, loop_correction_state_.pending,
+            recovery_state_.stabilization_frames_remaining);
 
         std::vector<std::vector<cv::DMatch>> knn;
         matcher.knnMatch(curr_desc, kf->descriptors_, knn, 2);
@@ -1700,7 +1762,9 @@ bool Tracking::relocalize() {
         }
 
         if (valid_3d_matches >= 8) {
-            candidates.push_back({kf, good, valid_3d_matches, valid_3d_matches});
+            candidates.push_back(
+                {kf, good, valid_3d_matches, valid_3d_matches, distance_to_anchor, local_to_anchor});
+            have_local_candidate = have_local_candidate || local_to_anchor;
         }
     }
 
@@ -1709,9 +1773,20 @@ bool Tracking::relocalize() {
         return false;
     }
 
+    if (prefer_local_candidates && have_local_candidate) {
+        std::cout << "Relocalize: Prioritizing local candidates during recovery"
+                  << " (total_candidates=" << candidates.size() << ")" << std::endl;
+    }
+
     // Sort by score (number of matches)
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) {
+                  if (a.local_to_anchor != b.local_to_anchor) {
+                      return a.local_to_anchor > b.local_to_anchor;
+                  }
+                  if (a.distance_to_anchor != b.distance_to_anchor) {
+                      return a.distance_to_anchor < b.distance_to_anchor;
+                  }
                   if (a.score == b.score) {
                       if (a.matches.size() == b.matches.size()) {
                           const long a_id = a.kf ? static_cast<long>(a.kf->id_) : -1L;
