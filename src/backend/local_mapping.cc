@@ -429,7 +429,7 @@ void LocalMapping::optimization() {
 
     if (local_keyframes.size() < 2 || local_landmarks.size() < 10) return;
 
-    Optimizer::bundleAdjustment(local_keyframes, local_landmarks, 10);
+    Optimizer::bundleAdjustment(local_keyframes, local_landmarks, 15);
 
     // Notify Tracking that BA is complete so it can recompute current frame pose
     if (on_ba_completed_) {
