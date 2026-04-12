@@ -20,20 +20,47 @@ SimpleVisualSLAMは6k行のC++17で、特徴点ベースSLAM + 深度センサ�
 
 **直近の競合ターゲット:** stella_vslam に精度・安定性で並び、DL深度統合で差別化する。
 
-### 1.1 リポジトリの現状（2026-04-12 時点のサマリ）
+### 1.1 リポジトリの現状（2026-04-13 時点のサマリ）
 
 - **Public OSS:** `https://github.com/rsasaki0109/simple_visual_slam` / Pages `https://rsasaki0109.github.io/simple_visual_slam/`
 - **版:** CMake `project(VERSION 0.1.0)`、`./build/run_mono --version` と一致。**引用:** ルート `CITATION.cff`。
-- **master HEAD:** `6429d9b`（`d3c81a7` の後続。Refactor SLAM core, stabilize loop closing, and enrich test suite.）。
-- **本日反映済み:** 2026-04-09 時点で未コミットだったループ補正安定化・tracking handoff・recovery guard 群は `6429d9b` に整理・コミット済み。Section 1.2 は当時の実験ログとして残す。
-- **テスト:** `ctest` **48/48 pass**（旧 24〜26 件帯から拡充）。
-- **回帰ゲート:** `python3 scripts/check_regression_gate.py --all-gates --quiet` **5/5 pass**。
+- **master HEAD:** `c5bcbe1`（Improve mono initialization, stabilize 600-frame loops, update README.）
+- **2026-04-13 の作業:**
+  - `6429d9b`: リファクタリング + テスト充実 (26→48)
+  - `244bb56`: ループ安定化 + stella比較 + plan更新 (48→51)
+  - `6d81697`: Metric Depth estimator + tracking改善 + ループ有効比較 (55 with DL ON)
+  - `c5bcbe1`: Mono初期化改善 + 600-frame安定化 + README更新
+- **テスト:** `ctest` **51/51 pass**（`USE_DEPTH_DL=ON` では **55/55**）。
+- **回帰ゲート:** `python3 scripts/check_regression_gate.py --all-gates --quiet` **5/5 pass**。ベースライン締め付け済み。
 - **リファクタ:** `tracking.cc` の helper 抽出、状態の `RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への集約、`loop_closing` の internal helper 化、`optimizer` の cleanup を実施。
-- **新規テスト:** `test_frame.cc`, `test_keyframe.cc`, `test_initializer.cc`, `test_loop_closing.cc`, `test_tracking.cc`, `test_tracking_pose_recompute.cc`, `test_synthetic_scene.h` を追加。
-- **方針:** Reference-keyframe policy 実験は収束済み。**SLAM コア品質向上**（特にループ補正の安定化）と**外部OSSとの公平な比較**が主戦場。
-- **retained best state:** metric-depth で `rigid Sim3 + confidence-weighted loop edge + pose-graph snapshot + pending strict accept` を保持。fresh `trajectory.txt` 評価の 400-frame rerun は **0.07351221** まで戻せる。
-- **未解決の本丸:** 600-frame では second-loop / stale-edge reuse が入る long run でまだ **0.10〜0.19 m** 帯に揺れる。loop candidate 検出や callback 配線よりも、**late-run tracking quality / relocalization 連鎖 / pose graph 後の handoff** が残課題。
-- **stella_vslam との比較実測済み** — Section 1.3 参照。
+- **新規テスト:** `test_frame.cc`, `test_keyframe.cc`, `test_initializer.cc`, `test_loop_closing.cc`, `test_tracking.cc`, `test_tracking_pose_recompute.cc`, `test_synthetic_scene.h`, `test_metric_depth_estimator.cc` を追加。
+- **Mono 初期化改善:** median parallax ベースの solution 選択により xyz_mono ATE **0.048→0.036** (-26%)。
+- **600-frame 安定化:** loop cooldown 120→200 KF。ATE **0.109m / 0.124m** (旧 median 0.617m)。
+- **Metric Depth:** `MetricDepthEstimator` 追加。`--metric-depth-model <path.onnx>` CLI 対応。
+- **stella_vslam 比較:** 4シナリオ×repro-eval + loop-enabled の両方を実施。eval/stella_comparison_results.md に記録。
+- **README 更新:** 比較表・テスト数・CLI を反映。
+- **方針:** Reference-keyframe policy 実験は収束済み。**room 系の ATE 6-10x 差の根本対策**（Ceres スパースソルバー化、BA 窓拡大）が次の主戦場。
+- **未解決の本丸:** room_depth は 250-frame で stella_vslam の 6.1x、room_mono は 9.8x。コア BA の構造的品質差（Ceres 密 vs g2o スパース）が主因と推定。
+
+### 1.8 Next Phase: Closing the Room Gap（2026-04-13 設計）
+
+**問題:** room 系で stella_vslam に 6-10x 負けている。ループ有効でも gap は縮まらない。
+
+**根本原因の分析:**
+1. **Ceres 密ソルバー vs g2o スパース:** poseGraphOptimization で `DENSE_QR` を使用。KF 数が増えると O(n³) でスケールしない。g2o は Schur complement + スパース構造を活用し O(n) 級
+2. **Local BA 窓が狭い:** covisible KF 15 個。stella_vslam は 20+ を使う傾向
+3. **Covisibility edge が均一重み:** 共有 landmark 数に応じた重み付けがない
+
+**提案（優先順）:**
+
+| # | 提案 | 期待効果 | リスク | 工数 |
+|---|------|---------|--------|------|
+| 1 | Ceres を `SPARSE_NORMAL_CHOLESKY` + SuiteSparse に切替 | pose graph の品質・速度改善。room 系で最大の改善見込み | SuiteSparse は既に依存。切替自体は低リスク | 小 |
+| 2 | Local BA の covisible KF 窓を 15→25 に拡大 | BA 精度向上。xyz/room 両方に効く | BA 時間増加。ただし Ceres は iteration 上限で制約される | 小 |
+| 3 | Pose graph edge に covisibility weight を導入 | 強い covisibility edge を優先。drift 低減 | edge 重み設計の試行錯誤が必要 | 中 |
+| 4 | g2o への移行 | stella_vslam と同等の pose graph 品質 | 依存追加 (GPL の g2o vs BSD の Ceres)。ライセンス注意 | 大 |
+
+**順序:** 1 → 2 → 3 の順。4 は最後の手段（GPL 汚染リスク）。
 
 ### 1.2 未コミット変更（2026-04-09 — ループ補正安定化の途中）
 
