@@ -325,7 +325,6 @@ int main(int argc, char** argv) {
         if (use_depth) {
             loop_closing->setMetricDepth(true);
         }
-        loop_closing_thread = std::thread(&LoopClosing::run, loop_closing);
     }
     
     local_mapping->setLoopClosing(loop_closing);
@@ -335,6 +334,7 @@ int main(int argc, char** argv) {
     tracker->setMap(map);
     tracker->setLocalMapping(local_mapping);
     tracker->setReferenceKeyframePolicy(create_reference_policy(reference_policy_name));
+    const std::weak_ptr<Tracking> tracker_weak = tracker;
 
     std::cout << "Reference keyframe policy: " << reference_policy_name << std::endl;
     if (repro_eval) {
@@ -348,9 +348,19 @@ int main(int argc, char** argv) {
     }
 
     // Register BA completion callback to recompute current frame pose
-    local_mapping->on_ba_completed_ = [tracker]() {
-        tracker->onBACompleted();
+    local_mapping->on_ba_completed_ = [tracker_weak]() {
+        if (auto tracker = tracker_weak.lock()) {
+            tracker->onBACompleted();
+        }
     };
+    if (loop_closing) {
+        loop_closing->on_loop_corrected_ = [tracker_weak]() {
+            if (auto tracker = tracker_weak.lock()) {
+                tracker->onLoopCorrected();
+            }
+        };
+        loop_closing_thread = std::thread(&LoopClosing::run, loop_closing);
+    }
 
     // Depth/accel integration setup
     if (use_tum) {
@@ -521,7 +531,7 @@ int main(int argc, char** argv) {
     if (save_online_trajectory("trajectory_online.txt")) {
         std::cout << "Trajectory saved to trajectory_online.txt" << std::endl;
     }
-    
+
     // Request worker threads to stop before waiting so shutdown does not enqueue more work.
     if (run_local_mapping_thread) {
         local_mapping->requestStop();

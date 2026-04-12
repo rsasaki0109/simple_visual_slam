@@ -49,7 +49,10 @@ void LocalMapping::processPendingWork() {
         mapPointCulling();
         createNewMapPoints();
         current_processed_kf_->updateConnections();
-        optimization();
+        // Skip BA while loop closing is correcting poses/landmarks
+        if (!map_->loop_correcting_.load()) {
+            optimization();
+        }
     }
 }
 
@@ -72,13 +75,13 @@ void LocalMapping::processNewKeyframe() {
     map_->addKeyframe(current_processed_kf_);
     ++processed_keyframe_count_;
     
+    std::cout << "LocalMapping: Processed Keyframe " << current_processed_kf_->id_ 
+              << ". Connected KFs: " << current_processed_kf_->connected_keyframes_.size() << std::endl;
+
     // Pass to Loop Closing
     if (loop_closing_) {
         loop_closing_->insertKeyframe(current_processed_kf_);
     }
-    
-    std::cout << "LocalMapping: Processed Keyframe " << current_processed_kf_->id_ 
-              << ". Connected KFs: " << current_processed_kf_->connected_keyframes_.size() << std::endl;
 }
 
 void LocalMapping::removeLandmark(const Landmark::Ptr& lm) {

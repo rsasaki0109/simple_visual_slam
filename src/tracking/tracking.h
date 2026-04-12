@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "core/common.h"
@@ -44,8 +45,19 @@ public:
 
     TrackingRunStatistics runStatistics() const { return run_stats_; }
 
+    static bool shouldAcceptRecomputedPose(double err_before, double err_after);
+    static bool shouldAcceptLocalMapPoseUpdate(std::size_t support,
+                                               std::size_t prior_support,
+                                               bool used_global_fallback,
+                                               double trans_change,
+                                               double rot_change,
+                                               int stabilization_frames_remaining);
+
     // Callback from LocalMapping when BA is completed
     void onBACompleted();
+
+    // Callback from LoopClosing when pose graph correction is applied
+    void onLoopCorrected();
 
     TrackingState state_;
     Frame::Ptr current_frame_;
@@ -64,8 +76,6 @@ public:
     SE3 velocity_;
 
     int num_tracked_features_ = 0;
-    int frames_since_last_kf_ = 0;
-    int consecutive_tracking_failures_ = 0;
     Keyframe::Ptr reference_keyframe_;
     Keyframe::Ptr previous_reference_keyframe_;
 
@@ -74,6 +84,26 @@ public:
     bool gravity_aligned_ = false;
 
 private:
+    struct RecoveryState {
+        int lost_frame_count = 0;
+        int consecutive_tracking_failures = 0;
+        int stabilization_frames_remaining = 0;
+        SE3 last_good_pose = SE3();
+    };
+
+    struct LoopCorrectionState {
+        bool pending = false;
+        int pending_deferrals = 0;
+        bool skip_velocity_update_once = false;
+        bool force_keyframe_insertion_once = false;
+        bool force_reference_refresh_once = false;
+    };
+
+    struct ReinitializationState {
+        Frame::Ptr reference_frame;
+        Initializer::Ptr initializer;
+    };
+
     bool initializeWithDepth();
     void createLandmarksFromDepth(Keyframe::Ptr kf);
     bool track();
@@ -81,7 +111,8 @@ private:
     bool trackReferenceKeyframe();
     bool trackLocalMap();
     bool needNewKeyframe();
-    void recomputeCurrentPose();
+    void applyPendingLoopCorrection(const char* phase);
+    bool recomputeCurrentPose();
     bool relocalize();  // Attempt to recover from tracking loss
     bool reinitialize();  // Re-initialize from scratch when lost for too long
     void setReferenceKeyframe(Keyframe::Ptr kf);
@@ -90,14 +121,19 @@ private:
     cv::Ptr<cv::DescriptorMatcher> matcher_;
     std::mutex pose_mutex_;  // For thread-safe pose updates
 
-    int lost_frame_count_ = 0;
     static constexpr int max_lost_frames_ = 30;  // Max frames before giving up
-    SE3 last_good_pose_;  // Last known good T_cw pose before tracking loss
     std::unique_ptr<ReferenceKeyframePolicy> reference_keyframe_policy_;
+    static constexpr int max_loop_correction_deferrals_ = 6;
+    static constexpr size_t min_loop_correction_correspondences_ = 80;
+    static constexpr int recovery_stabilization_window_frames_ = 3;
+    static constexpr std::size_t min_stable_support_ = 120;
+    static constexpr double recovery_max_change_strict_ = 0.12;
+    static constexpr double recovery_max_change_relaxed_ = 0.18;
+    RecoveryState recovery_state_;
+    LoopCorrectionState loop_correction_state_;
 
     // Re-initialization state
-    Frame::Ptr reinit_reference_frame_;
-    Initializer::Ptr reinit_initializer_;
+    ReinitializationState reinitialization_state_;
     static constexpr int reinit_trigger_frames_ = 20;  // Start re-init after this many lost frames
 
     TrackingRunStatistics run_stats_;
