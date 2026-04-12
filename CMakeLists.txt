@@ -259,11 +259,17 @@ if(BUILD_TESTS)
 
     add_executable(svslam_tests
         tests/test_camera.cc
+        tests/test_frame.cc
+        tests/test_initializer.cc
+        tests/test_keyframe.cc
         tests/test_landmark.cc
+        tests/test_loop_closing.cc
         tests/test_map.cc
         tests/test_optimizer.cc
         tests/test_reference_keyframe_policy.cc
+        tests/test_tracking.cc
         tests/test_tum_pinhole_calibration.cc
+        tests/test_tracking_pose_recompute.cc
         tests/test_tracking_run_statistics.cc
     )
     target_link_libraries(svslam_tests PRIVATE

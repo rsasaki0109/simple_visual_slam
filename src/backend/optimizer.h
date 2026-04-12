@@ -101,7 +101,8 @@ public:
 
     static void poseGraphOptimization(Map::Ptr map,
                                       const std::vector<PoseGraphEdge>& loop_edges,
-                                      int iterations = 50);
+                                      int iterations = 50,
+                                      bool fix_scale = false);
 
     static void globalBundleAdjustment(Map::Ptr map, int iterations = 10);
                                  

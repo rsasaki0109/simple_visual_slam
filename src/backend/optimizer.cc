@@ -29,6 +29,63 @@ int ceres_num_threads_from_env() {
     return static_cast<int>(v);
 }
 
+struct ObservationItem {
+    unsigned long keyframe_id = 0;
+    std::size_t keypoint_index = 0;
+    Keyframe::Ptr keyframe;
+};
+
+void fillSe3ParameterBlock(const SE3& pose, double* param) {
+    const Eigen::Vector3d translation = pose.translation();
+    const Eigen::Quaterniond quaternion = pose.unit_quaternion();
+    param[0] = translation.x();
+    param[1] = translation.y();
+    param[2] = translation.z();
+    param[3] = quaternion.w();
+    param[4] = quaternion.x();
+    param[5] = quaternion.y();
+    param[6] = quaternion.z();
+}
+
+SE3 se3FromParameterBlock(const double* param) {
+    const Eigen::Vector3d translation(param[0], param[1], param[2]);
+    const Eigen::Quaterniond quaternion(param[3], param[4], param[5], param[6]);
+    return SE3(quaternion, translation);
+}
+
+Sim3 sim3FromPoseGraphParameterBlock(const double* param) {
+    const Eigen::Vector3d translation(param[0], param[1], param[2]);
+    Eigen::Quaterniond quaternion(param[3], param[4], param[5], param[6]);
+    quaternion.normalize();
+    return Sim3(std::exp(param[7]), quaternion, translation);
+}
+
+std::vector<ObservationItem> collectSortedObservations(const Landmark::Ptr& landmark) {
+    std::vector<ObservationItem> observations;
+    if (!landmark) {
+        return observations;
+    }
+
+    std::lock_guard<std::mutex> observation_lock(landmark->mutex_);
+    observations.reserve(landmark->observations_.size());
+    for (const auto& observation : landmark->observations_) {
+        auto keyframe = observation.first.lock();
+        if (!keyframe) {
+            continue;
+        }
+        observations.push_back({keyframe->id_, observation.second, keyframe});
+    }
+
+    std::sort(observations.begin(), observations.end(),
+              [](const ObservationItem& lhs, const ObservationItem& rhs) {
+                  if (lhs.keyframe_id != rhs.keyframe_id) {
+                      return lhs.keyframe_id < rhs.keyframe_id;
+                  }
+                  return lhs.keypoint_index < rhs.keypoint_index;
+              });
+    return observations;
+}
+
 }  // namespace
 
 // Define Cost Functions here
@@ -80,6 +137,132 @@ struct ReprojectionError {
     double observed_y;
     double fx, fy, cx, cy;
 };
+
+namespace {
+
+void addReprojectionResiduals(ceres::Problem& problem,
+                              const Landmark::Ptr& landmark,
+                              double* point_param,
+                              const std::map<unsigned long, double*>& pose_params,
+                              int& residual_count) {
+    for (const auto& observation : collectSortedObservations(landmark)) {
+        const auto pose_it = pose_params.find(observation.keyframe_id);
+        if (pose_it == pose_params.end()) {
+            continue;
+        }
+        if (observation.keypoint_index >= observation.keyframe->keypoints_.size()) {
+            continue;
+        }
+
+        const auto& keypoint = observation.keyframe->keypoints_[observation.keypoint_index];
+        const auto& camera = observation.keyframe->camera_;
+        ceres::CostFunction* cost_function = ReprojectionError::Create(
+            keypoint.pt.x, keypoint.pt.y,
+            camera->fx_, camera->fy_, camera->cx_, camera->cy_);
+        problem.AddResidualBlock(cost_function, new ceres::HuberLoss(1.0),
+                                 pose_it->second, point_param);
+        ++residual_count;
+    }
+}
+
+int addDepthPriorResiduals(ceres::Problem& problem,
+                           const Landmark::Ptr& landmark,
+                           double* point_param,
+                           const std::map<unsigned long, double*>& pose_params) {
+    int depth_residual_count = 0;
+    for (const auto& observation : collectSortedObservations(landmark)) {
+        const auto pose_it = pose_params.find(observation.keyframe_id);
+        if (pose_it == pose_params.end()) {
+            continue;
+        }
+        const auto& keyframe = observation.keyframe;
+        if (keyframe->depth_image_.empty() ||
+            observation.keypoint_index >= keyframe->keypoints_.size()) {
+            continue;
+        }
+
+        const auto& keypoint = keyframe->keypoints_[observation.keypoint_index];
+        const float depth = keyframe->getDepth(keypoint.pt.x, keypoint.pt.y);
+        if (depth <= 0.0f || depth > 10.0f) {
+            continue;
+        }
+
+        const double sigma = keyframe->depth_is_metric_ ? 0.02 : 0.2;
+        const double weight = 1.0 / sigma;
+        const auto& camera = keyframe->camera_;
+        ceres::CostFunction* depth_cost = DepthPriorError::Create(
+            static_cast<double>(depth),
+            camera->fx_, camera->fy_, camera->cx_, camera->cy_,
+            keypoint.pt.x, keypoint.pt.y, weight);
+        problem.AddResidualBlock(depth_cost, new ceres::HuberLoss(0.5),
+                                 pose_it->second, point_param);
+        ++depth_residual_count;
+    }
+    return depth_residual_count;
+}
+
+struct PoseGraphKeyframeSnapshot {
+    Eigen::Vector3d translation = Eigen::Vector3d::Zero();
+    Eigen::Quaterniond rotation = Eigen::Quaterniond::Identity();
+    std::vector<std::pair<Keyframe::Ptr, int>> connections;
+};
+
+std::map<unsigned long, PoseGraphKeyframeSnapshot> snapshotPoseGraphKeyframes(
+    const std::map<unsigned long, Keyframe::Ptr>& all_keyframes) {
+    std::map<unsigned long, PoseGraphKeyframeSnapshot> snapshots;
+    for (const auto& entry : all_keyframes) {
+        const auto& keyframe = entry.second;
+        if (!keyframe) {
+            continue;
+        }
+
+        PoseGraphKeyframeSnapshot snapshot;
+        {
+            std::lock_guard<std::mutex> lock(keyframe->mutex_);
+            snapshot.translation = keyframe->T_cw_.translation();
+            snapshot.rotation = keyframe->T_cw_.unit_quaternion();
+            snapshot.connections.reserve(keyframe->connected_keyframes_.size());
+            for (const auto& connection : keyframe->connected_keyframes_) {
+                snapshot.connections.push_back(connection);
+            }
+        }
+        snapshots.emplace(entry.first, std::move(snapshot));
+    }
+    return snapshots;
+}
+
+void addPoseGraphParameterBlock(ceres::Problem& problem,
+                                const Keyframe::Ptr& keyframe,
+                                const std::map<unsigned long, PoseGraphKeyframeSnapshot>& snapshots,
+                                std::map<unsigned long, double*>& pose_params,
+                                std::map<unsigned long, Sim3>& old_poses,
+                                bool constant) {
+    if (!keyframe || pose_params.count(keyframe->id_)) {
+        return;
+    }
+    const auto snapshot_it = snapshots.find(keyframe->id_);
+    if (snapshot_it == snapshots.end()) {
+        return;
+    }
+
+    double* param = new double[8];
+    fillSe3ParameterBlock(SE3(snapshot_it->second.rotation, snapshot_it->second.translation), param);
+    param[7] = 0.0;
+    pose_params[keyframe->id_] = param;
+    old_poses[keyframe->id_] = Sim3(1.0, snapshot_it->second.rotation, snapshot_it->second.translation);
+
+    ceres::Manifold* manifold =
+        new ceres::ProductManifold<
+            ceres::EuclideanManifold<3>,
+            ceres::QuaternionManifold,
+            ceres::EuclideanManifold<1>>();
+    problem.AddParameterBlock(param, 8, manifold);
+    if (constant) {
+        problem.SetParameterBlockConstant(param);
+    }
+}
+
+}  // namespace
 
 struct PoseGraphError {
     PoseGraphError(const Sim3& measurement,
@@ -163,6 +346,23 @@ struct PoseGraphError {
     double scale_weight_;
 };
 
+struct ScalePriorError {
+    explicit ScalePriorError(double weight) : weight_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const pose, T* residuals) const {
+        residuals[0] = T(weight_) * pose[7];
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double weight) {
+        return new ceres::AutoDiffCostFunction<ScalePriorError, 1, 8>(
+            new ScalePriorError(weight));
+    }
+
+    double weight_;
+};
+
 void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes, 
                                  const std::vector<Landmark::Ptr>& landmarks,
                                  int iterations) {
@@ -179,22 +379,9 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         if (!kf || pose_params.count(kf->id_)) return;
 
         double* param = new double[7];
-        Eigen::Vector3d t = kf->T_cw_.translation();
-        Eigen::Quaterniond q = kf->T_cw_.unit_quaternion();
-
-        param[0] = t.x();
-        param[1] = t.y();
-        param[2] = t.z();
-        // Ceres QuaternionRotatePoint expects [w, x, y, z] order
-        param[3] = q.w();
-        param[4] = q.x();
-        param[5] = q.y();
-        param[6] = q.z();
-        
+        fillSe3ParameterBlock(kf->T_cw_, param);
         pose_params[kf->id_] = param;
 
-        // Construct Manifold for SE3 (Euclidean<3> x Quaternion)
-        // Using QuaternionManifold because we store quaternion in [w, x, y, z] order (Ceres convention)
         ceres::Manifold* manifold = new ceres::ProductManifold<ceres::EuclideanManifold<3>, ceres::QuaternionManifold>();
 
         problem.AddParameterBlock(param, 7, manifold);
@@ -213,9 +400,8 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
     std::map<unsigned long, Keyframe::Ptr> fixed_keyframes;
     for (auto& lm : landmarks) {
         if (!lm || lm->isBad()) continue;
-        for (const auto& obs : lm->observations_) {
-            auto kf = obs.first.lock();
-            if (!kf) continue;
+        for (const auto& observation : collectSortedObservations(lm)) {
+            const auto& kf = observation.keyframe;
             if (local_keyframe_ids.count(kf->id_)) continue;
             fixed_keyframes[kf->id_] = kf;
         }
@@ -237,7 +423,7 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
     const double position_bound = 100.0; // Reasonable bound for indoor scenes
 
     for (auto& lm : landmarks) {
-        if (lm->isBad()) continue;
+        if (!lm || lm->isBad()) continue;
 
         Vec3 pos = lm->getPos();
 
@@ -268,98 +454,15 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         problem.SetParameterLowerBound(param, 2, -position_bound);
         problem.SetParameterUpperBound(param, 2, position_bound);
         
-        // Add Residuals in deterministic order: `Landmark::observations_` is ordered by
-        // weak_ptr owner address, which varies run-to-run and changes Ceres residual ordering.
-        struct ObsItem {
-            unsigned long kf_id;
-            size_t kp_idx;
-            Keyframe::Ptr kf;
-        };
-        std::vector<ObsItem> obs_items;
-        {
-            std::lock_guard<std::mutex> obs_lock(lm->mutex_);
-            obs_items.reserve(lm->observations_.size());
-            for (const auto& obs : lm->observations_) {
-                auto kf = obs.first.lock();
-                if (!kf) continue;
-                obs_items.push_back({kf->id_, obs.second, kf});
-            }
-        }
-        std::sort(obs_items.begin(), obs_items.end(), [](const ObsItem& a, const ObsItem& b) {
-            if (a.kf_id != b.kf_id) return a.kf_id < b.kf_id;
-            return a.kp_idx < b.kp_idx;
-        });
-        for (const auto& item : obs_items) {
-            auto kf = item.kf;
-            if (pose_params.find(kf->id_) == pose_params.end()) {
-                continue;
-            }
-            const size_t kp_idx = item.kp_idx;
-            if (kp_idx >= kf->keypoints_.size()) continue;
-            const auto& kp = kf->keypoints_[kp_idx];
-
-            auto camera = kf->camera_;
-
-            ceres::CostFunction* cost_function = ReprojectionError::Create(
-                kp.pt.x, kp.pt.y,
-                camera->fx_, camera->fy_, camera->cx_, camera->cy_);
-
-            problem.AddResidualBlock(cost_function, new ceres::HuberLoss(1.0), pose_params[kf->id_], point_params[lm->id_]);
-            ++residual_count;
-        }
+        addReprojectionResiduals(problem, lm, param, pose_params, residual_count);
     }
 
-    // Add depth prior residuals for keyframes with depth images
     int depth_residual_count = 0;
     for (auto& lm : landmarks) {
-        if (lm->isBad()) continue;
+        if (!lm || lm->isBad()) continue;
         if (!point_params.count(lm->id_)) continue;
-
-        struct ObsItem {
-            unsigned long kf_id;
-            size_t kp_idx;
-            Keyframe::Ptr kf;
-        };
-        std::vector<ObsItem> depth_obs;
-        {
-            std::lock_guard<std::mutex> obs_lock(lm->mutex_);
-            depth_obs.reserve(lm->observations_.size());
-            for (const auto& obs : lm->observations_) {
-                auto kf = obs.first.lock();
-                if (!kf) continue;
-                depth_obs.push_back({kf->id_, obs.second, kf});
-            }
-        }
-        std::sort(depth_obs.begin(), depth_obs.end(), [](const ObsItem& a, const ObsItem& b) {
-            if (a.kf_id != b.kf_id) return a.kf_id < b.kf_id;
-            return a.kp_idx < b.kp_idx;
-        });
-        for (const auto& item : depth_obs) {
-            auto kf = item.kf;
-            if (pose_params.find(kf->id_) == pose_params.end()) continue;
-            if (kf->depth_image_.empty()) continue;
-
-            const size_t kp_idx = item.kp_idx;
-            if (kp_idx >= kf->keypoints_.size()) continue;
-            const auto& kp = kf->keypoints_[kp_idx];
-
-            float depth = kf->getDepth(kp.pt.x, kp.pt.y);
-            if (depth <= 0.0f || depth > 10.0f) continue;
-
-            // Weight: higher for sensor depth (metric), lower for DL depth
-            double sigma = kf->depth_is_metric_ ? 0.02 : 0.2;
-            double weight = 1.0 / sigma;
-
-            auto camera = kf->camera_;
-            ceres::CostFunction* depth_cost = DepthPriorError::Create(
-                static_cast<double>(depth),
-                camera->fx_, camera->fy_, camera->cx_, camera->cy_,
-                kp.pt.x, kp.pt.y, weight);
-
-            problem.AddResidualBlock(depth_cost, new ceres::HuberLoss(0.5),
-                                     pose_params[kf->id_], point_params[lm->id_]);
-            depth_residual_count++;
-        }
+        depth_residual_count += addDepthPriorResiduals(
+            problem, lm, point_params[lm->id_], pose_params);
     }
 
     if (depth_residual_count > 0) {
@@ -413,12 +516,7 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
     
     // Update State
     for (auto& kf : keyframes) {
-        double* param = pose_params[kf->id_];
-        Eigen::Vector3d t(param[0], param[1], param[2]);
-        // param order is [t, w, x, y, z], Eigen Quaterniond constructor is (w, x, y, z)
-        Eigen::Quaterniond q(param[3], param[4], param[5], param[6]); // w, x, y, z
-        
-        kf->T_cw_ = SE3(q, t);
+        kf->T_cw_ = se3FromParameterBlock(pose_params[kf->id_]);
     }
     
     for (auto& lm : landmarks) {
@@ -448,54 +546,40 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
 
 void Optimizer::poseGraphOptimization(Map::Ptr map,
                                       const std::vector<PoseGraphEdge>& loop_edges,
-                                      int iterations) {
+                                      int iterations,
+                                      bool fix_scale) {
     if (!map) return;
 
-    // Snapshot keyframes to avoid concurrent modification from Tracking thread
     std::map<unsigned long, Keyframe::Ptr> all_keyframes;
     {
         const auto& kf_ref = map->getAllKeyframes();
-        all_keyframes = kf_ref;  // copy
+        all_keyframes = kf_ref;
     }
     if (all_keyframes.size() < 2) return;
+
+    const auto keyframe_snapshots = snapshotPoseGraphKeyframes(all_keyframes);
 
     ceres::Problem problem;
     std::map<unsigned long, double*> pose_params;
     std::map<unsigned long, Sim3> old_poses;
 
-    auto addPoseParameterBlock = [&](const Keyframe::Ptr& kf, bool constant) {
-        if (!kf || pose_params.count(kf->id_)) return;
-
-        double* param = new double[8];
-        const Eigen::Vector3d t = kf->T_cw_.translation();
-        const Eigen::Quaterniond q = kf->T_cw_.unit_quaternion();
-        param[0] = t.x();
-        param[1] = t.y();
-        param[2] = t.z();
-        param[3] = q.w();
-        param[4] = q.x();
-        param[5] = q.y();
-        param[6] = q.z();
-        param[7] = 0.0;
-
-        pose_params[kf->id_] = param;
-        old_poses[kf->id_] = Sim3(1.0, q, t);
-
-        ceres::Manifold* manifold =
-            new ceres::ProductManifold<
-                ceres::EuclideanManifold<3>,
-                ceres::QuaternionManifold,
-                ceres::EuclideanManifold<1>>();
-        problem.AddParameterBlock(param, 8, manifold);
-        if (constant) {
-            problem.SetParameterBlockConstant(param);
-        }
-    };
-
     bool first = true;
     for (const auto& kv : all_keyframes) {
-        addPoseParameterBlock(kv.second, first);
+        addPoseGraphParameterBlock(problem, kv.second, keyframe_snapshots,
+                                   pose_params, old_poses, first);
         first = false;
+    }
+
+    if (fix_scale) {
+        constexpr double kMetricScalePriorWeight = 100.0;
+        for (const auto& kv : pose_params) {
+            if (!problem.IsParameterBlockConstant(kv.second)) {
+                problem.AddResidualBlock(
+                    ScalePriorError::Create(kMetricScalePriorWeight),
+                    nullptr,
+                    kv.second);
+            }
+        }
     }
 
     auto addEdgeResidual = [&](const PoseGraphEdge& edge, ceres::LossFunction* loss) {
@@ -516,9 +600,16 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
     for (const auto& kv : all_keyframes) {
         const auto& kf = kv.second;
         if (!kf) continue;
-        for (const auto& connected : kf->connected_keyframes_) {
+        const auto snapshot_it = keyframe_snapshots.find(kf->id_);
+        if (snapshot_it == keyframe_snapshots.end()) continue;
+        const auto& snapshot = snapshot_it->second;
+
+        for (const auto& connected : snapshot.connections) {
             const auto& other = connected.first;
             if (!other) continue;
+            const auto other_snapshot_it = keyframe_snapshots.find(other->id_);
+            if (other_snapshot_it == keyframe_snapshots.end()) continue;
+            const auto& other_snapshot = other_snapshot_it->second;
 
             const unsigned long id0 = std::min(kf->id_, other->id_);
             const unsigned long id1 = std::max(kf->id_, other->id_);
@@ -526,17 +617,15 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
             const double weight_scale =
                 std::clamp(std::sqrt(static_cast<double>(connected.second) / 30.0), 0.75, 2.0);
-            const Eigen::Quaterniond q_from = kf->T_cw_.unit_quaternion();
-            const Eigen::Quaterniond q_to = other->T_cw_.unit_quaternion();
             PoseGraphEdge edge;
             edge.from = kf;
             edge.to = other;
             edge.relative_pose =
-                Sim3(1.0, q_to, other->T_cw_.translation()) *
-                Sim3(1.0, q_from, kf->T_cw_.translation()).inverse();
+                Sim3(1.0, other_snapshot.rotation, other_snapshot.translation) *
+                Sim3(1.0, snapshot.rotation, snapshot.translation).inverse();
             edge.translation_weight = weight_scale;
             edge.rotation_weight = weight_scale;
-            edge.scale_weight = 1.5 * weight_scale;
+            edge.scale_weight = fix_scale ? 100.0 : (1.5 * weight_scale);
             addEdgeResidual(edge, new ceres::HuberLoss(1.0));
             ++covisibility_edges;
         }
@@ -564,6 +653,11 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
+    double min_scale = std::numeric_limits<double>::infinity();
+    double max_scale = 0.0;
+    double sum_scale = 0.0;
+    std::size_t counted_scales = 0;
+
     std::cout << "PoseGraph: " << summary.BriefReport()
               << " | covisibility_edges=" << covisibility_edges
               << " | loop_edges=" << loop_edge_count << std::endl;
@@ -571,25 +665,37 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
     std::map<unsigned long, Sim3> optimized_poses;
     for (const auto& kv : all_keyframes) {
         auto* param = pose_params[kv.first];
-        Eigen::Vector3d t(param[0], param[1], param[2]);
-        Eigen::Quaterniond q(param[3], param[4], param[5], param[6]);
-        const double scale = std::exp(param[7]);
+        const Sim3 optimized_pose = sim3FromPoseGraphParameterBlock(param);
+        const Eigen::Vector3d t = optimized_pose.translation();
+        const Eigen::Quaterniond q(optimized_pose.rotationMatrix());
+        const double scale = optimized_pose.scale();
 
-        // Validate optimized pose
         if (!std::isfinite(t.x()) || !std::isfinite(t.y()) || !std::isfinite(t.z()) ||
             !std::isfinite(q.w()) || !std::isfinite(q.x()) || !std::isfinite(q.y()) || !std::isfinite(q.z()) ||
             !std::isfinite(scale) || scale < 0.01 || scale > 100.0) {
-            // Keep original pose
             optimized_poses[kv.first] = old_poses[kv.first];
             continue;
         }
 
-        q.normalize();
-        optimized_poses[kv.first] = Sim3(scale, q, t);
-        kv.second->T_cw_ = SE3(q, t / scale);
+        optimized_poses[kv.first] = optimized_pose;
+        {
+            std::lock_guard<std::mutex> lock(kv.second->mutex_);
+            kv.second->T_cw_ = SE3(q, t / scale);
+        }
+
+        min_scale = std::min(min_scale, scale);
+        max_scale = std::max(max_scale, scale);
+        sum_scale += scale;
+        counted_scales++;
     }
 
-    // Snapshot landmarks to avoid concurrent modification
+    if (counted_scales > 0) {
+        std::cout << "PoseGraph: scale_stats min=" << min_scale
+                  << " max=" << max_scale
+                  << " mean=" << (sum_scale / static_cast<double>(counted_scales))
+                  << " | metric_fix_scale=" << (fix_scale ? 1 : 0) << std::endl;
+    }
+
     std::map<unsigned long, Landmark::Ptr> all_landmarks;
     {
         const auto& lm_ref = map->getAllLandmarks();

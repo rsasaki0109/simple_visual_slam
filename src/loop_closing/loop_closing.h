@@ -6,6 +6,7 @@
 #include "core/landmark.h"
 #include "backend/optimizer.h"
 #include <opencv2/features2d.hpp>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <deque>
@@ -17,6 +18,28 @@
 #endif
 
 namespace svslam {
+
+namespace loop_closing_internal {
+
+struct LoopConstraintWeighting {
+    double confidence = 0.0;
+    double translation_weight = 10.0;
+    double rotation_weight = 10.0;
+    double scale_weight = 15.0;
+};
+
+bool isFinalSim3ScaleAcceptable(double scale,
+                                bool has_metric_depth,
+                                double metric_scale_tolerance = 0.05);
+LoopConstraintWeighting computeLoopConstraintWeighting(int inlier_count,
+                                                       double inlier_ratio,
+                                                       bool has_metric_depth);
+double computeStaleLoopEdgeDecay(double translation_error, double scale_error);
+void mergeLandmarks(Map::Ptr map,
+                    const Landmark::Ptr& target,
+                    const Landmark::Ptr& source);
+
+}  // namespace loop_closing_internal
 
 #ifdef USE_DBOW2
 // Define Vocabulary type for ORB
@@ -43,11 +66,19 @@ public:
     // Set to true when metric depth is available (disables scale correction in loop closing)
     void setMetricDepth(bool metric) { has_metric_depth_ = metric; }
 
+    // Callback invoked after loop correction completes (on LoopClosing thread)
+    std::function<void()> on_loop_corrected_;
+
 private:
     struct LoopConstraint {
         Keyframe::Ptr from;
         Keyframe::Ptr to;
         Sim3 relative_pose;
+        double translation_weight = 10.0;
+        double rotation_weight = 10.0;
+        double scale_weight = 15.0;
+        int inlier_count = 0;
+        double inlier_ratio = 0.0;
     };
 
     bool checkNewKeyframes();
@@ -78,6 +109,8 @@ private:
     Keyframe::Ptr current_processed_kf_;
     Keyframe::Ptr loop_candidate_kf_;
     Sim3 corrected_sim3_;
+    int corrected_loop_inlier_count_ = 0;
+    double corrected_loop_inlier_ratio_ = 0.0;
     std::vector<cv::DMatch> verified_loop_matches_;
     std::vector<LoopConstraint> loop_constraints_;
 
