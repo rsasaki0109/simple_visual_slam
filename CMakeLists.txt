@@ -219,7 +219,10 @@ if(USE_DBOW2 AND TARGET DBoW2)
 endif()
 
 if(USE_DEPTH_DL)
-    target_sources(svslam_core PRIVATE src/depth/onnx_depth_estimator.cc)
+    target_sources(svslam_core PRIVATE
+        src/depth/onnx_depth_estimator.cc
+        src/depth/metric_depth_estimator.cc
+    )
     target_link_libraries(svslam_core PUBLIC onnxruntime::onnxruntime)
 endif()
 
@@ -272,6 +275,9 @@ if(BUILD_TESTS)
         tests/test_tracking_pose_recompute.cc
         tests/test_tracking_run_statistics.cc
     )
+    if(USE_DEPTH_DL)
+        target_sources(svslam_tests PRIVATE tests/test_metric_depth_estimator.cc)
+    endif()
     target_link_libraries(svslam_tests PRIVATE
         svslam_core
         svslam_reference_policy_experiments

@@ -25,6 +25,7 @@
 #include "backend/local_mapping.h"
 #include "loop_closing/loop_closing.h"
 #ifdef USE_DEPTH_DL
+#include "depth/metric_depth_estimator.h"
 #include "depth/onnx_depth_estimator.h"
 #endif
 #include <memory>
@@ -56,6 +57,7 @@ void print_help(std::ostream& os) {
        << "  --reference-policy <heuristic|score|pipeline>\n"
        << "  --skip-frames N   --max-frames N\n"
        << "  --depth-model <model.onnx>          DL depth (build with -DUSE_DEPTH_DL=ON)\n"
+       << "  --metric-depth-model <model.onnx>   Metric DL depth in meters (build with -DUSE_DEPTH_DL=ON)\n"
        << "  --no-viz                            No OpenCV imshow window\n"
        << "  --run-summary-json <path>          Machine-readable run stats (see schema in source)\n"
        << "  --strict-exit                       Exit 3 if tracking did not finish in OK state\n"
@@ -108,7 +110,7 @@ int main(int argc, char** argv) {
                   << "  ./run_mono --version | -V     (print semver from CMake project VERSION)\n"
                   << "  ./run_mono <video_path> [vocab_path]\n"
                   << "  ./run_mono --euroc <sequence_dir> [vocab_path]\n"
-                  << "  ./run_mono --tum <sequence_dir> [--tum-camera-config <calib.json>] [--depth] [--accel] [--repro-eval] [--reference-policy <heuristic|score|pipeline>] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [--run-summary-json <path>] [--strict-exit] [vocab_path]\n" << std::endl;
+                  << "  ./run_mono --tum <sequence_dir> [--tum-camera-config <calib.json>] [--depth] [--accel] [--repro-eval] [--reference-policy <heuristic|score|pipeline>] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [--metric-depth-model <path.onnx>] [--run-summary-json <path>] [--strict-exit] [vocab_path]\n" << std::endl;
         return -1;
     }
 
@@ -122,6 +124,7 @@ int main(int argc, char** argv) {
     int skip_frames = 0;
     std::string reference_policy_name = "heuristic";
     std::string depth_model_path;
+    std::string metric_depth_model_path;
     std::string tum_camera_config;
     std::string run_summary_json_path;
     bool strict_exit = false;
@@ -199,6 +202,8 @@ int main(int argc, char** argv) {
                 max_frames = parse_non_negative_int(argv[++i], "--max-frames");
             } else if (arg == "--depth-model" && i + 1 < argc) {
                 depth_model_path = argv[++i];
+            } else if (arg == "--metric-depth-model" && i + 1 < argc) {
+                metric_depth_model_path = argv[++i];
             } else if (arg == "--tum-camera-config" && i + 1 < argc) {
                 tum_camera_config = argv[++i];
             } else if (arg == "--run-summary-json" && i + 1 < argc) {
@@ -209,6 +214,11 @@ int main(int argc, char** argv) {
         }
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
+        return -1;
+    }
+
+    if (!depth_model_path.empty() && !metric_depth_model_path.empty()) {
+        std::cerr << "Specify only one of --depth-model or --metric-depth-model" << std::endl;
         return -1;
     }
 
@@ -295,7 +305,8 @@ int main(int argc, char** argv) {
     // Find vocab path: last argument that isn't a flag
     for (int i = positional_idx; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--depth-model" || arg == "--reference-policy" || arg == "--tum-camera-config" ||
+        if (arg == "--depth-model" || arg == "--metric-depth-model" ||
+            arg == "--reference-policy" || arg == "--tum-camera-config" ||
             arg == "--run-summary-json" || arg == "--skip-frames" || arg == "--max-frames") {
             ++i;
             continue;
@@ -322,9 +333,6 @@ int main(int argc, char** argv) {
     const bool run_loop_closing_thread = !repro_eval;
     if (run_loop_closing_thread) {
         loop_closing = std::make_shared<LoopClosing>(map, vocab_path);
-        if (use_depth) {
-            loop_closing->setMetricDepth(true);
-        }
     }
     
     local_mapping->setLoopClosing(loop_closing);
@@ -380,12 +388,27 @@ int main(int argc, char** argv) {
     }
 
     // Deep learning depth estimator
+    if (loop_closing && use_depth) {
+        loop_closing->setMetricDepth(true);
+    }
 #ifdef USE_DEPTH_DL
     std::shared_ptr<DepthEstimator> dl_depth_estimator;
-    if (!depth_model_path.empty()) {
+    if (!metric_depth_model_path.empty()) {
+        std::cout << "Loading metric DL depth model: " << metric_depth_model_path << std::endl;
+        dl_depth_estimator = std::make_shared<MetricDepthEstimator>(metric_depth_model_path, camera);
+        std::cout << "DL depth estimation: ENABLED (metric)" << std::endl;
+    } else if (!depth_model_path.empty()) {
         std::cout << "Loading DL depth model: " << depth_model_path << std::endl;
         dl_depth_estimator = std::make_shared<OnnxDepthEstimator>(depth_model_path);
-        std::cout << "DL depth estimation: ENABLED" << std::endl;
+        std::cout << "DL depth estimation: ENABLED (relative)" << std::endl;
+    }
+    if (loop_closing && dl_depth_estimator && dl_depth_estimator->isMetric()) {
+        loop_closing->setMetricDepth(true);
+    }
+#else
+    if (!depth_model_path.empty() || !metric_depth_model_path.empty()) {
+        std::cerr << "DL depth requires a build with -DUSE_DEPTH_DL=ON" << std::endl;
+        return -1;
     }
 #endif
 
@@ -480,7 +503,7 @@ int main(int argc, char** argv) {
             bool run_dl = (frame_id <= 1) || (frame_id % 5 == 0);
             if (run_dl) {
                 frame->depth_image_ = dl_depth_estimator->estimate(img);
-                frame->depth_is_metric_ = false;
+                frame->depth_is_metric_ = dl_depth_estimator->isMetric();
             }
         }
 #endif

@@ -26,6 +26,7 @@ constexpr std::size_t kMinTrackLocalMapInliers = 12;
 constexpr std::size_t kMinTrackReferenceInliers = 15;
 constexpr std::size_t kMinPoseRecomputeCorrespondences = 10;
 constexpr std::size_t kMinPoseRecomputeInliers = 20;
+constexpr std::size_t kMaxDepthLandmarksPerKeyframe = 600;
 
 struct PoseChange {
     double translation = std::numeric_limits<double>::infinity();
@@ -351,9 +352,43 @@ void Tracking::createLandmarksFromDepth(Keyframe::Ptr kf) {
     int created = 0;
     static unsigned long depth_track_lm_id = 300000;
 
-    for (size_t i = 0; i < kf->keypoints_.size(); ++i) {
-        if (kf->landmarks_[i]) continue;  // Already has a landmark
+    struct DepthCandidate {
+        std::size_t keypoint_index = 0;
+        float depth = 0.0f;
+    };
+    std::vector<DepthCandidate> depth_candidates;
+    depth_candidates.reserve(kf->keypoints_.size());
 
+    for (size_t i = 0; i < kf->keypoints_.size(); ++i) {
+        if (kf->landmarks_[i]) continue;
+        const auto& keypoint = kf->keypoints_[i];
+        const float depth = kf->getDepth(keypoint.pt.x, keypoint.pt.y);
+        if (depth <= 0.0f || depth > kMaxDepthLandmarkMeters) {
+            continue;
+        }
+        depth_candidates.push_back({i, depth});
+    }
+
+    std::sort(depth_candidates.begin(), depth_candidates.end(),
+              [&](const DepthCandidate& lhs, const DepthCandidate& rhs) {
+                  const auto& kp_lhs = kf->keypoints_[lhs.keypoint_index];
+                  const auto& kp_rhs = kf->keypoints_[rhs.keypoint_index];
+                  if (kp_lhs.octave != kp_rhs.octave) {
+                      return kp_lhs.octave < kp_rhs.octave;
+                  }
+                  if (kp_lhs.response != kp_rhs.response) {
+                      return kp_lhs.response > kp_rhs.response;
+                  }
+                  if (lhs.depth != rhs.depth) {
+                      return lhs.depth < rhs.depth;
+                  }
+                  return lhs.keypoint_index < rhs.keypoint_index;
+              });
+
+    const std::size_t max_candidates =
+        std::min(kMaxDepthLandmarksPerKeyframe, depth_candidates.size());
+    for (std::size_t candidate_idx = 0; candidate_idx < max_candidates; ++candidate_idx) {
+        const std::size_t i = depth_candidates[candidate_idx].keypoint_index;
         auto lm = createDepthLandmark(kf, i, depth_track_lm_id);
         if (!lm) {
             continue;
