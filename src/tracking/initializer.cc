@@ -10,8 +10,46 @@ namespace svslam {
 namespace {
 
 constexpr float kInitLoweRatio = 0.75f;
-// Minimum median bearing parallax (degrees) for F-based initialization; rejects tiny-baseline poses.
-constexpr float kInitMedianParallaxDeg = 0.6f;
+constexpr float kInitMedianParallaxDeg = 0.8f;
+constexpr float kInitHomographyMinParallaxDeg = 1.0f;
+constexpr float kInitPointParallaxDeg = 0.35f;
+constexpr double kInitMaxReprojErrorPx = 3.0;
+constexpr int kInitMinTriangulatedPoints = 70;
+
+double computeBearingParallaxRad(const Camera::Ptr& camera,
+                                 const Eigen::Matrix3d& R_21,
+                                 const cv::Point2f& pt_ref,
+                                 const cv::Point2f& pt_cur) {
+    if (!camera) {
+        return 0.0;
+    }
+
+    Vec3 ray_ref = camera->unproject(Vec2(pt_ref.x, pt_ref.y));
+    Vec3 ray_cur = camera->unproject(Vec2(pt_cur.x, pt_cur.y));
+    if (ray_ref.norm() < 1e-9 || ray_cur.norm() < 1e-9) {
+        return 0.0;
+    }
+
+    ray_ref.normalize();
+    ray_cur.normalize();
+
+    const Vec3 ray_ref_in_cur = R_21 * ray_ref;
+    const double cos_angle = std::clamp(ray_ref_in_cur.dot(ray_cur), -1.0, 1.0);
+    return std::acos(cos_angle);
+}
+
+double computeReprojectionErrorPx(const Camera::Ptr& camera,
+                                  const Vec3& point_c,
+                                  const cv::Point2f& observed_px) {
+    if (!camera || !point_c.allFinite() || point_c.z() <= 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    const Vec2 projected = camera->project(point_c);
+    const double dx = static_cast<double>(observed_px.x) - projected.x();
+    const double dy = static_cast<double>(observed_px.y) - projected.y();
+    return std::sqrt(dx * dx + dy * dy);
+}
 
 }  // namespace
 
@@ -69,23 +107,25 @@ bool Initializer::initialize(Frame::Ptr frame_cur, float sigma, int max_iteratio
 
     // 3. Select model
     float ratio = score_H / (score_H + score_F + 1e-5);
-    bool use_H = ratio > 0.40; // Threshold from ORB-SLAM
+    const int min_triangulated = kInitMinTriangulatedPoints;
+    bool use_H = ratio > 0.50f;
 
     cv::Mat K = frame_ref_->camera_->K();
     
     bool success = false;
     if (use_H && H_found) {
         std::cout << "Initializer: Selecting Homography" << std::endl;
-        success = reconstructH(inliers_H, H21, K, T_c1_c2_, triangulated_points_, is_triangulated_, 1.0, 50);
+        success = reconstructH(inliers_H, H21, K, T_c1_c2_, triangulated_points_, is_triangulated_,
+                               kInitHomographyMinParallaxDeg, min_triangulated);
         if (!success && F_found) {
             std::cout << "Initializer: Homography reconstruction failed, falling back to Fundamental Matrix" << std::endl;
             success = reconstructF(inliers_F, F21, K, T_c1_c2_, triangulated_points_, is_triangulated_,
-                                     kInitMedianParallaxDeg, 50);
+                                   kInitMedianParallaxDeg, min_triangulated);
         }
     } else if (F_found) {
         std::cout << "Initializer: Selecting Fundamental Matrix" << std::endl;
         success = reconstructF(inliers_F, F21, K, T_c1_c2_, triangulated_points_, is_triangulated_,
-                              kInitMedianParallaxDeg, 50);
+                               kInitMedianParallaxDeg, min_triangulated);
     }
 
     if (!success) {
@@ -217,6 +257,7 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
     Eigen::Vector3d t_eig;
     cv::cv2eigen(R, R_eig);
     cv::cv2eigen(t, t_eig);
+    const double min_point_parallax_rad = kInitPointParallaxDeg * (std::acos(-1.0) / 180.0);
     
     // Normalize rotation to satisfy Sophus orthogonality check
     Eigen::Quaterniond q(R_eig);
@@ -259,6 +300,8 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
     int rej_nonfinite = 0;
     int rej_z1 = 0;
     int rej_z2 = 0;
+    int rej_parallax = 0;
+    int rej_reproj = 0;
     for(size_t i=0; i<matches_.size(); ++i) {
         if(!inliers[i]) continue;
         
@@ -308,6 +351,29 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
                  continue;
              }
 
+             const Vec3 p_c1(x, y, z);
+             const Vec3 p_c2(p3d_c2.at<double>(0, 0),
+                             p3d_c2.at<double>(1, 0),
+                             p3d_c2.at<double>(2, 0));
+             const double parallax_rad =
+                 computeBearingParallaxRad(frame_ref_->camera_, R_eig, kps_ref_[i], kps_cur_[i]);
+             if (parallax_rad < min_point_parallax_rad) {
+                 rej_parallax++;
+                 compact_idx++;
+                 continue;
+             }
+
+             const double reproj_err_1 =
+                 computeReprojectionErrorPx(frame_ref_->camera_, p_c1, kps_ref_[i]);
+             const double reproj_err_2 =
+                 computeReprojectionErrorPx(frame_ref_->camera_, p_c2, kps_cur_[i]);
+             if (reproj_err_1 > kInitMaxReprojErrorPx ||
+                 reproj_err_2 > kInitMaxReprojErrorPx) {
+                 rej_reproj++;
+                 compact_idx++;
+                 continue;
+             }
+
              cv::Point3f p3d(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
              points[i] = p3d;
              triangulated_points_[i] = p3d;
@@ -323,8 +389,16 @@ bool Initializer::reconstructF(std::vector<bool>& inliers, cv::Mat& F21, cv::Mat
               << " rej_nonfinite=" << rej_nonfinite
               << " rej_z1=" << rej_z1
               << " rej_z2=" << rej_z2
+              << " rej_parallax=" << rej_parallax
+              << " rej_reproj=" << rej_reproj
               << " inlier_mask_size=" << mask.rows
               << std::endl;
+
+    if (tri_good < min_triangulated) {
+        std::cout << "Initializer: Rejecting F: triangulated support "
+                  << tri_good << " < " << min_triangulated << std::endl;
+        return false;
+    }
 
     points = triangulated_points_;
     triangulated = is_triangulated_;
@@ -341,7 +415,10 @@ bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat
     cv::Mat T1 = cv::Mat::eye(3, 4, CV_64F);
     cv::Mat P1 = K * T1;
     
-    double best_good_points = 0;
+    const double min_parallax_rad = min_parallax * (std::acos(-1.0) / 180.0);
+    const double min_point_parallax_rad = kInitPointParallaxDeg * (std::acos(-1.0) / 180.0);
+    int best_good_points = 0;
+    double best_median_parallax = 0.0;
     int best_solution = -1;
     std::vector<bool> best_triangulated;
     std::vector<cv::Point3f> best_points;
@@ -349,6 +426,8 @@ bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat
     for (int i=0; i<solutions; ++i) {
         cv::Mat R = Rs[i];
         cv::Mat t = ts[i];
+        Eigen::Matrix3d R_eig;
+        cv::cv2eigen(R, R_eig);
 
         const double t_norm = cv::norm(t);
         if (t_norm > 1e-9) {
@@ -363,6 +442,8 @@ bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat
         std::vector<bool> current_triangulated(matches_.size(), false);
         std::vector<cv::Point3f> current_points(matches_.size(), cv::Point3f(0.f, 0.f, 0.f));
         int n_good = 0;
+        std::vector<double> current_parallax_rad;
+        current_parallax_rad.reserve(matches_.size());
         
         for(size_t j=0; j<matches_.size(); ++j) {
             if(!inliers[j]) continue;
@@ -394,15 +475,47 @@ bool Initializer::reconstructH(std::vector<bool>& inliers, cv::Mat& H21, cv::Mat
                 
                 cv::Mat p3d_c2 = R * p3d_mat + t;
                 if (p3d_c2.at<double>(2,0) > 0) {
+                    const Vec3 p_c1(p3d.x, p3d.y, p3d.z);
+                    const Vec3 p_c2(p3d_c2.at<double>(0, 0),
+                                    p3d_c2.at<double>(1, 0),
+                                    p3d_c2.at<double>(2, 0));
+                    const double parallax_rad = computeBearingParallaxRad(
+                        frame_ref_->camera_, R_eig, kps_ref_[j], kps_cur_[j]);
+                    if (parallax_rad < min_point_parallax_rad) {
+                        continue;
+                    }
+
+                    const double reproj_err_1 = computeReprojectionErrorPx(
+                        frame_ref_->camera_, p_c1, kps_ref_[j]);
+                    const double reproj_err_2 = computeReprojectionErrorPx(
+                        frame_ref_->camera_, p_c2, kps_cur_[j]);
+                    if (reproj_err_1 > kInitMaxReprojErrorPx ||
+                        reproj_err_2 > kInitMaxReprojErrorPx) {
+                        continue;
+                    }
+
                     current_triangulated[j] = true;
                     current_points[j] = p3d;
+                    current_parallax_rad.push_back(parallax_rad);
                     n_good++;
                 }
             }
         }
-        
-        if (n_good > best_good_points && n_good > min_triangulated) {
+
+        if (current_parallax_rad.empty() || n_good < min_triangulated) {
+            continue;
+        }
+
+        std::sort(current_parallax_rad.begin(), current_parallax_rad.end());
+        const double median_parallax = current_parallax_rad[current_parallax_rad.size() / 2];
+        if (median_parallax < min_parallax_rad) {
+            continue;
+        }
+
+        if (n_good > best_good_points ||
+            (n_good == best_good_points && median_parallax > best_median_parallax)) {
             best_good_points = n_good;
+            best_median_parallax = median_parallax;
             best_solution = i;
             best_triangulated = current_triangulated;
             best_points = current_points;
