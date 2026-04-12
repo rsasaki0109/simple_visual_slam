@@ -67,14 +67,38 @@ flowchart LR
 
 ## Results
 
-Absolute Trajectory Error (ATE) mean in meters, evaluated with Sim(3) alignment. The table below is a single-run snapshot; for repeated evaluation, run `bash scripts/eval_all.sh --repeat N` to export aggregate `mean/std` summaries into `eval_results/summary.txt`.
+Absolute Trajectory Error (ATE) mean in meters, evaluated with Sim(3) alignment. The table below is the current regression-gate snapshot; for repeated evaluation, run `bash scripts/eval_all.sh --repeat N` to export aggregate `mean/std` summaries into `eval_results/summary.txt`.
 
 | Sequence | Monocular | + Depth | + Depth + Accel |
 |---|---|---|---|
-| Seq A (small motion) | 0.023 | 0.011 | 0.011 |
-| Seq B (room-scale) | 0.845 | 0.227 | 0.235 |
+| Seq A (small motion) | 0.0223 | 0.0109 | 0.011 |
+| Seq B (room-scale) | 0.2688 | 0.1289 | 0.235 |
 
-Depth sensor integration significantly improves metric-scale accuracy. Accelerometer data provides gravity alignment and helps with stationary detection but shows marginal improvement when depth is already available.
+Depth sensor integration significantly improves metric-scale accuracy. Accelerometer data provides gravity alignment and helps with stationary detection, but its effect on ATE is sequence-dependent once depth is already available.
+
+### Comparison with stella_vslam
+
+Fair head-250 comparison on the same TUM windows and `evo_ape` settings shows `stella_vslam` ahead in all four scenarios, both in `--repro-eval` mode and with loop closing enabled.
+
+**Repro-eval (`--repro-eval`, loop closing disabled):**
+
+| Scenario | Modality | SimpleVisualSLAM ATE (m) | stella_vslam ATE (m, head-250) | Delta (Simple - stella) (m) | Winner |
+| --- | --- | ---: | ---: | ---: | --- |
+| `xyz_depth` | RGB-D | 0.01136912 | 0.00889256 | 0.00247656 | `stella_vslam` |
+| `xyz_mono` | Mono | 0.04827879 | 0.01413570 | 0.03414309 | `stella_vslam` |
+| `room_depth` | RGB-D | 0.08606639 | 0.02110508 | 0.06496131 | `stella_vslam` |
+| `room_mono` | Mono | 0.19982044 | 0.02743546 | 0.17238498 | `stella_vslam` |
+
+**Loop-enabled (ORB vocabulary loaded; median ATE over 3 runs):**
+
+| Scenario | Modality | SimpleVisualSLAM Median ATE (m, 3 runs) | Raw ATEs (m) | stella_vslam ATE (m, head-250) | Delta (Simple - stella) (m) | Winner |
+| --- | --- | ---: | --- | ---: | ---: | --- |
+| `xyz_depth` | RGB-D | 0.01139951 | `0.01139951, 0.01108985, 0.01142678` | 0.00889256 | 0.00250695 | `stella_vslam` |
+| `xyz_mono` | Mono | 0.04529873 | `0.03893269, 0.04756870, 0.04529873` | 0.01413570 | 0.03116303 | `stella_vslam` |
+| `room_depth` | RGB-D | 0.08255800 | `0.08461199, 0.08255800, 0.08083409` | 0.02110508 | 0.06145292 | `stella_vslam` |
+| `room_mono` | Mono | 0.20024479 | `0.19253079, 0.20024479, 0.28880425` | 0.02743546 | 0.17280933 | `stella_vslam` |
+
+The `stella_eval` artifacts were not canonical 250-frame windows, so the comparison uses the first `250` poses from each provided `stella_vslam` trajectory as the fair head-window available from the supplied files. Enabling loop closing in SimpleVisualSLAM did not materially close the gap within that window.
 
 **Comparing to other OSS (stella_vslam, ORB-SLAM, …):** use the same TUM window, modality, and `evo_ape` flags or the numbers are not comparable. See [eval/comparison_protocol.md](eval/comparison_protocol.md). **Start with baseline verification:** `bash scripts/verify_comparison_benchmark.sh xyz_depth` (presets: `xyz_mono`, `room_mono`, …) prints mean ATE with the same `evo_ape` extras as `eval/regression_baselines.json`. This project’s design target is to stay **BSD-clean** and **readable** while competing on selected clips—especially where **RGB-D or DL depth** is in play—not to win every KITTI row.
 
@@ -144,6 +168,10 @@ cmake .. -DUSE_DEPTH_DL=ON
 make -j$(nproc)
 ```
 
+### Tests
+
+Run `ctest --output-on-failure` from `build/`. The current CTest suite registers `51` tests in the default build, or `55` with `-DUSE_DEPTH_DL=ON`.
+
 ### Repeated Evaluation
 
 ```bash
@@ -154,7 +182,7 @@ This runs each dataset/mode pair five times, keeps per-run trajectories and logs
 
 ## Usage
 
-All modes: run `./build/run_mono --help` for TUM flags (`--repro-eval`, `--run-summary-json`, `--strict-exit`, calibration JSON, etc.).
+All modes: run `./build/run_mono --help` for TUM flags (`--repro-eval`, `--run-summary-json`, `--strict-exit`, `--depth-model`, `--metric-depth-model`, calibration JSON, etc.).
 
 ### Video File
 
@@ -231,7 +259,10 @@ make -j$(nproc)
 
 ```bash
 ./build/run_mono --depth-model models/depth_anything_v2_small.onnx path/to/video.mp4
+./build/run_mono --metric-depth-model models/depth_anything_v2_small.onnx path/to/video.mp4
 ```
+
+Use `--metric-depth-model` for models that already predict metric depth in meters. Specify only one of `--depth-model` or `--metric-depth-model`.
 
 When enabled, the system runs depth inference on each keyframe and uses the predicted depth to:
 - Initialize the map from a single frame (no two-view initialization required)

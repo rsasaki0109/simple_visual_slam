@@ -125,7 +125,7 @@ private:
     double min_loop_score_ = 0.01;
     int min_loop_inliers_ = 30;
     int correction_window_size_ = 30;
-    int loop_cooldown_kf_ = 120;
+    int loop_cooldown_kf_ = 200;
     int sim3_ransac_iterations_ = 200;
     double max_sim3_residual_ = 0.25;
     double min_sim3_scale_ = 0.7;
