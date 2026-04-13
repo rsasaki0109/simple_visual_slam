@@ -62,3 +62,35 @@
 - Reference point: the loop-enabled `room_depth` head-250 median above was `0.08255800 m`, so the longer `600`-frame run is much less stable.
 - Inference from logs: the loop-correction stabilization path is active, not dead code. `rep2` and `rep3` both logged `TrackLocalMap: REJECTED - Recovery stabilization kept prior pose` and then forced reference refreshes after pending-loop-correction expiry, while `rep1` completed without stabilization rejections and had the best ATE.
 - Net assessment: the loop stabilization changes help catch some bad post-loop handoffs, but they do not yet make `room_depth` reliable over `600` frames with loop closing enabled; two of the three runs still ended with large drift.
+
+## Covisibility-Weighted Loop-Enabled Comparison (room_depth)
+
+| Run | ATE (m) | Frames | Notes |
+| --- | ---: | ---: | --- |
+| `rep1` | 0.08620279 | 250 | Full run completed and wrote `250` poses |
+| `rep2` | 0.08695826 | 250 | Loop edge confidence logged with `weight=7`; pose graph reported `covisibility_edges=424` and `loop_edges=1` |
+| `rep3` | 0.07599828 | 250 | Loop edge confidence logged with `weight=7` |
+| `median` | 0.08620279 | 250 | `+0.00364479 m` vs previous loop-enabled median `0.08255800` |
+
+- Generated: `2026-04-14T10:06:11+09:00`
+- SimpleVisualSLAM commit: `a32d904f66dbb77419ebc66529f6d5b1d6748302`
+- Build: `build_codex`
+- Command: `build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room --depth --max-frames 250 --no-viz data/ORBvoc.txt`
+- Covisibility-weight verification: run logs include `LoopClosing: loop edge confidence ... weight=7`, confirming weighted loop-edge insertion is active with loop closing enabled on this scenario.
+- Comparison to the prior loop-enabled `room_depth` median (`0.08255800`): this 3-run sample is worse by `0.00364479 m`, so the new weighting did not improve the median on this check.
+
+## Metric Depth (DL) Results
+
+| Run | Frames | ATE (m) | Notes |
+| --- | ---: | ---: | --- |
+| `room` | 50 | 0.01645454 | Loaded `models/depth_anything_v2_small.onnx`; finished with `50` poses |
+| `room` | 250 | 0.38429766 | Loaded `models/depth_anything_v2_small.onnx`; finished with `250` poses; loop candidates were found but `computeSim3` rejected them |
+
+- Generated: `2026-04-14T10:06:11+09:00`
+- SimpleVisualSLAM commit: `a32d904f66dbb77419ebc66529f6d5b1d6748302`
+- Build: `build_codex3`
+- Build flags: `-DBUILD_TESTS=ON -DUSE_DEPTH_DL=ON`
+- Command: `build_codex3/run_mono --tum data/tum/rgbd_dataset_freiburg1_room --metric-depth-model models/depth_anything_v2_small.onnx --max-frames {50,250} --no-viz`
+- Model-load verification: logs show `MetricDepthEstimator: Loaded model from models/depth_anything_v2_small.onnx`.
+- Loop-closing note: these metric-depth runs also loaded `data/ORBvoc.txt` and started `LoopClosing`; in the `250`-frame run, loop candidates at `KF 106` and `KF 109` were rejected by `computeSim3`, so no loop correction was applied within the measured window.
+- Outcome: metric depth is functional on `room`, but the `250`-frame ATE (`0.38429766 m`) is much worse than the sensor-depth loop-enabled `room_depth` median measured above (`0.08620279 m`).

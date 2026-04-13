@@ -1336,9 +1336,9 @@ bool Tracking::trackReferenceKeyframe() {
         if (ms.size() < 2) continue;
         const auto& m1 = ms[0];
         const auto& m2 = ms[1];
-        // Stricter Lowe ratio test (0.6) + tighter absolute distance gate (50)
+        // Favor cleaner frame-to-frame propagation for monocular tracking.
         if (m1.distance > 65.0f) continue;
-        if (m1.distance >= 0.75f * m2.distance) continue;
+        if (m1.distance >= 0.70f * m2.distance) continue;
         candidates.push_back({m1.queryIdx, m1.trainIdx, m1.distance});
     }
 

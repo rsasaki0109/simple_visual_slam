@@ -114,6 +114,7 @@ void LocalMapping::removeLandmark(const Landmark::Ptr& lm) {
 
 void LocalMapping::mapPointCulling() {
     int culled = 0;
+    const bool mono_mode = current_processed_kf_ && current_processed_kf_->depth_image_.empty();
     for (auto it = recent_landmarks_.begin(); it != recent_landmarks_.end();) {
         const Landmark::Ptr lm = it->first;
         const unsigned long created_at = it->second;
@@ -132,8 +133,11 @@ void LocalMapping::mapPointCulling() {
         const unsigned long age = processed_keyframe_count_ > created_at
             ? processed_keyframe_count_ - created_at
             : 0;
-        const bool should_cull = (observation_count <= 1 && age >= 1) ||
-                                 (observation_count < 3 && age >= 2);
+        const bool should_cull = mono_mode
+            ? ((observation_count <= 1 && age >= 1) ||
+               (observation_count < 3 && age >= 1))
+            : ((observation_count <= 1 && age >= 1) ||
+               (observation_count < 3 && age >= 2));
         const bool no_longer_recent = (observation_count >= 3) || (age >= 3);
 
         if (should_cull) {
@@ -235,9 +239,14 @@ void LocalMapping::createNewMapPoints() {
         SE3 T_cw2 = neighbor->T_cw_;
         Eigen::Vector3d Ow2 = T_cw2.so3().inverse() * -T_cw2.translation();
 
-        // Baseline check (relaxed for close keyframes)
+        const bool mono_pair =
+            current_processed_kf_->depth_image_.empty() &&
+            neighbor->depth_image_.empty();
+
+        // Monocular triangulation is much less stable on very short baselines.
+        const double min_baseline = mono_pair ? 0.02 : 0.01;
         double baseline = (Ow1 - Ow2).norm();
-        if (baseline < 0.01) continue; // Very small baseline skip
+        if (baseline < min_baseline) continue;
 
         std::vector<int> unmatched_indices_2;
         cv::Mat descriptors_2;
