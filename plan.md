@@ -47,9 +47,9 @@ What the project is trying to become:
 
 | Item | Current value |
 | --- | --- |
-| HEAD | `121e0445cd9a42cad29e8ef64be9e0239109443a` |
-| HEAD short | `121e044` |
-| HEAD subject | `Revamp README with demo images, Quick Start, and architecture diagram.` |
+| HEAD | `ef8e04e` |
+| HEAD short | `ef8e04e` |
+| HEAD subject | `Tune BA for xyz_depth: depth sigma 0.015, covis KF 20, BA iter 20.` |
 | Version | `SimpleVisualSLAM 0.2.0` |
 | Build used for this snapshot | `build_codex` |
 | Recent change volume | `73 files changed, 7646 insertions(+), 1269 deletions(-)` in `HEAD~16..HEAD` |
@@ -1093,7 +1093,72 @@ python3 scripts/print_ate_mean.py \
 
 ---
 
-## 14. Non-Goals
+## 14. stella_vslam Battle Log (2026-04-13〜14)
+
+Every parameter change tried to close the gap, with measured results:
+
+### xyz_depth (target: < 0.00889, stella baseline)
+
+| Change | ATE | vs baseline | Verdict |
+|--------|-----|-------------|---------|
+| Baseline (before tuning) | 0.01214 | — | — |
+| depth sigma 0.02→0.015 | 0.01176 | -3% | **kept** |
+| Huber loss 1.0→0.5 | 0.01321 | +9% | reverted |
+| search radius 100→80 | 0.01207 | -0.6% | reverted (negligible) |
+| covis KF 15→20 | 0.01111 | -8% | **kept** |
+| sigma 0.015 + covis 20 + BA iter 20 | **0.01104** | **-9%** | **committed (ef8e04e)** |
+
+Best achieved: **0.01104** — still 1.24x behind stella (0.00889). The gap is likely structural.
+
+### xyz_mono
+
+| Change | ATE | Verdict |
+|--------|-----|---------|
+| Lowe ratio 0.75→0.70 | 0.0413 | **broke gate** (ceiling 0.030) |
+| Lowe ratio reverted to 0.75 | 0.0223 | **recovered (f0dd425)** |
+
+### Cross-scenario effects
+
+| Change | xyz_depth | xyz_mono | room_depth | room_mono |
+|--------|-----------|----------|------------|-----------|
+| Lowe 0.70 | neutral | **broke** | neutral | improved |
+| Covis 20 + sigma 0.015 | improved | neutral | neutral | neutral |
+
+### Lessons learned
+
+1. **Lowe ratio is globally sensitive** — 0.70 helps room_mono but destroys xyz_mono. Keep at 0.75.
+2. **Depth sigma helps only depth scenarios** — 0.015 is better than 0.02 for sensor depth.
+3. **Covis window 20 is safe** — unlike the earlier attempt (before IRLS), it now passes all gates.
+4. **Huber tightening hurts** — 0.5 is too aggressive, outlier rejection becomes noise rejection.
+5. **The xyz_depth gap (1.24x) may be structural** — Ceres dense BA vs g2o sparse Schur, map management differences.
+
+### What the next agent should try (ordered by expected impact)
+
+**For xyz_depth (0.01104 → target < 0.00889):**
+1. `src/backend/optimizer.cc`: Try adaptive Huber (start at 1.0, reduce to 0.7 after 5 iterations)
+2. `src/tracking/tracking.cc:trackLocalMap()`: Add depth prior weighting in PnP — currently PnP treats all points equally, but depth-backed points should be more trusted
+3. `src/tracking/tracking.cc:trackLocalMap()`: Try 3-pass PnP (current: 2-pass) with progressively tighter reproj threshold (8px → 5px → 3px)
+4. `src/backend/optimizer.cc:bundleAdjustment()`: Try SPARSE_SCHUR solver for local BA (currently uses DENSE_SCHUR)
+
+**For room_depth (0.1289 → target < 0.02):**
+1. Fix 600-frame instability first (currently 0.109-0.124m best)
+2. `src/loop_closing/loop_closing.cc`: Improve Sim3 estimation quality — current RANSAC only does 200 iterations
+3. `src/backend/optimizer.cc:poseGraphOptimization()`: The IRLS 2-pass is in, but try 3-pass with tighter Cauchy threshold
+
+**For room_mono (0.2688 → target < 0.027):**
+1. This is 9.8x behind and likely requires fundamentally better mono map maintenance
+2. Focus on landmark lifecycle: creation, culling, and observation propagation
+3. Consider more aggressive keyframe insertion for mono (every 10 frames instead of 20)
+
+### What NOT to do
+
+- Don't change Lowe ratio below 0.75 (breaks xyz_mono, verified)
+- Don't increase covis KF above 20 without checking all 5 gates
+- Don't add g2o (GPL license conflict with BSD-2-Clause)
+- Don't claim stella_vslam is beaten until reproduced 3x with identical protocol
+- Don't modify regression gate semantics without updating baselines
+
+## 15. Non-Goals
 
 Do **not** spend time on these unless a human explicitly reprioritizes them:
 
