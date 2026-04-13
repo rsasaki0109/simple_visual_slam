@@ -1,11 +1,14 @@
 #include "io/euroc_dataset.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 namespace svslam {
 
@@ -23,28 +26,124 @@ static bool startsWith(const std::string& s, const std::string& prefix) {
     return s.rfind(prefix, 0) == 0;
 }
 
+static bool parseArrayLine(const std::string& line, const std::string& key, std::vector<double>& values) {
+    if (!startsWith(line, key)) {
+        return false;
+    }
+
+    const auto pos = line.find('[');
+    const auto pos2 = line.find(']');
+    if (pos == std::string::npos || pos2 == std::string::npos || pos2 <= pos) {
+        return false;
+    }
+
+    values.clear();
+    const std::string body = line.substr(pos + 1, pos2 - pos - 1);
+    std::stringstream ss(body);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        tok = trim(tok);
+        if (tok.empty()) continue;
+        values.push_back(std::stod(tok));
+    }
+
+    return true;
+}
+
 }  // namespace
 
-EurocDataset::EurocDataset(const std::string& seq_dir) : seq_dir_(seq_dir) {
-    const std::string cam0_dir = (std::filesystem::path(seq_dir_) / "mav0" / "cam0").string();
-    const std::string sensor_yaml = (std::filesystem::path(cam0_dir) / "sensor.yaml").string();
-    const std::string data_csv = (std::filesystem::path(cam0_dir) / "data.csv").string();
-    const std::string data_dir = (std::filesystem::path(cam0_dir) / "data").string();
+EurocDataset::EurocDataset(const std::string& seq_dir) : EurocDataset(seq_dir, nullptr, false) {}
 
-    if (!std::filesystem::exists(sensor_yaml)) {
-        error_ = "sensor.yaml not found: " + sensor_yaml;
+EurocDataset::EurocDataset(const std::string& seq_dir, bool load_stereo) : EurocDataset(seq_dir, nullptr, load_stereo) {}
+
+EurocDataset::EurocDataset(const std::string& seq_dir,
+                           const EurocPinholeCalibration& calib,
+                           bool load_stereo)
+    : EurocDataset(seq_dir, &calib, load_stereo) {}
+
+EurocDataset::EurocDataset(const std::string& seq_dir,
+                           const EurocPinholeCalibration* calib,
+                           bool load_stereo)
+    : seq_dir_(seq_dir), stereo_enabled_(load_stereo) {
+    const std::filesystem::path cam0_dir = std::filesystem::path(seq_dir_) / "mav0" / "cam0";
+    const std::filesystem::path cam1_dir = std::filesystem::path(seq_dir_) / "mav0" / "cam1";
+
+    const std::string cam0_sensor_yaml = (cam0_dir / "sensor.yaml").string();
+    const std::string cam0_data_csv = (cam0_dir / "data.csv").string();
+    const std::string cam0_data_dir = (cam0_dir / "data").string();
+
+    const std::string cam1_sensor_yaml = (cam1_dir / "sensor.yaml").string();
+    const std::string cam1_data_csv = (cam1_dir / "data.csv").string();
+    const std::string cam1_data_dir = (cam1_dir / "data").string();
+
+    if (!std::filesystem::exists(cam0_data_csv)) {
+        error_ = "data.csv not found: " + cam0_data_csv;
         return;
     }
-    if (!std::filesystem::exists(data_csv)) {
-        error_ = "data.csv not found: " + data_csv;
+    if (stereo_enabled_ && !std::filesystem::exists(cam1_data_csv)) {
+        error_ = "cam1 data.csv not found: " + cam1_data_csv;
         return;
     }
 
-    if (!loadSensorYaml(sensor_yaml)) return;
-    if (!loadDataCsv(data_csv, data_dir)) return;
+    EurocPinholeCalibration::Camera cam0_calib;
+    bool have_cam0_calib = false;
+    if (std::filesystem::exists(cam0_sensor_yaml)) {
+        if (loadSensorYaml(cam0_sensor_yaml, cam0_calib)) {
+            have_cam0_calib = true;
+        } else if (calib == nullptr) {
+            return;
+        } else {
+            error_.clear();
+        }
+    }
+    if (calib != nullptr) {
+        cam0_calib = calib->cam0;
+        have_cam0_calib = true;
+    }
+    if (!have_cam0_calib) {
+        error_ = "cam0 sensor.yaml not found and no external EuRoC calibration provided";
+        return;
+    }
+
+    EurocPinholeCalibration::Camera cam1_calib;
+    bool have_cam1_calib = false;
+    if (stereo_enabled_ && std::filesystem::exists(cam1_sensor_yaml)) {
+        if (loadSensorYaml(cam1_sensor_yaml, cam1_calib)) {
+            have_cam1_calib = true;
+        } else if (calib == nullptr || !calib->has_cam1) {
+            return;
+        } else {
+            error_.clear();
+        }
+    }
+    if (stereo_enabled_ && calib != nullptr && calib->has_cam1) {
+        cam1_calib = calib->cam1;
+        have_cam1_calib = true;
+    }
+    if (stereo_enabled_ && !have_cam1_calib) {
+        error_ = "cam1 sensor.yaml not found and no external cam1 calibration provided";
+        return;
+    }
+
+    initCalibration(cam0_calib, K_, dist_coeffs_, new_K_, undist_map1_, undist_map2_);
+    if (stereo_enabled_) {
+        initCalibration(cam1_calib, right_K_, right_dist_coeffs_, right_new_K_, right_undist_map1_,
+                        right_undist_map2_);
+    }
+
+    std::vector<CsvEntry> left_entries;
+    if (!loadDataCsv(cam0_data_csv, cam0_data_dir, left_entries)) return;
+
+    if (stereo_enabled_) {
+        std::vector<CsvEntry> right_entries;
+        if (!loadDataCsv(cam1_data_csv, cam1_data_dir, right_entries)) return;
+        if (!buildStereoEntries(left_entries, right_entries)) return;
+    } else {
+        buildMonoEntries(left_entries);
+    }
 
     if (entries_.empty()) {
-        error_ = "no entries in data.csv";
+        error_ = stereo_enabled_ ? "no stereo entries in data.csv" : "no entries in data.csv";
         return;
     }
 }
@@ -55,6 +154,12 @@ const std::string& EurocDataset::error() const { return error_; }
 
 const cv::Mat& EurocDataset::K() const { return K_; }
 
+const cv::Mat& EurocDataset::rightK() const { return right_K_; }
+
+bool EurocDataset::hasStereo() const {
+    return stereo_enabled_ && !entries_.empty() && !entries_.front().right_image_path.empty();
+}
+
 bool EurocDataset::next(cv::Mat& image, double& timestamp_sec) {
     if (!isValid()) return false;
     if (index_ >= entries_.size()) return false;
@@ -62,28 +167,37 @@ bool EurocDataset::next(cv::Mat& image, double& timestamp_sec) {
     const auto& e = entries_[index_++];
     timestamp_sec = e.timestamp_sec;
 
-    image = cv::imread(e.image_path, cv::IMREAD_GRAYSCALE);
-    if (image.empty()) {
-        error_ = "failed to read image: " + e.image_path;
-        return false;
-    }
-
-    return true;
+    return loadImage(e.left_image_path, undist_map1_, undist_map2_, image);
 }
 
-bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path) {
+bool EurocDataset::next(cv::Mat& left_image, cv::Mat& right_image, double& timestamp_sec) {
+    if (!isValid()) return false;
+    if (!hasStereo()) {
+        error_ = "stereo mode not enabled for this EuRoC dataset";
+        return false;
+    }
+    if (index_ >= entries_.size()) return false;
+
+    const auto& e = entries_[index_++];
+    timestamp_sec = e.timestamp_sec;
+
+    if (!loadImage(e.left_image_path, undist_map1_, undist_map2_, left_image)) {
+        return false;
+    }
+    return loadImage(e.right_image_path, right_undist_map1_, right_undist_map2_, right_image);
+}
+
+bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path, EurocPinholeCalibration::Camera& calib) {
     std::ifstream ifs(sensor_yaml_path);
     if (!ifs.is_open()) {
         error_ = "failed to open sensor.yaml: " + sensor_yaml_path;
         return false;
     }
 
-    // Minimal parser for EuRoC sensor.yaml
-    // Example:
-    // intrinsics: [458.654, 457.296, 367.215, 248.375]
-    // resolution: [752, 480]
-    double fx = 0, fy = 0, cx = 0, cy = 0;
     bool got_intrinsics = false;
+    bool got_resolution = false;
+    std::vector<double> values;
+    calib = EurocPinholeCalibration::Camera();
 
     std::string line;
     while (std::getline(ifs, line)) {
@@ -91,29 +205,26 @@ bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path) {
         if (line.empty()) continue;
         if (line[0] == '#') continue;
 
-        if (startsWith(line, "intrinsics:")) {
-            auto pos = line.find('[');
-            auto pos2 = line.find(']');
-            if (pos == std::string::npos || pos2 == std::string::npos || pos2 <= pos) continue;
-            const std::string body = line.substr(pos + 1, pos2 - pos - 1);
-
-            std::vector<double> vals;
-            std::stringstream ss(body);
-            std::string tok;
-            while (std::getline(ss, tok, ',')) {
-                tok = trim(tok);
-                if (tok.empty()) continue;
-                vals.push_back(std::stod(tok));
-            }
-
-            if (vals.size() == 4) {
-                fx = vals[0];
-                fy = vals[1];
-                cx = vals[2];
-                cy = vals[3];
+        if (parseArrayLine(line, "intrinsics:", values)) {
+            if (values.size() >= 4) {
+                calib.fx = values[0];
+                calib.fy = values[1];
+                calib.cx = values[2];
+                calib.cy = values[3];
                 got_intrinsics = true;
-                break;
             }
+            continue;
+        }
+        if (parseArrayLine(line, "resolution:", values)) {
+            if (values.size() >= 2) {
+                calib.image_width = static_cast<int>(values[0]);
+                calib.image_height = static_cast<int>(values[1]);
+                got_resolution = true;
+            }
+            continue;
+        }
+        if (parseArrayLine(line, "distortion_coefficients:", values)) {
+            calib.distortion = values;
         }
     }
 
@@ -121,23 +232,23 @@ bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path) {
         error_ = "failed to parse intrinsics from sensor.yaml: " + sensor_yaml_path;
         return false;
     }
-
-    K_ = cv::Mat::eye(3, 3, CV_64F);
-    K_.at<double>(0, 0) = fx;
-    K_.at<double>(1, 1) = fy;
-    K_.at<double>(0, 2) = cx;
-    K_.at<double>(1, 2) = cy;
-
+    if (!got_resolution) {
+        calib.image_width = 752;
+        calib.image_height = 480;
+    }
     return true;
 }
 
-bool EurocDataset::loadDataCsv(const std::string& data_csv_path, const std::string& data_dir) {
+bool EurocDataset::loadDataCsv(const std::string& data_csv_path,
+                               const std::string& data_dir,
+                               std::vector<CsvEntry>& entries) {
     std::ifstream ifs(data_csv_path);
     if (!ifs.is_open()) {
         error_ = "failed to open data.csv: " + data_csv_path;
         return false;
     }
 
+    entries.clear();
     std::string line;
     bool first = true;
     while (std::getline(ifs, line)) {
@@ -169,18 +280,106 @@ bool EurocDataset::loadDataCsv(const std::string& data_csv_path, const std::stri
             // Some datasets store without extension; try adding .png
             const std::string img_path_png = img_path + ".png";
             if (std::filesystem::exists(img_path_png)) {
-                entries_.push_back({ts_sec, img_path_png});
+                entries.push_back({ts_ns, ts_sec, img_path_png});
                 continue;
             }
             continue;
         }
 
-        entries_.push_back({ts_sec, img_path});
+        entries.push_back({ts_ns, ts_sec, img_path});
+    }
+
+    if (entries.empty()) {
+        error_ = "no readable image entries from data.csv: " + data_csv_path;
+        return false;
+    }
+
+    return true;
+}
+
+bool EurocDataset::buildStereoEntries(const std::vector<CsvEntry>& left_entries,
+                                      const std::vector<CsvEntry>& right_entries) {
+    entries_.clear();
+
+    size_t left_idx = 0;
+    size_t right_idx = 0;
+    while (left_idx < left_entries.size() && right_idx < right_entries.size()) {
+        const long long left_ts = left_entries[left_idx].timestamp_ns;
+        const long long right_ts = right_entries[right_idx].timestamp_ns;
+
+        if (left_ts == right_ts) {
+            entries_.push_back({left_entries[left_idx].timestamp_sec, left_entries[left_idx].image_path,
+                                right_entries[right_idx].image_path});
+            ++left_idx;
+            ++right_idx;
+        } else if (left_ts < right_ts) {
+            ++left_idx;
+        } else {
+            ++right_idx;
+        }
     }
 
     if (entries_.empty()) {
-        error_ = "no readable image entries from data.csv: " + data_csv_path;
+        error_ = "no stereo pairs matched between cam0 and cam1";
         return false;
+    }
+
+    return true;
+}
+
+void EurocDataset::buildMonoEntries(const std::vector<CsvEntry>& left_entries) {
+    entries_.clear();
+    entries_.reserve(left_entries.size());
+    for (const auto& entry : left_entries) {
+        entries_.push_back({entry.timestamp_sec, entry.image_path, ""});
+    }
+}
+
+void EurocDataset::initCalibration(const EurocPinholeCalibration::Camera& calib,
+                                   cv::Mat& K,
+                                   cv::Mat& dist_coeffs,
+                                   cv::Mat& new_K,
+                                   cv::Mat& undist_map1,
+                                   cv::Mat& undist_map2) {
+    K = cv::Mat::eye(3, 3, CV_64F);
+    K.at<double>(0, 0) = calib.fx;
+    K.at<double>(1, 1) = calib.fy;
+    K.at<double>(0, 2) = calib.cx;
+    K.at<double>(1, 2) = calib.cy;
+
+    if (calib.distortion.empty()) {
+        dist_coeffs = cv::Mat();
+        new_K = cv::Mat();
+        undist_map1.release();
+        undist_map2.release();
+        return;
+    }
+
+    dist_coeffs.create(static_cast<int>(calib.distortion.size()), 1, CV_64F);
+    for (size_t i = 0; i < calib.distortion.size(); ++i) {
+        dist_coeffs.at<double>(static_cast<int>(i), 0) = calib.distortion[i];
+    }
+
+    const cv::Size img_size(calib.image_width, calib.image_height);
+    new_K = cv::getOptimalNewCameraMatrix(K, dist_coeffs, img_size, 0, img_size);
+    cv::initUndistortRectifyMap(K, dist_coeffs, cv::Mat(), new_K, img_size, CV_32FC1, undist_map1, undist_map2);
+    K = new_K.clone();
+}
+
+bool EurocDataset::loadImage(const std::string& path,
+                             const cv::Mat& undist_map1,
+                             const cv::Mat& undist_map2,
+                             cv::Mat& image) {
+    image = cv::imread(path, cv::IMREAD_GRAYSCALE);
+    if (image.empty()) {
+        error_ = "failed to read image: " + path;
+        return false;
+    }
+
+    if (!undist_map1.empty()) {
+        cv::Mat undistorted;
+        cv::remap(image, undistorted, undist_map1, undist_map2, cv::INTER_LINEAR);
+        image = undistorted;
     }
 
     return true;
