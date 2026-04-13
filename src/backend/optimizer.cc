@@ -189,7 +189,7 @@ int addDepthPriorResiduals(ceres::Problem& problem,
             continue;
         }
 
-        const double sigma = keyframe->depth_is_metric_ ? 0.02 : 0.2;
+        const double sigma = keyframe->depth_is_metric_ ? 0.015 : 0.2;
         const double weight = 1.0 / sigma;
         const auto& camera = keyframe->camera_;
         ceres::CostFunction* depth_cost = DepthPriorError::Create(
