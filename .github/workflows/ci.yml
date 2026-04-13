@@ -44,7 +44,13 @@ jobs:
 
       - name: Regression gate script (syntax)
         run: |
-          python3 -m py_compile scripts/eval_lib.py scripts/check_regression_gate.py scripts/build_leaderboard.py scripts/print_ate_mean.py
+          python3 -m py_compile scripts/eval_lib.py scripts/check_regression_gate.py scripts/build_leaderboard.py scripts/print_ate_mean.py scripts/generate_ci_test_data.py scripts/run_ci_smoke_regression.py
           python3 scripts/check_regression_gate.py --help
           python3 scripts/build_leaderboard.py --help
           python3 scripts/build_leaderboard.py --dry-run
+
+      - name: CI regression smoke test
+        continue-on-error: true
+        run: |
+          bash scripts/download_ci_test_data.sh
+          python3 scripts/run_ci_smoke_regression.py --build build --data data/ci_test --expected-poses 10 --max-frames 10 --max-mean-ate-m 0.5

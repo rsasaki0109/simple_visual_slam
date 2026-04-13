@@ -15,6 +15,7 @@
 #include "core/camera.h"
 #include "core/map.h"
 #include "io/euroc_dataset.h"
+#include "io/euroc_pinhole_calibration.h"
 #include "io/tum_dataset.h"
 #include "io/tum_pinhole_calibration.h"
 #include "io/map_io.h"
@@ -46,8 +47,12 @@ void print_help(std::ostream& os) {
        << "  run_mono --version | -V\n"
        << "  run_mono --help | -h\n"
        << "  run_mono <video_path> [ORBvocab.txt]\n"
-       << "  run_mono --euroc <sequence_dir> [ORBvocab.txt]\n"
+       << "  run_mono --euroc <sequence_dir> [options] [ORBvocab.txt]\n"
        << "  run_mono --tum <sequence_dir> [options] [ORBvocab.txt]\n"
+       << "\n"
+       << "EUROC OPTIONS\n"
+       << "  --euroc-camera-config <calib.json> Override cam0/cam1 pinhole intrinsics (+optional distortion)\n"
+       << "  --stereo                            Load/display cam0+cam1; tracking still uses cam0 only\n"
        << "\n"
        << "TUM OPTIONS\n"
        << "  --tum-camera-config <calib.json>   Pinhole intrinsics (+optional distortion); else fr1 defaults\n"
@@ -109,7 +114,7 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: run_mono --help   (full options)\n"
                   << "  ./run_mono --version | -V     (print semver from CMake project VERSION)\n"
                   << "  ./run_mono <video_path> [vocab_path]\n"
-                  << "  ./run_mono --euroc <sequence_dir> [vocab_path]\n"
+                  << "  ./run_mono --euroc <sequence_dir> [--euroc-camera-config <calib.json>] [--stereo] [vocab_path]\n"
                   << "  ./run_mono --tum <sequence_dir> [--tum-camera-config <calib.json>] [--depth] [--accel] [--repro-eval] [--reference-policy <heuristic|score|pipeline>] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [--metric-depth-model <path.onnx>] [--run-summary-json <path>] [--strict-exit] [vocab_path]\n" << std::endl;
         return -1;
     }
@@ -125,8 +130,10 @@ int main(int argc, char** argv) {
     std::string reference_policy_name = "heuristic";
     std::string depth_model_path;
     std::string metric_depth_model_path;
+    std::string euroc_camera_config;
     std::string tum_camera_config;
     std::string run_summary_json_path;
+    bool stereo_mode = false;
     bool strict_exit = false;
     std::string euroc_seq_dir;
     std::string tum_seq_dir;
@@ -204,10 +211,14 @@ int main(int argc, char** argv) {
                 depth_model_path = argv[++i];
             } else if (arg == "--metric-depth-model" && i + 1 < argc) {
                 metric_depth_model_path = argv[++i];
+            } else if (arg == "--euroc-camera-config" && i + 1 < argc) {
+                euroc_camera_config = argv[++i];
             } else if (arg == "--tum-camera-config" && i + 1 < argc) {
                 tum_camera_config = argv[++i];
             } else if (arg == "--run-summary-json" && i + 1 < argc) {
                 run_summary_json_path = argv[++i];
+            } else if (arg == "--stereo") {
+                stereo_mode = true;
             } else if (arg == "--strict-exit") {
                 strict_exit = true;
             }
@@ -219,6 +230,10 @@ int main(int argc, char** argv) {
 
     if (!depth_model_path.empty() && !metric_depth_model_path.empty()) {
         std::cerr << "Specify only one of --depth-model or --metric-depth-model" << std::endl;
+        return -1;
+    }
+    if (stereo_mode && !use_euroc) {
+        std::cerr << "--stereo is currently only supported with --euroc" << std::endl;
         return -1;
     }
 
@@ -240,7 +255,17 @@ int main(int argc, char** argv) {
         }
     } else {
         if (use_euroc) {
-            euroc = EurocDataset(euroc_seq_dir);
+            if (!euroc_camera_config.empty()) {
+                EurocPinholeCalibration cal;
+                std::string cal_err;
+                if (!EurocPinholeCalibration::load_json_file(euroc_camera_config, cal, cal_err)) {
+                    std::cerr << "Failed to load --euroc-camera-config: " << cal_err << std::endl;
+                    return -1;
+                }
+                euroc = EurocDataset(euroc_seq_dir, cal, stereo_mode);
+            } else {
+                euroc = EurocDataset(euroc_seq_dir, stereo_mode);
+            }
             if (!euroc.isValid()) {
                 std::cerr << "Failed to open EuRoC dataset: " << euroc_seq_dir << "\n"
                           << "Reason: " << euroc.error() << std::endl;
@@ -307,12 +332,13 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--depth-model" || arg == "--metric-depth-model" ||
             arg == "--reference-policy" || arg == "--tum-camera-config" ||
+            arg == "--euroc-camera-config" ||
             arg == "--run-summary-json" || arg == "--skip-frames" || arg == "--max-frames") {
             ++i;
             continue;
         }
         if (arg != "--depth" && arg != "--accel" && arg != "--repro-eval" && arg != "--no-viz" &&
-            arg != "--strict-exit") {
+            arg != "--strict-exit" && arg != "--stereo") {
             vocab_path = arg;
             break;
         }
@@ -353,6 +379,9 @@ int main(int argc, char** argv) {
     }
     if (max_frames >= 0) {
         std::cout << "Frame budget: " << max_frames << " tracked frames" << std::endl;
+    }
+    if (use_euroc && stereo_mode) {
+        std::cout << "EuRoC stereo scaffolding: ENABLED (tracking cam0 / displaying cam0+cam1)" << std::endl;
     }
 
     // Register BA completion callback to recompute current frame pose
@@ -458,6 +487,7 @@ int main(int argc, char** argv) {
 
     // Main Loop
     cv::Mat img;
+    cv::Mat right_img;
     cv::Mat depth_img;
     unsigned long frame_id = 0;
     int skipped_frames = 0;
@@ -469,13 +499,18 @@ int main(int argc, char** argv) {
 
         double timestamp = 0.0;
         depth_img = cv::Mat();
+        right_img = cv::Mat();
         if (!use_euroc && !use_tum) {
             cap >> img;
             if (img.empty()) break;
             timestamp = cap.get(cv::CAP_PROP_POS_MSEC) / 1000.0;
         } else {
             if (use_euroc) {
-                if (!euroc.next(img, timestamp)) break;
+                if (stereo_mode) {
+                    if (!euroc.next(img, right_img, timestamp)) break;
+                } else {
+                    if (!euroc.next(img, timestamp)) break;
+                }
             } else if (use_depth) {
                 if (!tum.nextWithDepth(img, depth_img, timestamp)) break;
             } else {
@@ -534,12 +569,26 @@ int main(int argc, char** argv) {
         if (!no_viz) {
             cv::Mat img_show;
             cv::drawKeypoints(img, frame->keypoints_, img_show);
-            cv::putText(img_show, "State: " + std::to_string((int)tracker->state_), cv::Point(10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
-            cv::imshow("SimpleVisualSLAM", img_show);
+            cv::putText(img_show, "State: " + std::to_string((int)tracker->state_), cv::Point(10, 20),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+
+            cv::Mat viz_frame = img_show;
+            if (stereo_mode && !right_img.empty()) {
+                cv::Mat left_show = img_show.clone();
+                cv::Mat right_show;
+                cv::cvtColor(right_img, right_show, cv::COLOR_GRAY2BGR);
+                cv::putText(left_show, "Left", cv::Point(10, 45), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                            cv::Scalar(255, 255, 0), 2);
+                cv::putText(right_show, "Right", cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                            cv::Scalar(255, 255, 0), 2);
+                cv::hconcat(left_show, right_show, viz_frame);
+            }
+
+            cv::imshow("SimpleVisualSLAM", viz_frame);
             char k = cv::waitKey(10);
             if (k == 27) break;
             if (frame_id == 100) {
-                cv::imwrite("slam_result.jpg", img_show);
+                cv::imwrite("slam_result.jpg", viz_frame);
             }
         }
     }

@@ -186,6 +186,7 @@ add_library(svslam_core
     src/core/landmark.cc
     src/core/map.cc
     src/io/euroc_dataset.cc
+    src/io/euroc_pinhole_calibration.cc
     src/io/tum_dataset.cc
     src/io/tum_pinhole_calibration.cc
     src/io/map_io.cc
@@ -269,6 +270,7 @@ if(BUILD_TESTS)
         tests/test_loop_closing.cc
         tests/test_map.cc
         tests/test_optimizer.cc
+        tests/test_euroc_dataset.cc
         tests/test_reference_keyframe_policy.cc
         tests/test_tracking.cc
         tests/test_tum_pinhole_calibration.cc
