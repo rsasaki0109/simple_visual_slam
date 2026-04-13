@@ -1,21 +1,107 @@
 # SimpleVisualSLAM
+> A readable, hackable Visual SLAM in 6k lines of C++17
 
 [![CI](https://github.com/rsasaki0109/simple_visual_slam/actions/workflows/ci.yml/badge.svg)](https://github.com/rsasaki0109/simple_visual_slam/actions/workflows/ci.yml)
 
-A lightweight, readable visual SLAM system with deep learning depth integration. Version **0.1.x** (see `project(VERSION)` in CMake; run `./build/run_mono --version`). Changes: [CHANGELOG.md](CHANGELOG.md).
+SimpleVisualSLAM is a compact BSD-licensed Visual SLAM system for people who want to read the whole pipeline, modify it, and run experiments without living inside a 50k-line codebase. It supports monocular, RGB-D, stereo, and learned-depth inputs, with loop closing, map persistence, and a ROS2 Jazzy node.
 
-## Features
+## Feature Highlights
 
-- **Monocular visual SLAM** with ORB feature extraction and matching
-- **Depth sensor integration** -- single-frame initialization and depth-assisted bundle adjustment
-- **Deep learning depth estimation** -- Depth Anything v2 via ONNX Runtime for metric-scale monocular operation
-- **Accelerometer integration** -- gravity-aligned coordinate frames and stationary detection
-- **Loop closing** -- DBoW2 place recognition with Sim(3) pose graph optimization
-- **Map persistence** -- save and load maps for relocalization across sessions
-- **~6,000 lines of C++** -- designed to be readable and educational rather than maximally optimized
-- **BSD-2-Clause license** ([LICENSE](LICENSE)) -- all dependencies are GPL-free
+- 6k lines of readable C++17 (vs ORB-SLAM3's 50k)
+- Mono / RGB-D / Stereo / DL Depth
+- Loop closing with pose graph optimization
+- ROS2 Jazzy node included
+- BSD-2-Clause license (no GPL contamination)
+- 55 unit tests, CI with regression gates
 
-## Citing
+## Quick Start
+
+```bash
+# Clone and build
+git clone https://github.com/rsasaki0109/simple_visual_slam.git
+cd simple_visual_slam
+sudo apt install -y libopencv-dev libeigen3-dev libgoogle-glog-dev libgflags-dev libsuitesparse-dev
+cmake -S . -B build -G Ninja -DBUILD_TESTS=ON
+cmake --build build -j$(nproc)
+ctest --test-dir build
+
+# Run on TUM dataset
+./build/run_mono --tum <path-to-tum-sequence> --depth --no-viz
+```
+
+The first configure fetches Ceres Solver, Sophus, DBoW2, and GoogleTest automatically. The full `-DUSE_DEPTH_DL=ON` build reaches the 55-test configuration.
+
+## Supported Modes
+
+| Mode | Input | Flag |
+| --- | --- | --- |
+| Mono | RGB camera | (default) |
+| RGB-D | RGB + Depth | `--depth` |
+| Stereo | Stereo pair | `--euroc --stereo` |
+| DL Depth | RGB + ONNX model | `--depth-model` / `--metric-depth-model` |
+
+Stereo is currently available through the EuRoC loader. DL depth requires `-DUSE_DEPTH_DL=ON`. For the full flag set, run `./build/run_mono --help`.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Main Thread] --> B[Tracking]
+    B --> C[LocalMapping]
+    C --> D[LoopClosing]
+```
+
+Tracking runs on the main thread. Local mapping and loop closing process keyframes asynchronously and push corrections back into the shared map.
+
+## Accuracy
+
+Absolute Trajectory Error (ATE) mean in meters with Sim(3) alignment. These are the current regression-gate snapshot numbers.
+
+| Sequence | Mono | RGB-D | RGB-D + Accel |
+| --- | ---: | ---: | ---: |
+| Seq A (small motion) | 0.0223 | 0.0109 | 0.0110 |
+| Seq B (room-scale) | 0.2688 | 0.1289 | 0.2350 |
+
+### Comparison with `stella_vslam`
+
+On the same TUM head-250 windows and `evo_ape` settings, `stella_vslam` currently beats SimpleVisualSLAM in all four measured scenarios. Loop closing did not materially close the gap in this comparison.
+
+| Scenario | Mode | SimpleVisualSLAM (`--repro-eval`) | SimpleVisualSLAM (loop median, 3 runs) | `stella_vslam` (head-250) | Winner |
+| --- | --- | ---: | ---: | ---: | --- |
+| `xyz_depth` | RGB-D | 0.01137 | 0.01140 | 0.00889 | `stella_vslam` |
+| `xyz_mono` | Mono | 0.04828 | 0.04530 | 0.01414 | `stella_vslam` |
+| `room_depth` | RGB-D | 0.08607 | 0.08256 | 0.02111 | `stella_vslam` |
+| `room_mono` | Mono | 0.19982 | 0.20024 | 0.02744 | `stella_vslam` |
+
+The comparison uses the first `250` poses from the provided `stella_vslam` trajectories, which is the fairest head-window available from the supplied artifacts. If you compare against other systems, keep the dataset window, modality, and `evo_ape` flags identical. See [eval/comparison_protocol.md](eval/comparison_protocol.md).
+
+## Optional Extras
+
+### ORB Vocabulary for Loop Closing
+
+Loop closing looks for `data/ORBvoc.txt`. If it is missing, the system still runs, but loop closing is disabled.
+
+```bash
+mkdir -p data
+curl -L -o ORBvoc.txt.tar.gz \
+    https://github.com/raulmur/ORB_SLAM2/raw/master/Vocabulary/ORBvoc.txt.tar.gz
+tar -xzf ORBvoc.txt.tar.gz -C data
+rm ORBvoc.txt.tar.gz
+```
+
+### DL Depth
+
+Build with `-DUSE_DEPTH_DL=ON`, then pass either `--depth-model <model.onnx>` or `--metric-depth-model <model.onnx>`. Depth Anything v2 works out of the box via ONNX Runtime.
+
+### ROS2 Jazzy
+
+A ROS2 node and launch file live under [`ros2/`](ros2/). See [`ros2/README.md`](ros2/README.md) for workspace build and launch instructions.
+
+## Contributing
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), keep changes small and reviewable, and run `ctest --test-dir build --output-on-failure` before opening a PR. If you touch evaluation logic, keep the regression scripts and benchmark docs in sync.
+
+## Citation
 
 For papers and reports, please cite the repository (GitHub also reads [`CITATION.cff`](CITATION.cff)). Example BibTeX:
 
@@ -31,259 +117,6 @@ For papers and reports, please cite the repository (GitHub also reads [`CITATION
 }
 ```
 
-## Architecture
-
-```mermaid
-flowchart LR
-    subgraph Main Thread
-        A[Video / Dataset Input] --> B[Frame]
-        B --> C[ORB Extraction]
-        C --> D[Tracking]
-    end
-
-    subgraph Mapping Thread
-        D -- new Keyframe --> E[Local Mapping]
-        E -- triangulate --> F[New Landmarks]
-        E -- optimize --> G[Local Bundle Adjustment]
-    end
-
-    subgraph Loop Closing Thread
-        E -- Keyframe --> H[Loop Detection<br/>DBoW2]
-        H -- candidate --> I[Sim3 Verification]
-        I -- loop found --> J[Pose Graph Optimization]
-        J -- correction --> K[Map Update]
-    end
-
-    D <--> L[(Map<br/>Keyframes + Landmarks)]
-    E <--> L
-    J <--> L
-```
-
-**Data flow summary:**
-1. Each incoming image is converted into a `Frame` with ORB keypoints and descriptors.
-2. **Tracking** estimates the camera pose by matching against the local map (constant-velocity model, then reference keyframe, then local map tracking).
-3. When a new keyframe is created, the **Local Mapping** thread triangulates new landmarks and runs local bundle adjustment via Ceres Solver.
-4. The **Loop Closing** thread queries the DBoW2 database for place-recognition candidates, verifies them with Sim(3) alignment, and distributes the accumulated drift across the pose graph.
-
-## Results
-
-Absolute Trajectory Error (ATE) mean in meters, evaluated with Sim(3) alignment. The table below is the current regression-gate snapshot; for repeated evaluation, run `bash scripts/eval_all.sh --repeat N` to export aggregate `mean/std` summaries into `eval_results/summary.txt`.
-
-| Sequence | Monocular | + Depth | + Depth + Accel |
-|---|---|---|---|
-| Seq A (small motion) | 0.0223 | 0.0109 | 0.011 |
-| Seq B (room-scale) | 0.2688 | 0.1289 | 0.235 |
-
-Depth sensor integration significantly improves metric-scale accuracy. Accelerometer data provides gravity alignment and helps with stationary detection, but its effect on ATE is sequence-dependent once depth is already available.
-
-### Comparison with stella_vslam
-
-Fair head-250 comparison on the same TUM windows and `evo_ape` settings shows `stella_vslam` ahead in all four scenarios, both in `--repro-eval` mode and with loop closing enabled.
-
-**Repro-eval (`--repro-eval`, loop closing disabled):**
-
-| Scenario | Modality | SimpleVisualSLAM ATE (m) | stella_vslam ATE (m, head-250) | Delta (Simple - stella) (m) | Winner |
-| --- | --- | ---: | ---: | ---: | --- |
-| `xyz_depth` | RGB-D | 0.01136912 | 0.00889256 | 0.00247656 | `stella_vslam` |
-| `xyz_mono` | Mono | 0.04827879 | 0.01413570 | 0.03414309 | `stella_vslam` |
-| `room_depth` | RGB-D | 0.08606639 | 0.02110508 | 0.06496131 | `stella_vslam` |
-| `room_mono` | Mono | 0.19982044 | 0.02743546 | 0.17238498 | `stella_vslam` |
-
-**Loop-enabled (ORB vocabulary loaded; median ATE over 3 runs):**
-
-| Scenario | Modality | SimpleVisualSLAM Median ATE (m, 3 runs) | Raw ATEs (m) | stella_vslam ATE (m, head-250) | Delta (Simple - stella) (m) | Winner |
-| --- | --- | ---: | --- | ---: | ---: | --- |
-| `xyz_depth` | RGB-D | 0.01139951 | `0.01139951, 0.01108985, 0.01142678` | 0.00889256 | 0.00250695 | `stella_vslam` |
-| `xyz_mono` | Mono | 0.04529873 | `0.03893269, 0.04756870, 0.04529873` | 0.01413570 | 0.03116303 | `stella_vslam` |
-| `room_depth` | RGB-D | 0.08255800 | `0.08461199, 0.08255800, 0.08083409` | 0.02110508 | 0.06145292 | `stella_vslam` |
-| `room_mono` | Mono | 0.20024479 | `0.19253079, 0.20024479, 0.28880425` | 0.02743546 | 0.17280933 | `stella_vslam` |
-
-The `stella_eval` artifacts were not canonical 250-frame windows, so the comparison uses the first `250` poses from each provided `stella_vslam` trajectory as the fair head-window available from the supplied files. Enabling loop closing in SimpleVisualSLAM did not materially close the gap within that window.
-
-**Comparing to other OSS (stella_vslam, ORB-SLAM, …):** use the same TUM window, modality, and `evo_ape` flags or the numbers are not comparable. See [eval/comparison_protocol.md](eval/comparison_protocol.md). **Start with baseline verification:** `bash scripts/verify_comparison_benchmark.sh xyz_depth` (presets: `xyz_mono`, `room_mono`, …) prints mean ATE with the same `evo_ape` extras as `eval/regression_baselines.json`. This project’s design target is to stay **BSD-clean** and **readable** while competing on selected clips—especially where **RGB-D or DL depth** is in play—not to win every KITTI row.
-
-## Experiment Status
-
-The reference-keyframe policy work now lives as a compareable experiment surface rather than a one-off implementation tweak.
-
-- GitHub landing page: [docs/index.md](docs/index.md)
-- Decision record: [docs/decisions.md](docs/decisions.md)
-- Full experiment tables: [docs/experiments.md](docs/experiments.md)
-- Minimal surviving interface: [docs/interfaces.md](docs/interfaces.md)
-
-Current snapshot:
-
-- Curated corpus accuracy: `score` and `pipeline` tie at `0.929`
-- Bounded real-trace replay: `score` is the current overall best
-- Full repeat-2 replay: `score` stays best overall, but no single policy wins every mode
-- Runtime default remains `heuristic` until one policy wins across curated, replay, and repeat gates
-
-**Local regression gate (data required):** With TUM sequences under `data/tum/` (see `eval/regression_baselines.json`) and `evo_ape` installed, run `python3 scripts/check_regression_gate.py --quiet` from the repo root. This checks `--repro-eval` bitwise trajectory match on two runs and compares mean ATE (same `evo_ape` flags as `scripts/eval_reference_policies.sh`) to per-scenario ceilings. Use `--all-gates` to run every scenario in the JSON (room: mono, depth, depth+accel; xyz: mono, depth), `--gate <name>` for one scenario, and `--skip-ate` for reproducibility only. Contributor-oriented notes: [CONTRIBUTING.md](CONTRIBUTING.md).
-
-**Research comparison table (TUM; data required):** `scripts/build_leaderboard.py` prints a ranked matrix (methods × short TUM windows) for ablations and papers. It is intentionally **not** a KITTI odometry substitute—KITTI’s sequences, sensors, and reporting rules are a different game, and forcing this repo into that mold mostly squeezes what you can evaluate. Edit `eval/leaderboard_suite.json` to choose windows and method presets; use `python3 scripts/build_leaderboard.py --dry-run` to preview the matrix, then e.g. `python3 scripts/build_leaderboard.py --build build --quiet` to evaluate. Rows sort by **mean ATE** (lower better) with an optional **mean rank** across sequences. Default Markdown: `eval_results/leaderboard.md`; `--json-out` for raw numbers.
-
-**Ceres parallelism:** Bundle adjustment and pose-graph solves default to **one thread** for repeatable results. For faster (possibly run-to-run variable) solves, set e.g. `export SVSLAM_CERES_NUM_THREADS=8` before running `run_mono`.
-
-## Dependencies
-
-**Required:**
-- [OpenCV](https://opencv.org/) 4.5+
-- [Eigen3](https://eigen.tuxfamily.org/)
-
-**Auto-fetched via CMake FetchContent (no manual installation needed):**
-- [Ceres Solver](http://ceres-solver.org/) 2.1+
-- [Sophus](https://github.com/strasdat/Sophus) (Lie group library)
-- [DBoW2](https://github.com/dorian3d/DBoW2) (bag-of-words for loop closing)
-
-**Optional (auto-fetched when enabled):**
-- [ONNX Runtime](https://onnxruntime.ai/) (for deep learning depth estimation)
-
-## Build
-
-Tested on Ubuntu 22.04 with GCC 11+.
-
-```bash
-# Install system dependencies
-sudo apt install libopencv-dev libeigen3-dev libgoogle-glog-dev libgflags-dev
-
-# Build
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-```
-
-The first build may take several minutes as CMake fetches and compiles Ceres Solver, Sophus, and DBoW2 automatically.
-
-### Build Options
-
-| CMake Option | Default | Description |
-|---|---|---|
-| `USE_DBOW2` | `ON` | Enable DBoW2 for loop closing |
-| `USE_DEPTH_DL` | `OFF` | Enable deep learning depth estimation (fetches ONNX Runtime) |
-
-Example with all features enabled:
-
-```bash
-cmake .. -DUSE_DEPTH_DL=ON
-make -j$(nproc)
-```
-
-### Tests
-
-Run `ctest --output-on-failure` from `build/`. The current CTest suite registers `51` tests in the default build, or `55` with `-DUSE_DEPTH_DL=ON`.
-
-### Repeated Evaluation
-
-```bash
-bash scripts/eval_all.sh --repeat 5
-```
-
-This runs each dataset/mode pair five times, keeps per-run trajectories and logs in `eval_results/`, and writes aggregate `mean/std` ATE statistics to `eval_results/summary.txt`.
-
-## Usage
-
-All modes: run `./build/run_mono --help` for TUM flags (`--repro-eval`, `--run-summary-json`, `--strict-exit`, `--depth-model`, `--metric-depth-model`, calibration JSON, etc.).
-
-### Video File
-
-```bash
-./build/run_mono path/to/video.mp4
-```
-
-### Image Sequence Dataset
-
-```bash
-# EuRoC-format dataset (cam0/data/ with timestamps)
-./build/run_mono --euroc /path/to/sequence_dir
-
-# TUM RGB-D format dataset
-./build/run_mono --tum /path/to/sequence_dir
-```
-
-### With ORB Vocabulary (enables loop closing)
-
-```bash
-# Vocabulary path as last argument
-./build/run_mono path/to/video.mp4 data/ORBvoc.txt
-./build/run_mono --euroc /path/to/sequence_dir data/ORBvoc.txt
-./build/run_mono --tum /path/to/sequence_dir data/ORBvoc.txt
-```
-
-If no vocabulary path is given, the system looks for `data/ORBvoc.txt` by default. If the file is not found, loop closing is disabled and the system runs without it.
-
-### Output
-
-- **`trajectory.txt`** -- estimated camera trajectory (timestamp, x, y, z)
-- **`map.bin`** -- serialized map for later reuse
-
-### Keyboard Controls
-
-- `Esc` -- stop processing
-
-## ORB Vocabulary
-
-Loop closing requires an ORB vocabulary file. This repository does not distribute one. You can obtain `ORBvoc.txt` from the ORB-SLAM2 project:
-
-```bash
-mkdir -p data
-curl -L -o ORBvoc.txt.tar.gz \
-    https://github.com/raulmur/ORB_SLAM2/raw/master/Vocabulary/ORBvoc.txt.tar.gz
-tar -xzf ORBvoc.txt.tar.gz -C data
-rm ORBvoc.txt.tar.gz
-```
-
-This places the vocabulary at `data/ORBvoc.txt`, which is the default search path.
-
-## Deep Learning Depth Estimation
-
-SimpleVisualSLAM can use [Depth Anything v2](https://github.com/DepthAnything/Depth-Anything-V2) to predict dense depth maps from monocular images via ONNX Runtime. This enables metric-scale reconstruction without a physical depth sensor.
-
-### Download the ONNX Model
-
-```bash
-mkdir -p models
-# Download Depth Anything v2 Small (recommended for real-time use)
-wget -O models/depth_anything_v2_small.onnx \
-    https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx
-```
-
-### Build with DL Depth
-
-```bash
-mkdir build && cd build
-cmake .. -DUSE_DEPTH_DL=ON
-make -j$(nproc)
-```
-
-### Run with DL Depth
-
-```bash
-./build/run_mono --depth-model models/depth_anything_v2_small.onnx path/to/video.mp4
-./build/run_mono --metric-depth-model models/depth_anything_v2_small.onnx path/to/video.mp4
-```
-
-Use `--metric-depth-model` for models that already predict metric depth in meters. Specify only one of `--depth-model` or `--metric-depth-model`.
-
-When enabled, the system runs depth inference on each keyframe and uses the predicted depth to:
-- Initialize the map from a single frame (no two-view initialization required)
-- Add depth priors to bundle adjustment for improved scale consistency
-
-## Project Structure
-
-```
-SimpleVisualSLAM/
-├── apps/
-│   └── run_mono.cc            # Main application entry point
-├── src/
-│   ├── core/                  # Camera, Frame, Keyframe, Landmark, Map
-│   ├── tracking/              # Tracking, Initializer
-│   ├── backend/               # Local Mapping, Bundle Adjustment (Ceres)
-│   ├── loop_closing/          # Loop detection + Sim3 pose graph optimization
-│   └── io/                    # Dataset readers, Map serialization
-├── cmake/                     # CMake modules
-└── CMakeLists.txt
-```
-
 ## License
 
 This project is licensed under the [BSD 2-Clause License](LICENSE).
@@ -292,9 +125,9 @@ This project is licensed under the [BSD 2-Clause License](LICENSE).
 
 SimpleVisualSLAM builds on the following open source projects:
 
-- [OpenCV](https://opencv.org/) -- feature extraction, image processing, visualization
-- [Ceres Solver](http://ceres-solver.org/) -- bundle adjustment and nonlinear optimization
-- [Sophus](https://github.com/strasdat/Sophus) -- Lie group (SE3/Sim3) operations
-- [DBoW2](https://github.com/dorian3d/DBoW2) -- bag-of-words place recognition for loop closing
-- [ONNX Runtime](https://onnxruntime.ai/) -- deep learning inference for depth estimation
-- [Depth Anything v2](https://github.com/DepthAnything/Depth-Anything-V2) -- monocular depth estimation model
+- [OpenCV](https://opencv.org/) for feature extraction, image processing, and visualization
+- [Ceres Solver](http://ceres-solver.org/) for bundle adjustment and nonlinear optimization
+- [Sophus](https://github.com/strasdat/Sophus) for Lie group (`SE3` / `Sim3`) operations
+- [DBoW2](https://github.com/dorian3d/DBoW2) for bag-of-words place recognition
+- [ONNX Runtime](https://onnxruntime.ai/) for deep learning inference
+- [Depth Anything v2](https://github.com/DepthAnything/Depth-Anything-V2) for monocular depth estimation
