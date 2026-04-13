@@ -595,6 +595,42 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
         problem.AddResidualBlock(cost, loss, from_it->second, to_it->second);
     };
 
+    auto sharedLandmarkCount = [](const Keyframe::Ptr& from,
+                                  const PoseGraphKeyframeSnapshot& other_snapshot,
+                                  int forward_count) {
+        int shared_landmarks = std::max(forward_count, 0);
+        if (!from) {
+            return shared_landmarks;
+        }
+        for (const auto& reverse_connection : other_snapshot.connections) {
+            if (!reverse_connection.first || reverse_connection.first->id_ != from->id_) {
+                continue;
+            }
+            shared_landmarks = std::max(shared_landmarks, reverse_connection.second);
+            break;
+        }
+        return shared_landmarks;
+    };
+
+    int max_shared_landmarks = 0;
+    for (const auto& kv : all_keyframes) {
+        const auto& kf = kv.second;
+        if (!kf) continue;
+        const auto snapshot_it = keyframe_snapshots.find(kf->id_);
+        if (snapshot_it == keyframe_snapshots.end()) continue;
+        const auto& snapshot = snapshot_it->second;
+
+        for (const auto& connected : snapshot.connections) {
+            const auto& other = connected.first;
+            if (!other) continue;
+            const auto other_snapshot_it = keyframe_snapshots.find(other->id_);
+            if (other_snapshot_it == keyframe_snapshots.end()) continue;
+            max_shared_landmarks =
+                std::max(max_shared_landmarks,
+                         sharedLandmarkCount(kf, other_snapshot_it->second, connected.second));
+        }
+    }
+
     std::set<std::pair<unsigned long, unsigned long>> added_pairs;
     int covisibility_edges = 0;
     for (const auto& kv : all_keyframes) {
@@ -615,8 +651,14 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
             const unsigned long id1 = std::max(kf->id_, other->id_);
             if (!added_pairs.insert({id0, id1}).second) continue;
 
+            const int shared_landmarks =
+                sharedLandmarkCount(kf, other_snapshot, connected.second);
+            const double normalized_shared_landmarks =
+                max_shared_landmarks > 0
+                    ? static_cast<double>(shared_landmarks) / static_cast<double>(max_shared_landmarks)
+                    : 1.0;
             const double weight_scale =
-                std::clamp(std::sqrt(static_cast<double>(connected.second) / 30.0), 0.75, 2.0);
+                std::sqrt(std::clamp(normalized_shared_landmarks, 0.0, 1.0));
             PoseGraphEdge edge;
             edge.from = kf;
             edge.to = other;
