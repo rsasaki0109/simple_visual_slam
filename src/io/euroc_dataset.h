@@ -25,6 +25,7 @@ public:
 
     const cv::Mat& K() const;
     const cv::Mat& rightK() const;
+    double stereoBaselineMeters() const;
     bool hasStereo() const;
 
     bool next(cv::Mat& image, double& timestamp_sec);
@@ -71,6 +72,7 @@ private:
     std::vector<Entry> entries_;
     size_t index_ = 0;
     bool stereo_enabled_ = false;
+    double stereo_baseline_meters_ = 0.0;
 };
 
 }  // namespace svslam

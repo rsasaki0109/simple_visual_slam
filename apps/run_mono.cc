@@ -25,6 +25,7 @@
 #include "tracking/tracking.h"
 #include "backend/local_mapping.h"
 #include "loop_closing/loop_closing.h"
+#include "depth/stereo_depth_estimator.h"
 #ifdef USE_DEPTH_DL
 #include "depth/metric_depth_estimator.h"
 #include "depth/onnx_depth_estimator.h"
@@ -52,7 +53,7 @@ void print_help(std::ostream& os) {
        << "\n"
        << "EUROC OPTIONS\n"
        << "  --euroc-camera-config <calib.json> Override cam0/cam1 pinhole intrinsics (+optional distortion)\n"
-       << "  --stereo                            Load/display cam0+cam1; tracking still uses cam0 only\n"
+       << "  --stereo                            Load cam0+cam1 and compute metric stereo depth; tracking still uses cam0\n"
        << "\n"
        << "TUM OPTIONS\n"
        << "  --tum-camera-config <calib.json>   Pinhole intrinsics (+optional distortion); else fr1 defaults\n"
@@ -381,7 +382,7 @@ int main(int argc, char** argv) {
         std::cout << "Frame budget: " << max_frames << " tracked frames" << std::endl;
     }
     if (use_euroc && stereo_mode) {
-        std::cout << "EuRoC stereo scaffolding: ENABLED (tracking cam0 / displaying cam0+cam1)" << std::endl;
+        std::cout << "EuRoC stereo mode: ENABLED (tracking cam0 / metric depth from cam0+cam1)" << std::endl;
     }
 
     // Register BA completion callback to recompute current frame pose
@@ -419,6 +420,22 @@ int main(int argc, char** argv) {
     // Deep learning depth estimator
     if (loop_closing && use_depth) {
         loop_closing->setMetricDepth(true);
+    }
+    std::shared_ptr<DepthEstimator> stereo_depth_estimator;
+    if (use_euroc && stereo_mode) {
+        const double stereo_baseline_meters = euroc.stereoBaselineMeters();
+        if (stereo_baseline_meters <= 0.0) {
+            std::cerr << "EuRoC stereo depth requires a positive stereo baseline from sensor.yaml or "
+                         "--euroc-camera-config baseline"
+                      << std::endl;
+            return -1;
+        }
+        stereo_depth_estimator = std::make_shared<StereoDepthEstimator>(stereo_baseline_meters, euroc.K());
+        std::cout << "Stereo depth estimation: ENABLED (metric, baseline=" << stereo_baseline_meters << " m)"
+                  << std::endl;
+        if (loop_closing && stereo_depth_estimator->isMetric()) {
+            loop_closing->setMetricDepth(true);
+        }
     }
 #ifdef USE_DEPTH_DL
     std::shared_ptr<DepthEstimator> dl_depth_estimator;
@@ -530,6 +547,10 @@ int main(int argc, char** argv) {
         if (!depth_img.empty()) {
             frame->depth_image_ = depth_img;
             frame->depth_is_metric_ = true;
+        }
+        else if (stereo_depth_estimator && !right_img.empty()) {
+            frame->depth_image_ = stereo_depth_estimator->estimate(img, right_img);
+            frame->depth_is_metric_ = stereo_depth_estimator->isMetric();
         }
 #ifdef USE_DEPTH_DL
         else if (dl_depth_estimator) {

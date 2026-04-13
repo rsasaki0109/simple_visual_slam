@@ -1,6 +1,7 @@
 #include "io/euroc_dataset.h"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -50,6 +51,18 @@ static bool parseArrayLine(const std::string& line, const std::string& key, std:
     return true;
 }
 
+static double computeStereoBaselineMeters(const EurocPinholeCalibration::Camera& cam0,
+                                          const EurocPinholeCalibration::Camera& cam1) {
+    if (cam0.T_BS.size() != 16 || cam1.T_BS.size() != 16) {
+        return 0.0;
+    }
+
+    const double dx = cam1.T_BS[3] - cam0.T_BS[3];
+    const double dy = cam1.T_BS[7] - cam0.T_BS[7];
+    const double dz = cam1.T_BS[11] - cam0.T_BS[11];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
 }  // namespace
 
 EurocDataset::EurocDataset(const std::string& seq_dir) : EurocDataset(seq_dir, nullptr, false) {}
@@ -97,7 +110,11 @@ EurocDataset::EurocDataset(const std::string& seq_dir,
         }
     }
     if (calib != nullptr) {
+        const std::vector<double> sensor_t_bs = cam0_calib.T_BS;
         cam0_calib = calib->cam0;
+        if (cam0_calib.T_BS.empty()) {
+            cam0_calib.T_BS = sensor_t_bs;
+        }
         have_cam0_calib = true;
     }
     if (!have_cam0_calib) {
@@ -117,7 +134,11 @@ EurocDataset::EurocDataset(const std::string& seq_dir,
         }
     }
     if (stereo_enabled_ && calib != nullptr && calib->has_cam1) {
+        const std::vector<double> sensor_t_bs = cam1_calib.T_BS;
         cam1_calib = calib->cam1;
+        if (cam1_calib.T_BS.empty()) {
+            cam1_calib.T_BS = sensor_t_bs;
+        }
         have_cam1_calib = true;
     }
     if (stereo_enabled_ && !have_cam1_calib) {
@@ -129,6 +150,9 @@ EurocDataset::EurocDataset(const std::string& seq_dir,
     if (stereo_enabled_) {
         initCalibration(cam1_calib, right_K_, right_dist_coeffs_, right_new_K_, right_undist_map1_,
                         right_undist_map2_);
+        stereo_baseline_meters_ =
+            (calib != nullptr && calib->has_baseline) ? calib->baseline_meters
+                                                      : computeStereoBaselineMeters(cam0_calib, cam1_calib);
     }
 
     std::vector<CsvEntry> left_entries;
@@ -155,6 +179,8 @@ const std::string& EurocDataset::error() const { return error_; }
 const cv::Mat& EurocDataset::K() const { return K_; }
 
 const cv::Mat& EurocDataset::rightK() const { return right_K_; }
+
+double EurocDataset::stereoBaselineMeters() const { return stereo_baseline_meters_; }
 
 bool EurocDataset::hasStereo() const {
     return stereo_enabled_ && !entries_.empty() && !entries_.front().right_image_path.empty();
@@ -198,12 +224,25 @@ bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path, EurocPinh
     bool got_resolution = false;
     std::vector<double> values;
     calib = EurocPinholeCalibration::Camera();
+    bool in_t_bs_block = false;
 
     std::string line;
     while (std::getline(ifs, line)) {
         line = trim(line);
         if (line.empty()) continue;
         if (line[0] == '#') continue;
+
+        if (startsWith(line, "T_BS:")) {
+            in_t_bs_block = true;
+            continue;
+        }
+        if (in_t_bs_block && parseArrayLine(line, "data:", values)) {
+            if (values.size() == 16) {
+                calib.T_BS = values;
+            }
+            in_t_bs_block = false;
+            continue;
+        }
 
         if (parseArrayLine(line, "intrinsics:", values)) {
             if (values.size() >= 4) {

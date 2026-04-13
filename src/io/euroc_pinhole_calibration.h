@@ -14,16 +14,19 @@ struct EurocPinholeCalibration {
         int image_width = 752;
         int image_height = 480;
         std::vector<double> distortion;
+        std::vector<double> T_BS;
     };
 
     Camera cam0;
     Camera cam1;
     bool has_cam1 = false;
+    double baseline_meters = 0.0;
+    bool has_baseline = false;
 
     // Minimal JSON reader (no external JSON library).
     // Accepted forms:
     //   { "fx": ..., "fy": ..., "cx": ..., "cy": ..., "distortion": [...] }
-    //   { "cam0": { ... }, "cam1": { ... } }
+    //   { "cam0": { ... }, "cam1": { ... }, "baseline": ... }
     // Optional keys per camera: "width", "height", "distortion".
     static bool load_json_file(const std::string& path, EurocPinholeCalibration& out, std::string& error);
 };

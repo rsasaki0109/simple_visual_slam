@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(SimpleVisualSLAM VERSION 0.1.0 LANGUAGES CXX)
+project(SimpleVisualSLAM VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -185,6 +185,7 @@ add_library(svslam_core
     src/core/keyframe.cc
     src/core/landmark.cc
     src/core/map.cc
+    src/depth/stereo_depth_estimator.cc
     src/io/euroc_dataset.cc
     src/io/euroc_pinhole_calibration.cc
     src/io/tum_dataset.cc
@@ -271,6 +272,7 @@ if(BUILD_TESTS)
         tests/test_map.cc
         tests/test_optimizer.cc
         tests/test_euroc_dataset.cc
+        tests/test_stereo_depth_estimator.cc
         tests/test_reference_keyframe_policy.cc
         tests/test_tracking.cc
         tests/test_tum_pinhole_calibration.cc

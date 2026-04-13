@@ -6,8 +6,8 @@ message: >-
   For reproducibility, include the version (`./build/run_mono --version`) or git commit hash.
 type: software
 license: BSD-2-Clause
-version: 0.1.0
-date-released: "2026-04-01"
+version: 0.2.0
+date-released: "2026-04-14"
 repository-code: "https://github.com/rsasaki0109/simple_visual_slam"
 url: "https://github.com/rsasaki0109/simple_visual_slam"
 abstract: >-
