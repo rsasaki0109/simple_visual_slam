@@ -51,7 +51,8 @@ TEST(EurocPinholeCalibrationTest, LoadsStereoJsonConfig) {
     "width": 752,
     "height": 480,
     "distortion": [-0.28368365, 0.07451284, -0.00010473, -3.55590700e-05]
-  }
+  },
+  "baseline": 0.110074
 })");
 
     EurocPinholeCalibration calib;
@@ -61,6 +62,8 @@ TEST(EurocPinholeCalibrationTest, LoadsStereoJsonConfig) {
     ASSERT_TRUE(calib.has_cam1);
     EXPECT_DOUBLE_EQ(calib.cam1.cx, 379.999);
     ASSERT_EQ(calib.cam1.distortion.size(), 4u);
+    EXPECT_TRUE(calib.has_baseline);
+    EXPECT_DOUBLE_EQ(calib.baseline_meters, 0.110074);
 
     std::error_code ec;
     std::filesystem::remove(path, ec);

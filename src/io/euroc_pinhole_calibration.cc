@@ -174,6 +174,12 @@ bool EurocPinholeCalibration::load_json_file(const std::string& path,
         calib.has_cam1 = true;
     }
 
+    double baseline_meters = 0.0;
+    if (parse_double(json, "baseline", baseline_meters) && baseline_meters > 0.0) {
+        calib.baseline_meters = baseline_meters;
+        calib.has_baseline = true;
+    }
+
     out = calib;
     error.clear();
     return true;
