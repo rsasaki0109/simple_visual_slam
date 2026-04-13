@@ -1338,7 +1338,7 @@ bool Tracking::trackReferenceKeyframe() {
         const auto& m2 = ms[1];
         // Favor cleaner frame-to-frame propagation for monocular tracking.
         if (m1.distance > 65.0f) continue;
-        if (m1.distance >= 0.70f * m2.distance) continue;
+        if (m1.distance >= 0.75f * m2.distance) continue;
         candidates.push_back({m1.queryIdx, m1.trainIdx, m1.distance});
     }
 
