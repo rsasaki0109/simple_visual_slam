@@ -92,7 +92,13 @@ MetricDepthEstimator::MetricDepthEstimator(const std::string& model_path, Camera
         input_names_.push_back(name.get());
         input_name_ptrs_.push_back(std::move(name));
 
-        const auto tensor_info = session_.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        const auto type_info = session_.GetInputTypeInfo(i);
+        if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
+            input_shapes_.push_back({});
+            input_types_.push_back(ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED);
+            continue;
+        }
+        const auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
         input_shapes_.push_back(tensor_info.GetShape());
         input_types_.push_back(tensor_info.GetElementType());
     }
@@ -103,7 +109,13 @@ MetricDepthEstimator::MetricDepthEstimator(const std::string& model_path, Camera
         output_names_.push_back(name.get());
         output_name_ptrs_.push_back(std::move(name));
 
-        const auto tensor_info = session_.GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        const auto type_info = session_.GetOutputTypeInfo(i);
+        if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
+            output_shapes_.push_back({});
+            output_types_.push_back(ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED);
+            continue;
+        }
+        const auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
         output_shapes_.push_back(tensor_info.GetShape());
         output_types_.push_back(tensor_info.GetElementType());
     }
@@ -156,7 +168,8 @@ cv::Size MetricDepthEstimator::resolveInputSize(const std::vector<int64_t>& inpu
     return cv::Size(width, height);
 }
 
-cv::Size MetricDepthEstimator::resolveOutputSize(const std::vector<int64_t>& output_shape) {
+cv::Size MetricDepthEstimator::resolveOutputSize(const std::vector<int64_t>& output_shape,
+                                                 const cv::Size& fallback) {
     std::vector<int64_t> spatial_dims;
     spatial_dims.reserve(output_shape.size());
     for (const int64_t dim : output_shape) {
@@ -165,11 +178,16 @@ cv::Size MetricDepthEstimator::resolveOutputSize(const std::vector<int64_t>& out
         }
     }
 
-    if (spatial_dims.size() != 2) {
-        throw std::runtime_error("MetricDepthEstimator: unsupported depth output tensor shape");
+    if (spatial_dims.size() == 2) {
+        return cv::Size(static_cast<int>(spatial_dims[1]), static_cast<int>(spatial_dims[0]));
     }
 
-    return cv::Size(static_cast<int>(spatial_dims[1]), static_cast<int>(spatial_dims[0]));
+    // Dynamic output shape — use fallback (input or original image size)
+    if (fallback.width > 0 && fallback.height > 0) {
+        return fallback;
+    }
+
+    throw std::runtime_error("MetricDepthEstimator: unsupported depth output tensor shape");
 }
 
 bool MetricDepthEstimator::isNhwcImageShape(const std::vector<int64_t>& shape) {
@@ -249,7 +267,7 @@ size_t MetricDepthEstimator::findDepthOutputIndex() const {
                 score += 10;
             }
         } catch (const std::exception&) {
-            continue;
+            // Dynamic output shape — still a valid candidate if name matches
         }
 
         if (score > best_score) {
@@ -458,7 +476,7 @@ std::vector<int64_t> MetricDepthEstimator::createInt64AuxiliaryInput(
 cv::Mat MetricDepthEstimator::postprocess(const float* output_data,
                                           const std::vector<int64_t>& output_shape,
                                           const cv::Size& original_size) const {
-    const cv::Size model_output_size = resolveOutputSize(output_shape);
+    const cv::Size model_output_size = resolveOutputSize(output_shape, original_size);
     const std::size_t expected_count =
         static_cast<std::size_t>(model_output_size.width) * model_output_size.height;
 

@@ -20,7 +20,8 @@ public:
 
     static cv::Size resolveInputSize(const std::vector<int64_t>& input_shape,
                                      const cv::Size& image_size);
-    static cv::Size resolveOutputSize(const std::vector<int64_t>& output_shape);
+    static cv::Size resolveOutputSize(const std::vector<int64_t>& output_shape,
+                                     const cv::Size& fallback = cv::Size());
 
 private:
     struct InputBuffer {
