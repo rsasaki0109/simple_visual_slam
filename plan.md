@@ -24,23 +24,28 @@ SimpleVisualSLAMは6k行のC++17で、特徴点ベースSLAM + 深度センサ�
 
 - **Public OSS:** `https://github.com/rsasaki0109/simple_visual_slam` / Pages `https://rsasaki0109.github.io/simple_visual_slam/`
 - **版:** CMake `project(VERSION 0.1.0)`、`./build/run_mono --version` と一致。**引用:** ルート `CITATION.cff`。
-- **master HEAD:** `c5bcbe1`（Improve mono initialization, stabilize 600-frame loops, update README.）
-- **2026-04-13 の作業:**
+- **HEAD:** `a32d904`（Fix metric depth estimator crash on models with dynamic output shapes.）
+- **2026-04-13 の作業（8 commits）:**
   - `6429d9b`: リファクタリング + テスト充実 (26→48)
   - `244bb56`: ループ安定化 + stella比較 + plan更新 (48→51)
-  - `6d81697`: Metric Depth estimator + tracking改善 + ループ有効比較 (55 with DL ON)
+  - `6d81697`: `MetricDepthEstimator` 追加、tracking改善、stella比較完了、`USE_DEPTH_DL=ON` で **55/55**
   - `c5bcbe1`: Mono初期化改善 + 600-frame安定化 + README更新
-- **テスト:** `ctest` **51/51 pass**（`USE_DEPTH_DL=ON` では **55/55**）。
+  - `c61d8b1`: 回帰ベースライン締め付け + room gap 設計メモの追記
+  - `f440bdc`: Local BA iteration を **10→15** に増加
+  - `8007ee2`: covisibility-weighted pose graph edge 導入 + metric depth test 文書化
+  - `a32d904`: dynamic output shape の ONNX model で metric depth estimator が落ちる crash を修正
+- **テスト:** `ctest` **51/51 pass**。`USE_DEPTH_DL=ON` では **55/55 pass**。
 - **回帰ゲート:** `python3 scripts/check_regression_gate.py --all-gates --quiet` **5/5 pass**。ベースライン締め付け済み。
 - **リファクタ:** `tracking.cc` の helper 抽出、状態の `RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への集約、`loop_closing` の internal helper 化、`optimizer` の cleanup を実施。
 - **新規テスト:** `test_frame.cc`, `test_keyframe.cc`, `test_initializer.cc`, `test_loop_closing.cc`, `test_tracking.cc`, `test_tracking_pose_recompute.cc`, `test_synthetic_scene.h`, `test_metric_depth_estimator.cc` を追加。
 - **Mono 初期化改善:** median parallax ベースの solution 選択により xyz_mono ATE **0.048→0.036** (-26%)。
-- **600-frame 安定化:** loop cooldown 120→200 KF。ATE **0.109m / 0.124m** (旧 median 0.617m)。
-- **Metric Depth:** `MetricDepthEstimator` 追加。`--metric-depth-model <path.onnx>` CLI 対応。
+- **600-frame 安定化:** loop cooldown **120→200 KF**。ATE **0.109m / 0.124m** (旧 median **0.617m**)。
+- **room_depth 改善:** covisibility-weighted pose graph により ATE **0.1289→0.0695**。
+- **Metric Depth:** `MetricDepthEstimator` + `--metric-depth-model <path.onnx>` pipeline が動作。`xyz` ATE **0.00913m**。
+- **Local BA:** local mapping の BA iteration を **10→15** に増やし、loop 後の収束を強化。
 - **stella_vslam 比較:** 4シナリオ×repro-eval + loop-enabled の両方を実施。eval/stella_comparison_results.md に記録。
 - **README 更新:** 比較表・テスト数・CLI を反映。
-- **方針:** Reference-keyframe policy 実験は収束済み。**room 系の ATE 6-10x 差の根本対策**（Ceres スパースソルバー化、BA 窓拡大）が次の主戦場。
-- **未解決の本丸:** room_depth は 250-frame で stella_vslam の 6.1x、room_mono は 9.8x。コア BA の構造的品質差（Ceres 密 vs g2o スパース）が主因と推定。
+- **方針:** Phase A / F は概ね整備済み。Phase B は metric depth estimator 導入で部分着手済みとなり、次は pose graph / local BA / metric depth 品質の詰めが主戦場。
 
 ### 1.8 Next Phase: Closing the Room Gap（2026-04-13 設計）
 
@@ -214,17 +219,18 @@ SimpleVisualSLAMは6k行のC++17で、特徴点ベースSLAM + 深度センサ�
 | 7 | `mergeLandmarks()` が candidate landmark の位置を保持（optimizer が移動させた current を破棄） | Medium | **未コミット変更で修正済み**。current 側 landmark を生存側に変更 |
 | 8 | `loop_constraints_` が無制限に蓄積 | Low | **未着手** |
 
-### 1.6 コミット履歴（2026-04-12 時点）
+### 1.6 コミット履歴（2026-04-13 時点）
 
 | コミット | 内容 |
 |---------|------|
-| `6429d9b` | **Refactor SLAM core, stabilize loop closing, and enrich test suite**: `tracking.cc` helper 抽出、`RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への状態集約、`loop_closing` internal helper 化、`optimizer` cleanup、テスト **48/48**、回帰ゲート **5/5** |
-| `d3c81a7` | **Improve tracking accuracy**: ratio test, BA iterations 5→10, covisible KF 10→15, loop correction ordering |
-| `fcbde0a` | Add calibration override, run statistics, CLI help, eval tooling, citation, plan update |
-| `52d3547` | Product release scaffolding: `--version`, `CHANGELOG.md`, `RELEASING.md` |
-| `4288203` | xyz depth regression gate |
-| `78b3b47` | room depth+accel regression gate + CONTRIBUTING.md |
-| ... | （以前のコミットは `git log` 参照） |
+| `a32d904` | **Fix metric depth estimator crash on models with dynamic output shapes**: dynamic output shape の ONNX model で metric depth estimator が落ちるケースを修正 |
+| `8007ee2` | **Add covisibility-weighted pose graph edges, document metric depth test**: pose graph edge を共有 landmark 数で重み付けし、`room_depth` ATE を **0.1289→0.0695** へ改善 |
+| `f440bdc` | **Increase local BA iterations from 10 to 15**: `LocalMapping::optimization()` の BA iteration を増やし、局所収束を強化 |
+| `c61d8b1` | **Tighten regression baselines and update plan with room gap design**: 回帰ベースラインを締め付け、Section 1.8 の room gap 設計を記録 |
+| `c5bcbe1` | **Improve mono initialization, stabilize 600-frame loops, update README**: xyz_mono **0.048→0.036**、600-frame **0.109-0.124m**、README更新 |
+| `6d81697` | **Add metric depth estimator, improve tracking, complete stella comparison**: `MetricDepthEstimator` 追加、`--metric-depth-model` 対応、`xyz` ATE **0.00913m**、`USE_DEPTH_DL=ON` で **55/55** |
+| `244bb56` | **Stabilize loop closing, add stella_vslam comparison, update plan**: ループ安定化、比較評価追加、`ctest` **51/51** |
+| `6429d9b` | **Refactor SLAM core, stabilize loop closing, and enrich test suite**: `tracking.cc` helper 抽出、`RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への状態集約、`loop_closing` internal helper 化、`optimizer` cleanup、`ctest` **48/48**、回帰ゲート **5/5** |
 
 ### 1.7 過去セッション履歴
 
@@ -592,8 +598,10 @@ LoopClosing Thread (loop_closing->run())
 | tracking.cc | kf_tracking_ratio | 0.75 | KF挿入のtracking率閾値 |
 | tracking.cc | lowe_ratio | 0.75 | ORBマッチのLowe ratio |
 | tracking.cc | max_lost_frames_ | 30 | LOST最大許容フレーム |
-| tracking.cc | reinit_trigger_ | 20 | 再初期化開始LOSTフレーム |
+| tracking.cc | reinit_trigger_frames_ | 20 | 再初期化開始LOSTフレーム |
 | tracking.cc | recovery_stabilization_window_frames_ | 3 | relocalization / loop handoff 後に厳しめの pose update guard を維持するフレーム数 |
+| tracking.cc | loop_relocalization_radius_m_ | 2.5m | loop correction handoff 直後に relocalization 候補を絞る半径 |
+| tracking.cc | recovery_relocalization_radius_m_ | 4.0m | 通常 recovery 時の relocalization 候補半径 |
 | tracking.cc | min_stable_support_ | 120 | local-map pose update を「stable support」とみなす最小対応数 |
 | tracking.cc | recovery_max_change_strict_ | 0.12 | thin-support / support regression 時の pose update 最大変化量 |
 | tracking.cc | recovery_max_change_relaxed_ | 0.18 | support が十分な recovery window 中の pose update 最大変化量 |
@@ -612,7 +620,7 @@ LoopClosing Thread (loop_closing->run())
 | loop_closing | sim3_scale (metric) | 0.85-1.15 | metric depthのscale範囲 |
 | loop_closing | sim3_scale (mono) | 0.7-1.4 | monocularのscale範囲 |
 | loop_closing | scale_weight (metric) | 1000.0 | PoseGraph scale weight |
-| loop_closing | loop_cooldown | 120 KF | ループ成功後のcooldown |
+| loop_closing | loop_cooldown | 200 KF | ループ成功後のcooldown |
 | onnx_depth | kInputW/H | 518 | DL推論入力サイズ |
 | onnx_depth | median_target | 1.5m | relative depthのscaling |
 
@@ -943,8 +951,8 @@ TUM は `--tum-camera-config <calib.json>` で外部キャリブ可能になっ�
 | Task | Status | 内容 |
 |------|--------|------|
 | A-1 | ✅完了 | ORB決定論化、BA収束強化、2パスPnP |
-| A-2 | 進行中 | `eval_all.sh --repeat N`、README 反映、回帰ゲート **5/5** までは完了。追加シーケンス拡充は未完 |
-| A-3 | ✅完了 | Google Test suite 拡充（`ctest` **48/48**。`frame` / `keyframe` / `initializer` / `loop_closing` / `tracking` / `tracking_pose_recompute` 追加） |
+| A-2 | 進行中 | `eval_all.sh --repeat N`、README 反映、回帰ゲート **5/5**、ベースライン締め付けまでは完了。追加シーケンス拡充は未完 |
+| A-3 | ✅完了 | Google Test suite 拡充（`ctest` **51/51**。`USE_DEPTH_DL=ON` では **55/55**。`frame` / `keyframe` / `initializer` / `loop_closing` / `tracking` / `tracking_pose_recompute` / `metric_depth_estimator` 追加） |
 | A-4 | ✅完了 | 英語 README と public-facing 結果表 |
 
 ### Phase F: Experiment-to-Convergence Workflow [収束完了]
@@ -975,11 +983,11 @@ TUM は `--tum-camera-config <calib.json>` で外部キャリブ可能になっ�
 - `room_depth_accel_tail` (750-250), `room_depth_accel_recovery` (350-300) を追加
 - repeat-5 で評価完了。結果は Section 3.2 に記載
 
-### Phase B: DL 深度の差別化強化
+### Phase B: DL 深度の差別化強化 [部分着手]
 
 | Task | Status | 内容 |
 |------|--------|------|
-| B-1 | 未着手 | Metric DL Depth（Metric3D v2 / UniDepth対応） |
+| B-1 | 部分完了 | `MetricDepthEstimator` を追加し、`--metric-depth-model` CLI と metric depth pipeline を実装。`xyz` ATE **0.00913m**。Metric3D v2 / UniDepth 対応拡充は未完 |
 | B-2 | 未着手 | GPU推論（CUDA ExecutionProvider） |
 | B-3 | 未着手 | DL Depth品質向上（confidence map、temporal consistency） |
 
@@ -1326,6 +1334,7 @@ python3 scripts/print_ate_mean.py /path/to/groundtruth.txt /path/to/trajectory.t
 
 ## 14. 変更履歴メモ（plan.md 自身）
 
+- **2026-04-14:** 2026-04-13 の 8 commits (`6429d9b`→`a32d904`) を反映する plan 更新を実施。Section 1.1 を `HEAD` `a32d904` ベースへ更新し、`USE_DEPTH_DL=ON` で `ctest` **55/55 pass**、`room_depth` ATE **0.1289→0.0695**（covisibility-weighted pose graph）、600-frame **0.109-0.124m**、xyz_mono **0.048→0.036**、metric depth `xyz` **0.00913m**、local BA **10→15**、回帰ベースライン締め付けを追記。Section 1.6 のコミット表を 8 件へ拡張し、Section 2.4 に `loop_relocalization_radius_m_` / `recovery_relocalization_radius_m_` と `loop_cooldown=200` を反映、Section 5 では Phase B を部分着手へ更新。
 - **2026-04-12:** Section 1.1 を現行 HEAD `6429d9b` ベースへ更新。`d3c81a7` 後続コミットとして、`tracking.cc` helper 抽出、`RecoveryState` / `LoopCorrectionState` / `ReinitializationState` への状態集約、`loop_closing` internal helper 化、`optimizer` cleanup、loop stabilization の反映、`ctest` **48/48 pass**、回帰ゲート **5/5 pass**、新規テスト（`test_frame.cc`, `test_keyframe.cc`, `test_initializer.cc`, `test_loop_closing.cc`, `test_tracking.cc`, `test_tracking_pose_recompute.cc`, `test_synthetic_scene.h`）を追記。Section 1.6 のコミット表、Section 2.1 の行数と test 一覧、Section 2.4 の recovery 系定数、Section 5 Phase A の testing 状態も更新。
 - **2026-04-09:** Section 1.1 を 2026-04-09 時点へ更新（未コミット差分量、retained best state、600-frame の未解決課題を反映）。Section 1.2 を拡張し、400-frame / 600-frame の rerun 結果、late-run での second-loop / relocalization 連鎖の現状、`TrackLocalMap()` thin-support overwrite guard 実験 3 variant（400-frame **0.07351221**、600-frame **0.19205861 / 0.18324189 / 0.19566213**、いずれも不採用）を長文で記録。次に触る候補として `TrackReferenceKeyframe()` の post-loop collapse、通常 BA callback 側 `recomputeCurrentPose()` の absolute fallback、pending correction expire 後の handoff 再設計を明記。
 - **2026-04-09:** 候補 2 を着手済みに更新。`src/tracking/tracking.cc` で BA callback の pose recompute から `err_after < 20.0` absolute fallback を除去し、strict reprojection improvement のみ許可する形へ統一。`tests/test_tracking_pose_recompute.cc` を追加し、`build_bench` の `ctest` 26/26 pass、`verify_comparison_benchmark.sh room_mono` で worsened BA update の reject ログを確認。
