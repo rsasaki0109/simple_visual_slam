@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>simple_visual_slam_ros2</name>
+  <name>simple_visual_slam_ros</name>
   <version>0.1.0</version>
   <description>Basic ROS 2 node wrapper for the SimpleVisualSLAM core library.</description>
 

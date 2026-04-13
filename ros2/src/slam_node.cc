@@ -8,7 +8,7 @@
 #include <Eigen/Geometry>
 
 #include <builtin_interfaces/msg/time.hpp>
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <image_transport/image_transport.hpp>

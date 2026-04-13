@@ -1,0 +1,1 @@
+{"schema":"svslam.run_summary.v1","version":"0.2.0","final_tracking_state":2,"processed_frames":10,"skipped_frames":0,"keyframes":4,"landmarks":1223,"reloc_attempts":0,"reloc_successes":0,"frames_tracking_lost":0,"reinit_successes":0,"map_saved":true}
