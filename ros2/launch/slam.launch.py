@@ -39,7 +39,7 @@ def generate_launch_description():
                 description="Maximum ORB features extracted per frame.",
             ),
             Node(
-                package="simple_visual_slam_ros2",
+                package="simple_visual_slam_ros",
                 executable="slam_node",
                 name="slam_node",
                 output="screen",

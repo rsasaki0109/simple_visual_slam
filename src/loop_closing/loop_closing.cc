@@ -888,7 +888,7 @@ void LoopClosing::correctLoop() {
     map_->loop_correcting_.store(true);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    Optimizer::poseGraphOptimization(map_, optimizer_edges, 60, has_metric_depth_);
+    Optimizer::poseGraphOptimization(map_, optimizer_edges, 90, has_metric_depth_);
 
     fuseLoopLandmarks();
 

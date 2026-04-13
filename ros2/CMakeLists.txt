@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(simple_visual_slam_ros2)
+project(simple_visual_slam_ros)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
@@ -24,7 +24,7 @@ add_executable(slam_node
 )
 
 target_compile_features(slam_node PRIVATE cxx_std_17)
-target_link_libraries(slam_node PRIVATE svslam_core)
+target_link_libraries(slam_node svslam_core)
 
 ament_target_dependencies(slam_node
   cv_bridge

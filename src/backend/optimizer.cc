@@ -4,6 +4,8 @@
 #include <ceres/manifold.h>
 #include <ceres/product_manifold.h>
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <set>
 #include <vector>
@@ -251,6 +253,20 @@ void addPoseGraphParameterBlock(ceres::Problem& problem,
     pose_params[keyframe->id_] = param;
     old_poses[keyframe->id_] = Sim3(1.0, snapshot_it->second.rotation, snapshot_it->second.translation);
 
+    ceres::Manifold* manifold =
+        new ceres::ProductManifold<
+            ceres::EuclideanManifold<3>,
+            ceres::QuaternionManifold,
+            ceres::EuclideanManifold<1>>();
+    problem.AddParameterBlock(param, 8, manifold);
+    if (constant) {
+        problem.SetParameterBlockConstant(param);
+    }
+}
+
+void attachPoseGraphParameterBlock(ceres::Problem& problem,
+                                   double* param,
+                                   bool constant) {
     ceres::Manifold* manifold =
         new ceres::ProductManifold<
             ceres::EuclideanManifold<3>,
@@ -559,30 +575,24 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
     const auto keyframe_snapshots = snapshotPoseGraphKeyframes(all_keyframes);
 
-    ceres::Problem problem;
+    ceres::Problem bootstrap_problem;
     std::map<unsigned long, double*> pose_params;
     std::map<unsigned long, Sim3> old_poses;
+    std::set<unsigned long> constant_pose_ids;
 
     bool first = true;
     for (const auto& kv : all_keyframes) {
-        addPoseGraphParameterBlock(problem, kv.second, keyframe_snapshots,
+        addPoseGraphParameterBlock(bootstrap_problem, kv.second, keyframe_snapshots,
                                    pose_params, old_poses, first);
+        if (first) {
+            constant_pose_ids.insert(kv.first);
+        }
         first = false;
     }
 
-    if (fix_scale) {
-        constexpr double kMetricScalePriorWeight = 100.0;
-        for (const auto& kv : pose_params) {
-            if (!problem.IsParameterBlockConstant(kv.second)) {
-                problem.AddResidualBlock(
-                    ScalePriorError::Create(kMetricScalePriorWeight),
-                    nullptr,
-                    kv.second);
-            }
-        }
-    }
-
-    auto addEdgeResidual = [&](const PoseGraphEdge& edge, ceres::LossFunction* loss) {
+    auto addEdgeResidual = [&](ceres::Problem& problem,
+                               const PoseGraphEdge& edge,
+                               ceres::LossFunction* loss) {
         if (!edge.from || !edge.to) return;
         auto from_it = pose_params.find(edge.from->id_);
         auto to_it = pose_params.find(edge.to->id_);
@@ -593,6 +603,28 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
             edge.rotation_weight,
             edge.scale_weight);
         problem.AddResidualBlock(cost, loss, from_it->second, to_it->second);
+    };
+
+    auto poseGraphResidualNorm = [&](const PoseGraphEdge& edge) {
+        if (!edge.from || !edge.to) {
+            return 0.0;
+        }
+        const auto from_it = pose_params.find(edge.from->id_);
+        const auto to_it = pose_params.find(edge.to->id_);
+        if (from_it == pose_params.end() || to_it == pose_params.end()) {
+            return 0.0;
+        }
+        PoseGraphError error(edge.relative_pose,
+                             edge.translation_weight,
+                             edge.rotation_weight,
+                             edge.scale_weight);
+        std::array<double, 7> residuals{};
+        error(from_it->second, to_it->second, residuals.data());
+        double sq_norm = 0.0;
+        for (const double residual : residuals) {
+            sq_norm += residual * residual;
+        }
+        return std::sqrt(sq_norm);
     };
 
     auto sharedLandmarkCount = [](const Keyframe::Ptr& from,
@@ -631,6 +663,15 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
         }
     }
 
+    struct WeightedPoseGraphEdge {
+        PoseGraphEdge edge;
+        bool is_loop = false;
+        double irls_weight = 1.0;
+    };
+
+    std::vector<WeightedPoseGraphEdge> weighted_edges;
+    weighted_edges.reserve(all_keyframes.size() * 6 + loop_edges.size());
+
     std::set<std::pair<unsigned long, unsigned long>> added_pairs;
     int covisibility_edges = 0;
     for (const auto& kv : all_keyframes) {
@@ -668,14 +709,14 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
             edge.translation_weight = weight_scale;
             edge.rotation_weight = weight_scale;
             edge.scale_weight = fix_scale ? 100.0 : (1.5 * weight_scale);
-            addEdgeResidual(edge, new ceres::HuberLoss(1.0));
+            weighted_edges.push_back({edge, false, 1.0});
             ++covisibility_edges;
         }
     }
 
     int loop_edge_count = 0;
     for (const auto& edge : loop_edges) {
-        addEdgeResidual(edge, new ceres::HuberLoss(0.5));
+        weighted_edges.push_back({edge, true, 1.0});
         ++loop_edge_count;
     }
 
@@ -686,15 +727,134 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
         return;
     }
 
-    ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.num_threads = ceres_num_threads_from_env();
-    options.max_num_iterations = iterations;
-    options.minimizer_progress_to_stdout = false;
-    options.logging_type = ceres::SILENT;
+    auto medianOf = [](std::vector<double> values) {
+        if (values.empty()) {
+            return 0.0;
+        }
+        const auto mid = values.begin() + (values.size() / 2);
+        std::nth_element(values.begin(), mid, values.end());
+        double median = *mid;
+        if ((values.size() % 2) == 0) {
+            const auto lower_mid = values.begin() + (values.size() / 2 - 1);
+            std::nth_element(values.begin(), lower_mid, values.end());
+            median = 0.5 * (median + *lower_mid);
+        }
+        return median;
+    };
 
-    ceres::Solver::Summary summary;
-    ceres::Solve(options, &problem, &summary);
+    auto buildProblem = [&](ceres::Problem& problem) {
+        for (const auto& kv : pose_params) {
+            attachPoseGraphParameterBlock(problem,
+                                          kv.second,
+                                          constant_pose_ids.count(kv.first) > 0);
+        }
+
+        if (fix_scale) {
+            constexpr double kMetricScalePriorWeight = 100.0;
+            for (const auto& kv : pose_params) {
+                if (constant_pose_ids.count(kv.first) == 0) {
+                    problem.AddResidualBlock(
+                        ScalePriorError::Create(kMetricScalePriorWeight),
+                        nullptr,
+                        kv.second);
+                }
+            }
+        }
+
+        for (const auto& weighted_edge : weighted_edges) {
+            PoseGraphEdge scaled_edge = weighted_edge.edge;
+            const double w = weighted_edge.irls_weight;
+            scaled_edge.translation_weight *= w;
+            scaled_edge.rotation_weight *= w;
+            scaled_edge.scale_weight *= w;
+            ceres::LossFunction* loss = weighted_edge.is_loop
+                ? static_cast<ceres::LossFunction*>(new ceres::CauchyLoss(1.0))
+                : static_cast<ceres::LossFunction*>(new ceres::HuberLoss(1.0));
+            addEdgeResidual(problem, scaled_edge, loss);
+        }
+    };
+
+    auto solvePoseGraph = [&](const char* pass_name) {
+        ceres::Problem problem;
+        buildProblem(problem);
+
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+        options.sparse_linear_algebra_library_type = ceres::SUITE_SPARSE;
+        options.num_threads = ceres_num_threads_from_env();
+        options.max_num_iterations = std::max(iterations, loop_edge_count > 0 ? 90 : iterations);
+        options.minimizer_progress_to_stdout = false;
+        options.logging_type = ceres::SILENT;
+
+        std::cout << "PoseGraph(" << pass_name
+                  << "): linear_solver=SPARSE_NORMAL_CHOLESKY"
+                  << " sparse_library=SUITE_SPARSE"
+                  << " loss_loop=Cauchy"
+                  << " loss_covisibility=Huber"
+                  << " max_iterations=" << options.max_num_iterations
+                  << std::endl;
+
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+        return summary;
+    };
+
+    ceres::Solver::Summary summary = solvePoseGraph("pass1");
+
+    int irls_downweighted_edges = 0;
+    double irls_min_weight = 1.0;
+    double irls_max_weight = 1.0;
+    if (loop_edge_count > 0) {
+        std::vector<double> loop_residuals;
+        loop_residuals.reserve(loop_edge_count);
+        for (const auto& weighted_edge : weighted_edges) {
+            if (!weighted_edge.is_loop) {
+                continue;
+            }
+            loop_residuals.push_back(poseGraphResidualNorm(weighted_edge.edge));
+        }
+
+        const double residual_median = medianOf(loop_residuals);
+        std::vector<double> residual_deviations;
+        residual_deviations.reserve(loop_residuals.size());
+        for (const double residual : loop_residuals) {
+            residual_deviations.push_back(std::abs(residual - residual_median));
+        }
+        const double residual_mad = medianOf(residual_deviations);
+        const double residual_cutoff = std::max(1.0, residual_median + 2.5 * residual_mad);
+
+        bool rerun_irls = false;
+        for (auto& weighted_edge : weighted_edges) {
+            if (!weighted_edge.is_loop) {
+                continue;
+            }
+            const double residual = poseGraphResidualNorm(weighted_edge.edge);
+            double weight = 1.0;
+            if (residual > residual_cutoff) {
+                weight = std::clamp(std::sqrt(residual_cutoff / residual), 0.20, 1.0);
+            }
+            weighted_edge.irls_weight = weight;
+            irls_min_weight = std::min(irls_min_weight, weight);
+            irls_max_weight = std::max(irls_max_weight, weight);
+            if (weight < 0.999) {
+                rerun_irls = true;
+                ++irls_downweighted_edges;
+            }
+        }
+
+        std::cout << "PoseGraph: IRLS residual_median=" << residual_median
+                  << " residual_mad=" << residual_mad
+                  << " cutoff=" << residual_cutoff
+                  << " downweighted_loop_edges=" << irls_downweighted_edges
+                  << " min_loop_weight=" << irls_min_weight
+                  << " max_loop_weight=" << irls_max_weight
+                  << std::endl;
+
+        if (rerun_irls) {
+            summary = solvePoseGraph("pass2_irls");
+        }
+    }
+
     double min_scale = std::numeric_limits<double>::infinity();
     double max_scale = 0.0;
     double sum_scale = 0.0;
@@ -702,7 +862,9 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
     std::cout << "PoseGraph: " << summary.BriefReport()
               << " | covisibility_edges=" << covisibility_edges
-              << " | loop_edges=" << loop_edge_count << std::endl;
+              << " | loop_edges=" << loop_edge_count
+              << " | irls_downweighted_loop_edges=" << irls_downweighted_edges
+              << std::endl;
 
     std::map<unsigned long, Sim3> optimized_poses;
     for (const auto& kv : all_keyframes) {
