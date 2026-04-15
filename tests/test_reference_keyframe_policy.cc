@@ -42,6 +42,45 @@ TEST(ReferenceKeyframePolicyTest, DenseMonoCandidatePromotes) {
     EXPECT_TRUE(decision.promoteNewReference());
 }
 
+TEST(ReferenceKeyframePolicyTest, LateSparseMonoWithStrongCoverageCanRefreshReference) {
+    HeuristicReferenceKeyframePolicy policy;
+    ReferenceKeyframePolicyInput input;
+    input.tracked_features = 22;
+    input.detected_keypoints = 852;
+    input.candidate_landmarks = 22;
+    input.frames_since_reference = 4;
+    input.has_depth = false;
+
+    const auto decision = policy.evaluate(input);
+    EXPECT_TRUE(decision.promoteNewReference());
+}
+
+TEST(ReferenceKeyframePolicyTest, LateSparseMonoNeedsAtLeastThreeFramesToRefresh) {
+    HeuristicReferenceKeyframePolicy policy;
+    ReferenceKeyframePolicyInput input;
+    input.tracked_features = 22;
+    input.detected_keypoints = 852;
+    input.candidate_landmarks = 22;
+    input.frames_since_reference = 2;
+    input.has_depth = false;
+
+    const auto decision = policy.evaluate(input);
+    EXPECT_FALSE(decision.promoteNewReference());
+}
+
+TEST(ReferenceKeyframePolicyTest, LateSparseMonoNeedsEnoughCandidateLandmarksToRefresh) {
+    HeuristicReferenceKeyframePolicy policy;
+    ReferenceKeyframePolicyInput input;
+    input.tracked_features = 22;
+    input.detected_keypoints = 852;
+    input.candidate_landmarks = 14;
+    input.frames_since_reference = 4;
+    input.has_depth = false;
+
+    const auto decision = policy.evaluate(input);
+    EXPECT_FALSE(decision.promoteNewReference());
+}
+
 TEST(ReferenceKeyframePolicyTest, ScorePolicyPromotesDepthAccelSparseRescue) {
     ScoreReferenceKeyframePolicy policy;
     ReferenceKeyframePolicyInput input;

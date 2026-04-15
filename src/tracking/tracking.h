@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iosfwd>
 
 #include "core/common.h"
 #include "core/frame.h"
@@ -41,6 +42,7 @@ public:
     void setMap(std::shared_ptr<Map> map);
     void setLocalMapping(std::shared_ptr<LocalMapping> local_mapping);
     void setReferenceKeyframePolicy(std::unique_ptr<ReferenceKeyframePolicy> policy);
+    void setKeyframeDecisionTraceSink(std::shared_ptr<std::ostream> trace_sink);
     bool addFrame(Frame::Ptr frame);
 
     TrackingRunStatistics runStatistics() const { return run_stats_; }
@@ -121,6 +123,11 @@ private:
     bool reinitialize();  // Re-initialize from scratch when lost for too long
     void setReferenceKeyframe(Keyframe::Ptr kf);
     void setKeyframeGravity(Keyframe::Ptr kf);  // Set gravity from accel data
+    void traceKeyframeDecision(bool insert_keyframe,
+                               const char* reason,
+                               int ref_landmarks,
+                               double tracked_ratio,
+                               int frames_since_reference);
     static std::size_t countValidFrameLandmarks(const Frame::Ptr& frame);
 
     cv::Ptr<cv::DescriptorMatcher> matcher_;
@@ -144,6 +151,8 @@ private:
     static constexpr int reinit_trigger_frames_ = 20;  // Start re-init after this many lost frames
 
     TrackingRunStatistics run_stats_;
+    std::shared_ptr<std::ostream> keyframe_decision_trace_sink_;
+    bool keyframe_decision_trace_header_written_ = false;
 };
 
 }

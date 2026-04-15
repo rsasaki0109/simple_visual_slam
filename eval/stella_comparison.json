@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-13T13:11:19+09:00",
+  "generated_at": "2026-04-15T12:00:00+09:00",
   "comparison_protocol": {
     "reference": "eval/comparison_protocol.md",
     "evo_ape_flags": [
@@ -10,8 +10,8 @@
     ],
     "simple_visual_slam": {
       "build_dir": "build_codex",
-      "git_head": "6429d9b9ba34697c668b474acac8ca456653f8fe",
-      "version": "SimpleVisualSLAM 0.1.0",
+      "git_head": "2ac7ffaa365e7a144802e7bcc325182c724cb375",
+      "version": "SimpleVisualSLAM 0.2.0",
       "tracked_frame_window": 250,
       "common_flags": [
         "--max-frames",
@@ -22,15 +22,17 @@
         "heuristic"
       ],
       "depth_extra_flag": "--depth",
+      "measurement_command": "bash scripts/verify_comparison_benchmark.sh <preset> with BUILD=build_codex",
+      "trajectory_output": "build_codex/trajectory.txt (overwritten per preset run)",
       "loop_closing": {
         "status": "disabled",
-        "reason": "Repro eval mode disables loop closing; logs also report ORBvoc.txt not found from build_codex cwd."
+        "reason": "`--repro-eval` runs local mapping synchronously and disables loop closing."
       }
     },
     "stella_vslam": {
       "results_root": "stella_eval",
       "loop_closing_status": "unknown",
-      "artifact_note": "Provided stella_eval frame_trajectory.txt files were not canonical 250-frame windows; fair comparison uses the first 250 poses from each provided trajectory."
+      "artifact_note": "Provided stella_eval frame_trajectory.txt files were not canonical 250-frame windows; fair comparison uses the first 250 poses from each provided trajectory. Baselines not re-run in this refresh."
     }
   },
   "scenarios": {
@@ -38,8 +40,8 @@
       "sequence": "rgbd_dataset_freiburg1_xyz",
       "modality": "depth",
       "simple_visual_slam": {
-        "trajectory_path": "build_codex/trajectory_xyz_depth.txt",
-        "ate_mean_m": 0.01136912
+        "trajectory_path": "build_codex/trajectory.txt",
+        "ate_mean_m": 0.01104221
       },
       "stella_vslam": {
         "provided_trajectory_path": "stella_eval/xyz_depth/frame_trajectory.txt",
@@ -50,18 +52,18 @@
       },
       "comparison": {
         "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
-        "delta_simple_minus_stella_m": 0.00247656,
+        "delta_simple_minus_stella_m": 0.00314965,
         "winner": "stella_vslam",
         "simple_loses": true,
-        "loss_hypothesis": "Slightly higher local RGB-D pose noise from the current heuristic keyframe/depth stack than stella_vslam's more mature ORB + local BA pipeline on this short translation-heavy clip."
+        "loss_hypothesis": "Slightly higher local RGB-D pose noise than stella_vslam on this short translation-heavy clip; gap is modest (~1.25x)."
       }
     },
     "xyz_mono": {
       "sequence": "rgbd_dataset_freiburg1_xyz",
       "modality": "mono",
       "simple_visual_slam": {
-        "trajectory_path": "build_codex/trajectory_xyz_mono.txt",
-        "ate_mean_m": 0.04827879
+        "trajectory_path": "build_codex/trajectory.txt",
+        "ate_mean_m": 0.02702567
       },
       "stella_vslam": {
         "provided_trajectory_path": "stella_eval/xyz_mono/frame_trajectory.txt",
@@ -72,18 +74,18 @@
       },
       "comparison": {
         "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
-        "delta_simple_minus_stella_m": 0.03414309,
+        "delta_simple_minus_stella_m": 0.01288997,
         "winner": "stella_vslam",
         "simple_loses": true,
-        "loss_hypothesis": "Monocular initialization and early map maintenance drift more than stella_vslam's ORB front-end/local optimization, producing a much larger head-250 pose error."
+        "loss_hypothesis": "Monocular still trails stella on xyz head-250, but the gap narrowed materially versus older SimpleVisualSLAM snapshots in this file."
       }
     },
     "room_depth": {
       "sequence": "rgbd_dataset_freiburg1_room",
       "modality": "depth",
       "simple_visual_slam": {
-        "trajectory_path": "build_codex/trajectory_room_depth.txt",
-        "ate_mean_m": 0.08606639
+        "trajectory_path": "build_codex/trajectory.txt",
+        "ate_mean_m": 0.07991444
       },
       "stella_vslam": {
         "provided_trajectory_path": "stella_eval/room_depth/frame_trajectory.txt",
@@ -94,18 +96,18 @@
       },
       "comparison": {
         "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
-        "delta_simple_minus_stella_m": 0.06496131,
+        "delta_simple_minus_stella_m": 0.05880936,
         "winner": "stella_vslam",
         "simple_loses": true,
-        "loss_hypothesis": "With loop closing disabled in --repro-eval, the room sequence accumulates much more drift through revisits than stella_vslam on the same early trajectory segment."
+        "loss_hypothesis": "With loop closing disabled in `--repro-eval`, room revisits accumulate more drift than stella on the same early window; improved vs older SimpleVisualSLAM rows but still far from stella."
       }
     },
     "room_mono": {
       "sequence": "rgbd_dataset_freiburg1_room",
       "modality": "mono",
       "simple_visual_slam": {
-        "trajectory_path": "build_codex/trajectory_room_mono.txt",
-        "ate_mean_m": 0.19982044
+        "trajectory_path": "build_codex/trajectory.txt",
+        "ate_mean_m": 0.22049743
       },
       "stella_vslam": {
         "provided_trajectory_path": "stella_eval/room_mono/frame_trajectory.txt",
@@ -116,10 +118,10 @@
       },
       "comparison": {
         "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
-        "delta_simple_minus_stella_m": 0.17238498,
+        "delta_simple_minus_stella_m": 0.19306197,
         "winner": "stella_vslam",
         "simple_loses": true,
-        "loss_hypothesis": "Monocular scale drift plus no loop closure is especially costly on room_mono, where correspondence support thins out and the map degrades much earlier than stella_vslam."
+        "loss_hypothesis": "Monocular scale drift and thin support on `room_mono` without loop closure remain the largest gap versus stella."
       }
     }
   }

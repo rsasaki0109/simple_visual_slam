@@ -196,8 +196,25 @@ void LocalMapping::createNewMapPoints() {
     int nn = 15;
     std::vector<Keyframe::Ptr> neighbors = current_processed_kf_->getBestCovisibilityKeyframes(nn);
 
+    int valid_landmarks = 0;
+    for (const auto& lm : current_processed_kf_->landmarks_) {
+        if (lm && !lm->isBad()) {
+            ++valid_landmarks;
+        }
+    }
+
     // Fallback: if covisibility graph has no neighbors, use all keyframes in the map
     if (neighbors.empty()) {
+        const bool sparse_mono_without_support =
+            current_processed_kf_->depth_image_.empty() &&
+            valid_landmarks < 20;
+        if (sparse_mono_without_support) {
+            std::cout << "LocalMapping::createNewMapPoints: skipping all-KF fallback for sparse mono KF "
+                      << current_processed_kf_->id_
+                      << " (valid_landmarks=" << valid_landmarks << ")" << std::endl;
+            return;
+        }
+
         const auto& all_kfs = map_->getAllKeyframes();
         for (const auto& kv : all_kfs) {
             if (kv.second && kv.second != current_processed_kf_) {
