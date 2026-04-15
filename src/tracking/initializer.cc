@@ -108,7 +108,7 @@ bool Initializer::initialize(Frame::Ptr frame_cur, float sigma, int max_iteratio
     // 3. Select model
     float ratio = score_H / (score_H + score_F + 1e-5);
     const int min_triangulated = kInitMinTriangulatedPoints;
-    bool use_H = ratio > 0.50f;
+    bool use_H = ratio > 0.60f;
 
     cv::Mat K = frame_ref_->camera_->K();
     

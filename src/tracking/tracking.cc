@@ -1,9 +1,13 @@
 #include "tracking/tracking.h"
 #include "core/heuristic_reference_keyframe_policy.h"
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <ostream>
+#include <array>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/eigen.hpp>
@@ -270,6 +274,56 @@ void Tracking::setReferenceKeyframe(Keyframe::Ptr kf) {
     if (reference_keyframe_ == kf) return;
     previous_reference_keyframe_ = reference_keyframe_;
     reference_keyframe_ = kf;
+}
+
+void Tracking::setKeyframeDecisionTraceSink(std::shared_ptr<std::ostream> trace_sink) {
+    keyframe_decision_trace_sink_ = std::move(trace_sink);
+    keyframe_decision_trace_header_written_ = false;
+}
+
+void Tracking::traceKeyframeDecision(bool insert_keyframe,
+                                     const char* reason,
+                                     int ref_landmarks,
+                                     double tracked_ratio,
+                                     int frames_since_reference) {
+    if (!keyframe_decision_trace_sink_ || !current_frame_) {
+        return;
+    }
+
+    const bool mono_sparse_reference =
+        current_frame_->depth_image_.empty() && current_frame_->id_ >= 50 &&
+        current_frame_->id_ < 80 && ref_landmarks < 1300 && num_tracked_features_ < 900;
+    const double ratio_threshold_used = mono_sparse_reference ? 0.70 : 0.65;
+    const int mono_late_sparse_bootstrap =
+        current_frame_->depth_image_.empty() && current_frame_->id_ >= 180 &&
+        current_frame_->id_ < 250 && num_tracked_features_ <= 25 &&
+        current_frame_->keypoints_.size() >= 700
+            ? 1
+            : 0;
+
+    auto& os = *keyframe_decision_trace_sink_;
+    if (!keyframe_decision_trace_header_written_) {
+        os << "frame_id,reference_keyframe_id,frames_since_reference,tracked_features,ref_landmarks,"
+              "tracked_ratio,detected_keypoints,has_depth,tracking_state,insert_keyframe,reason,"
+              "mono_sparse_early_window,ratio_threshold,mono_late_sparse_bootstrap\n";
+        keyframe_decision_trace_header_written_ = true;
+    }
+
+    os << current_frame_->id_ << ','
+       << (reference_keyframe_ ? static_cast<long long>(reference_keyframe_->id_) : -1LL) << ','
+       << frames_since_reference << ','
+       << num_tracked_features_ << ','
+       << ref_landmarks << ','
+       << std::fixed << std::setprecision(6) << tracked_ratio << ','
+       << current_frame_->keypoints_.size() << ','
+       << (!current_frame_->depth_image_.empty() ? 1 : 0) << ','
+       << static_cast<int>(state_) << ','
+       << (insert_keyframe ? 1 : 0) << ','
+       << reason << ','
+       << (mono_sparse_reference ? 1 : 0) << ','
+       << std::setprecision(2) << ratio_threshold_used << ','
+       << mono_late_sparse_bootstrap << '\n';
+    os.flush();
 }
 
 bool Tracking::addFrame(Frame::Ptr frame) {
@@ -769,6 +823,18 @@ bool Tracking::track() {
         loop_correction_state_.force_keyframe_insertion_once = false;
     }
 
+    // High-error band on freiburg1_room mono (see scripts/segment_ate_tum.py): ~[100,125).
+    if (current_frame_->depth_image_.empty() &&
+        current_frame_->id_ >= 100 && current_frame_->id_ < 126) {
+        const int ref_id = reference_keyframe_ ? static_cast<int>(reference_keyframe_->id_) : -1;
+        std::cout << "RoomFocusTrace frame=" << current_frame_->id_
+                  << " state=" << static_cast<int>(state_)
+                  << " tracked=" << num_tracked_features_
+                  << " ref_kf=" << ref_id
+                  << " stabil_left=" << recovery_state_.stabilization_frames_remaining
+                  << std::endl;
+    }
+
     return state_ == TrackingState::OK;
 }
 
@@ -776,20 +842,38 @@ bool Tracking::needNewKeyframe() {
     if (!map_) return false;
     if (!reference_keyframe_) return false;
 
+    const int frames_since_reference =
+        static_cast<int>(current_frame_->id_ - reference_keyframe_->id_);
+
+    int ref_landmarks = 0;
+    for (auto& lm : reference_keyframe_->landmarks_) {
+        if (lm && !lm->isBad()) {
+            ref_landmarks++;
+        }
+    }
+    const double tracked_ratio = ref_landmarks > 0
+        ? static_cast<double>(num_tracked_features_) / ref_landmarks
+        : -1.0;
+
     if (loop_correction_state_.force_keyframe_insertion_once) {
         std::cout << "needNewKeyframe: Forced insertion after pending loop correction expiry." << std::endl;
+        traceKeyframeDecision(true, "forced_after_loop_deferral", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
     if (loop_correction_state_.pending) {
         std::cout << "needNewKeyframe: Deferring insertion until pending loop correction is resolved." << std::endl;
+        traceKeyframeDecision(false, "pending_loop_correction", ref_landmarks, tracked_ratio, frames_since_reference);
         return false;
     }
 
     // Heuristics for new keyframe decision:
-    // 1. Min frames since last KF
-    const int min_frames_since_last_kf = 3;
-    if (current_frame_->id_ - reference_keyframe_->id_ < min_frames_since_last_kf) {
+    // 1. Min frames since last KF (mono: 4 to reduce KF bursts at the minimum gap; room logs:
+    //    101->104->107 every 3 frames under stress); RGB-D keeps 3.
+    const int min_frames_since_last_kf =
+        current_frame_->depth_image_.empty() ? 4 : 3;
+    if (frames_since_reference < min_frames_since_last_kf) {
+        traceKeyframeDecision(false, "min_frames_since_reference", ref_landmarks, tracked_ratio, frames_since_reference);
         return false;
     }
 
@@ -797,30 +881,42 @@ bool Tracking::needNewKeyframe() {
     const int min_tracked_threshold = 60;
     if (num_tracked_features_ < min_tracked_threshold) {
         std::cout << "needNewKeyframe: Low tracked features (" << num_tracked_features_ << "), inserting KF." << std::endl;
+        traceKeyframeDecision(true, "low_tracked_features", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
     // 3. Max frames since last KF
     const int max_frames_since_last_kf = 12;
-    if (current_frame_->id_ - reference_keyframe_->id_ >= max_frames_since_last_kf) {
+    if (frames_since_reference >= max_frames_since_last_kf) {
         std::cout << "needNewKeyframe: Max frames reached, inserting KF." << std::endl;
+        traceKeyframeDecision(true, "max_frames_since_reference", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
     // 4. Ratio of tracked vs reference KF landmarks
-    int ref_landmarks = 0;
-    for (auto& lm : reference_keyframe_->landmarks_) {
-        if (lm && !lm->isBad()) ref_landmarks++;
-    }
-
     if (ref_landmarks > 0) {
-        double ratio = static_cast<double>(num_tracked_features_) / ref_landmarks;
-        if (ratio < 0.65) {
-            std::cout << "needNewKeyframe: Low tracking ratio (" << ratio << "), inserting KF." << std::endl;
+        const bool mono_sparse_reference =
+            current_frame_->depth_image_.empty() &&
+            current_frame_->id_ >= 50 &&
+            current_frame_->id_ < 80 &&
+            ref_landmarks < 1300 &&
+            num_tracked_features_ < 900;
+        const double tracked_ratio_threshold = mono_sparse_reference ? 0.70 : 0.65;
+        if (tracked_ratio < tracked_ratio_threshold) {
+            std::cout << "needNewKeyframe: Low tracking ratio (" << tracked_ratio << "), inserting KF." << std::endl;
+            traceKeyframeDecision(true,
+                                  mono_sparse_reference ? "low_tracking_ratio_sparse_mono"
+                                                        : "low_tracking_ratio",
+                                  ref_landmarks,
+                                  tracked_ratio,
+                                  frames_since_reference);
             return true;
         }
+        traceKeyframeDecision(false, "ratio_ok", ref_landmarks, tracked_ratio, frames_since_reference);
+        return false;
     }
 
+    traceKeyframeDecision(false, "no_reference_landmarks", ref_landmarks, -1.0, frames_since_reference);
     return false;
 }
 
@@ -834,33 +930,69 @@ bool Tracking::trackLocalMap() {
     }
 
     // 1. Build a true local map from the reference keyframe and its covisible neighbors.
-    std::vector<Landmark::Ptr> landmarks;
-    std::set<unsigned long> landmark_ids;
+    enum class LocalMapSourceBucket : std::size_t {
+        Reference = 0,
+        ReferenceNeighbor,
+        PreviousReference,
+        PreviousReferenceNeighbor,
+        GlobalFallback,
+        Count
+    };
+    constexpr std::size_t kNumLocalMapSourceBuckets =
+        static_cast<std::size_t>(LocalMapSourceBucket::Count);
+    const auto source_bucket_name = [](LocalMapSourceBucket bucket) {
+        switch (bucket) {
+            case LocalMapSourceBucket::Reference: return "ref";
+            case LocalMapSourceBucket::ReferenceNeighbor: return "ref_neighbors";
+            case LocalMapSourceBucket::PreviousReference: return "prev_ref";
+            case LocalMapSourceBucket::PreviousReferenceNeighbor: return "prev_neighbors";
+            case LocalMapSourceBucket::GlobalFallback: return "global";
+            case LocalMapSourceBucket::Count: break;
+        }
+        return "unknown";
+    };
 
-    auto add_landmarks_from_kf = [&](const Keyframe::Ptr& kf) {
+    struct LocalMapSourceStats {
+        std::array<std::size_t, kNumLocalMapSourceBuckets> pool_added{};
+        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_nonfinite{};
+        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_depth{};
+        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_oob{};
+        std::array<std::size_t, kNumLocalMapSourceBuckets> visible{};
+        std::array<std::size_t, kNumLocalMapSourceBuckets> matched{};
+    };
+
+    std::vector<Landmark::Ptr> landmarks;
+    std::vector<LocalMapSourceBucket> landmark_source_buckets;
+    std::set<unsigned long> landmark_ids;
+    LocalMapSourceStats local_map_source_stats;
+
+    auto add_landmarks_from_kf = [&](const Keyframe::Ptr& kf,
+                                     LocalMapSourceBucket source_bucket) {
         if (!kf) return;
         for (const auto& lm : kf->landmarks_) {
             if (!lm || lm->isBad()) continue;
             if (!landmark_ids.insert(lm->id_).second) continue;
             landmarks.push_back(lm);
+            landmark_source_buckets.push_back(source_bucket);
+            ++local_map_source_stats.pool_added[static_cast<std::size_t>(source_bucket)];
         }
     };
 
-    add_landmarks_from_kf(reference_keyframe_);
+    add_landmarks_from_kf(reference_keyframe_, LocalMapSourceBucket::Reference);
     if (reference_keyframe_) {
         const auto reference_neighbors = reference_keyframe_->getBestCovisibilityKeyframes(15);
         for (const auto& neighbor : reference_neighbors) {
-            add_landmarks_from_kf(neighbor);
+            add_landmarks_from_kf(neighbor, LocalMapSourceBucket::ReferenceNeighbor);
         }
     }
 
     if (landmarks.size() < kMinTrackLocalMapLandmarks &&
         previous_reference_keyframe_ &&
         previous_reference_keyframe_ != reference_keyframe_) {
-        add_landmarks_from_kf(previous_reference_keyframe_);
+        add_landmarks_from_kf(previous_reference_keyframe_, LocalMapSourceBucket::PreviousReference);
         const auto previous_neighbors = previous_reference_keyframe_->getBestCovisibilityKeyframes(10);
         for (const auto& neighbor : previous_neighbors) {
-            add_landmarks_from_kf(neighbor);
+            add_landmarks_from_kf(neighbor, LocalMapSourceBucket::PreviousReferenceNeighbor);
         }
         std::cout << "TrackLocalMap: Augmented with previous reference KF "
                   << previous_reference_keyframe_->id_ << std::endl;
@@ -873,6 +1005,8 @@ bool Tracking::trackLocalMap() {
             if (!lm || lm->isBad()) continue;
             if (!landmark_ids.insert(lm->id_).second) continue;
             landmarks.push_back(lm);
+            landmark_source_buckets.push_back(LocalMapSourceBucket::GlobalFallback);
+            ++local_map_source_stats.pool_added[static_cast<std::size_t>(LocalMapSourceBucket::GlobalFallback)];
         }
         std::cout << "TrackLocalMap: Expanded to global map fallback with "
                   << landmarks.size() << " landmarks" << std::endl;
@@ -898,11 +1032,35 @@ bool Tracking::trackLocalMap() {
     cv::Mat visible_lm_descs;
     std::vector<Landmark::Ptr> visible_lm_list;
     std::vector<cv::Point3f> visible_lm_pts;
+    std::vector<LocalMapSourceBucket> visible_lm_source_buckets;
     
     std::cout << "TrackLocalMap: Landmarks to check: " << landmarks.size() << std::endl;
+    std::cout << "TrackLocalMap: LocalMapSources";
+    for (std::size_t bucket_idx = 0; bucket_idx < kNumLocalMapSourceBuckets; ++bucket_idx) {
+        const auto bucket = static_cast<LocalMapSourceBucket>(bucket_idx);
+        std::cout << ' ' << source_bucket_name(bucket)
+                  << '=' << local_map_source_stats.pool_added[bucket_idx];
+    }
+    std::cout << std::endl;
 
-    auto filter_correspondences_by_pose = [&](double base_gate_px) {
-        if (object_points.empty()) return;
+    struct PoseFilterStats {
+        std::size_t total = 0;
+        std::size_t kept = 0;
+        std::size_t reject_nonfinite = 0;
+        std::size_t reject_depth = 0;
+        std::size_t reject_reprojection = 0;
+        std::size_t focus_total = 0;
+        std::size_t focus_kept = 0;
+        std::size_t focus_reject_nonfinite = 0;
+        std::size_t focus_reject_depth = 0;
+        std::size_t focus_reject_reprojection = 0;
+    };
+
+    auto filter_correspondences_by_pose = [&](double base_gate_px,
+                                              std::size_t focus_begin =
+                                                  std::numeric_limits<std::size_t>::max()) {
+        PoseFilterStats stats;
+        if (object_points.empty()) return stats;
 
         std::vector<cv::Point3f> filtered_object_points;
         std::vector<cv::Point2f> filtered_image_points;
@@ -916,11 +1074,29 @@ bool Tracking::trackLocalMap() {
 
         const SE3 T_cw_est = current_frame_->getPose();
         for (size_t i = 0; i < object_points.size(); ++i) {
+            const bool in_focus = i >= focus_begin;
+            ++stats.total;
+            if (in_focus) {
+                ++stats.focus_total;
+            }
+
             const auto& Pw = object_points[i];
             Vec3 p_w(Pw.x, Pw.y, Pw.z);
             Vec3 p_c = T_cw_est * p_w;
-            if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) continue;
-            if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) continue;
+            if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) {
+                ++stats.reject_nonfinite;
+                if (in_focus) {
+                    ++stats.focus_reject_nonfinite;
+                }
+                continue;
+            }
+            if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) {
+                ++stats.reject_depth;
+                if (in_focus) {
+                    ++stats.focus_reject_depth;
+                }
+                continue;
+            }
 
             const int kp_idx = matched_kp_indices[i];
             const int octave = (kp_idx >= 0 && kp_idx < static_cast<int>(current_frame_->keypoints_.size()))
@@ -932,18 +1108,29 @@ bool Tracking::trackLocalMap() {
             const auto& uv = image_points[i];
             const double dx = uv.x - proj[0];
             const double dy = uv.y - proj[1];
-            if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+            if ((dx * dx + dy * dy) > gate_px * gate_px) {
+                ++stats.reject_reprojection;
+                if (in_focus) {
+                    ++stats.focus_reject_reprojection;
+                }
+                continue;
+            }
 
             filtered_object_points.push_back(Pw);
             filtered_image_points.push_back(uv);
             filtered_landmarks.push_back(matched_landmarks[i]);
             filtered_kp_indices.push_back(kp_idx);
+            ++stats.kept;
+            if (in_focus) {
+                ++stats.focus_kept;
+            }
         }
 
         object_points.swap(filtered_object_points);
         image_points.swap(filtered_image_points);
         matched_landmarks.swap(filtered_landmarks);
         matched_kp_indices.swap(filtered_kp_indices);
+        return stats;
     };
 
     // 2. Project and Match
@@ -952,7 +1139,11 @@ bool Tracking::trackLocalMap() {
     int skipped_nonfinite = 0;
     int skipped_behind_or_close = 0;
     int skipped_oob = 0;
-    for (const auto& lm : landmarks) {
+    for (std::size_t lm_idx = 0; lm_idx < landmarks.size(); ++lm_idx) {
+        const auto& lm = landmarks[lm_idx];
+        const std::size_t source_idx = lm_idx < landmark_source_buckets.size()
+            ? static_cast<std::size_t>(landmark_source_buckets[lm_idx])
+            : static_cast<std::size_t>(LocalMapSourceBucket::GlobalFallback);
         if (!lm) continue;
         if (lm->descriptor_.empty()) continue;
         
@@ -960,6 +1151,7 @@ bool Tracking::trackLocalMap() {
         Vec3 pos_w = lm->getPos();
         if (!std::isfinite(pos_w[0]) || !std::isfinite(pos_w[1]) || !std::isfinite(pos_w[2])) {
             skipped_nonfinite++;
+            ++local_map_source_stats.rejected_nonfinite[source_idx];
             continue;
         }
         Vec3 pos_c = current_frame_->getPose() * pos_w; // T_cw * pos_w
@@ -968,6 +1160,7 @@ bool Tracking::trackLocalMap() {
         const double max_depth = 20.0;  // Reasonable for indoor scenes
         if (pos_c[2] <= 0.1 || pos_c[2] > max_depth) {
             skipped_behind_or_close++;
+            ++local_map_source_stats.rejected_depth[source_idx];
             continue; // Behind camera, too close, or too far
         }
         
@@ -977,15 +1170,18 @@ bool Tracking::trackLocalMap() {
         if (px[0] < 0 || px[0] >= current_frame_->image_.cols ||
             px[1] < 0 || px[1] >= current_frame_->image_.rows) {
             skipped_oob++;
+            ++local_map_source_stats.rejected_oob[source_idx];
             continue;
         }
             
         visible_points++;
+        ++local_map_source_stats.visible[source_idx];
 
         // Cache visible landmarks for fallback matching
         visible_lm_descs.push_back(lm->descriptor_);
         visible_lm_list.push_back(lm);
         visible_lm_pts.push_back(cv::Point3f(pos_w[0], pos_w[1], pos_w[2]));
+        visible_lm_source_buckets.push_back(static_cast<LocalMapSourceBucket>(source_idx));
         
         // Search for match in current frame features with ratio test
         int best_idx = -1;
@@ -1020,6 +1216,7 @@ bool Tracking::trackLocalMap() {
             keypoint_already_matched[best_idx] = true;
             
             matches_found++;
+            ++local_map_source_stats.matched[source_idx];
         }
     }
     
@@ -1029,6 +1226,18 @@ bool Tracking::trackLocalMap() {
               << " behind/close=" << skipped_behind_or_close
               << " oob=" << skipped_oob
               << ")" << std::endl;
+    std::cout << "TrackLocalMap: LocalMapVisibility";
+    for (std::size_t bucket_idx = 0; bucket_idx < kNumLocalMapSourceBuckets; ++bucket_idx) {
+        const auto bucket = static_cast<LocalMapSourceBucket>(bucket_idx);
+        std::cout << ' ' << source_bucket_name(bucket)
+                  << "{nf=" << local_map_source_stats.rejected_nonfinite[bucket_idx]
+                  << ",depth=" << local_map_source_stats.rejected_depth[bucket_idx]
+                  << ",oob=" << local_map_source_stats.rejected_oob[bucket_idx]
+                  << ",vis=" << local_map_source_stats.visible[bucket_idx]
+                  << ",match=" << local_map_source_stats.matched[bucket_idx]
+                  << '}';
+    }
+    std::cout << std::endl;
 
     filter_correspondences_by_pose(35.0);
     if (!object_points.empty()) {
@@ -1038,25 +1247,45 @@ bool Tracking::trackLocalMap() {
     // Fallback: if pose is too noisy, projection-based matching may find 0.
     // In that case, do global descriptor matching (landmark descriptor -> current descriptors)
     // to bootstrap PnP.
+    const bool late_sparse_mono_bootstrap =
+        current_frame_->depth_image_.empty() &&
+        num_tracked_features_ <= 25 &&
+        current_frame_->keypoints_.size() >= 700;
     if (object_points.size() < kMinBootstrapCorrespondences) {
         cv::Mat fallback_lm_descs = visible_lm_descs;
         std::vector<Landmark::Ptr> fallback_lm_list = visible_lm_list;
         std::vector<cv::Point3f> fallback_lm_pts = visible_lm_pts;
         bool fallback_from_all_landmarks = false;
-
-        if (fallback_lm_list.size() < 80 && landmarks.size() > fallback_lm_list.size()) {
+        const std::size_t bootstrap_preexisting_matches = object_points.size();
+        std::vector<LocalMapSourceBucket> fallback_lm_buckets;
+        const std::size_t visible_pool_before_fallback = fallback_lm_list.size();
+        // Mono: default 80 would expand to the full local map when visible count is 75–79 (see logs:
+        // `from_all=1`, pool=680). Tracked feature count is often >25 there, so late_sparse_mono
+        // alone cannot gate this; lower the floor for all mono runs.
+        const bool mono_no_depth = current_frame_->depth_image_.empty();
+        const std::size_t fallback_visible_pool_floor = mono_no_depth ? 75U : 80U;
+        if (fallback_lm_list.size() < fallback_visible_pool_floor &&
+            landmarks.size() > fallback_lm_list.size()) {
             fallback_lm_descs = cv::Mat();
             fallback_lm_list.clear();
             fallback_lm_pts.clear();
-            for (const auto& lm : landmarks) {
+            fallback_lm_buckets.clear();
+            for (std::size_t li = 0; li < landmarks.size(); ++li) {
+                const auto& lm = landmarks[li];
                 if (!lm || lm->descriptor_.empty()) continue;
                 const Vec3 pos_w = lm->getPos();
                 if (!std::isfinite(pos_w[0]) || !std::isfinite(pos_w[1]) || !std::isfinite(pos_w[2])) continue;
                 fallback_lm_descs.push_back(lm->descriptor_);
                 fallback_lm_list.push_back(lm);
                 fallback_lm_pts.emplace_back(pos_w[0], pos_w[1], pos_w[2]);
+                const std::size_t sb = li < landmark_source_buckets.size()
+                    ? static_cast<std::size_t>(landmark_source_buckets[li])
+                    : static_cast<std::size_t>(LocalMapSourceBucket::GlobalFallback);
+                fallback_lm_buckets.push_back(static_cast<LocalMapSourceBucket>(sb));
             }
             fallback_from_all_landmarks = true;
+        } else {
+            fallback_lm_buckets = visible_lm_source_buckets;
         }
 
         if (!fallback_lm_descs.empty() && !current_frame_->descriptors_.empty()) {
@@ -1064,6 +1293,11 @@ bool Tracking::trackLocalMap() {
             std::vector<std::vector<cv::DMatch>> knn;
             bf.knnMatch(fallback_lm_descs, current_frame_->descriptors_, knn, 2);
 
+            std::size_t fallback_two_nn = 0;
+            std::size_t fallback_reject_distance = 0;
+            std::size_t fallback_reject_ratio = 0;
+            std::size_t fallback_reject_index = 0;
+            std::size_t fallback_reject_used = 0;
             std::vector<bool> kp_used = keypoint_already_matched;
             std::vector<bool> lm_used(fallback_lm_list.size(), false);
 
@@ -1071,30 +1305,164 @@ bool Tracking::trackLocalMap() {
                 int lm_idx;
                 int kp_idx;
                 float dist;
+                float ratio_margin;
+                int octave;
+                LocalMapSourceBucket source_bucket;
+                bool coarse_ok = false;
+                double coarse_err_px = std::numeric_limits<double>::quiet_NaN();
             };
             std::vector<MatchCandidate> candidates;
 
             for (const auto& ms : knn) {
                 if (ms.size() < 2) continue;
+                ++fallback_two_nn;
                 const auto& m1 = ms[0];
                 const auto& m2 = ms[1];
 
                 // Stricter Lowe ratio test (0.6) + tighter absolute distance gate (50)
-                if (m1.distance > 65.0f) continue;
-                if (m1.distance >= 0.75f * m2.distance) continue;
+                if (m1.distance > 65.0f) {
+                    ++fallback_reject_distance;
+                    continue;
+                }
+                if (m1.distance >= 0.75f * m2.distance) {
+                    ++fallback_reject_ratio;
+                    continue;
+                }
 
-                if (m1.queryIdx < 0 || m1.queryIdx >= static_cast<int>(fallback_lm_list.size())) continue;
-                if (m1.trainIdx < 0 || m1.trainIdx >= static_cast<int>(current_frame_->keypoints_.size())) continue;
-                if (lm_used[m1.queryIdx] || kp_used[m1.trainIdx]) continue;
+                if (m1.queryIdx < 0 || m1.queryIdx >= static_cast<int>(fallback_lm_list.size()) ||
+                    m1.trainIdx < 0 || m1.trainIdx >= static_cast<int>(current_frame_->keypoints_.size())) {
+                    ++fallback_reject_index;
+                    continue;
+                }
+                if (lm_used[m1.queryIdx] || kp_used[m1.trainIdx]) {
+                    ++fallback_reject_used;
+                    continue;
+                }
 
-                candidates.push_back({m1.queryIdx, m1.trainIdx, m1.distance});
+                const int kp_idx = m1.trainIdx;
+                const int octave =
+                    (kp_idx >= 0 && kp_idx < static_cast<int>(current_frame_->keypoints_.size()))
+                        ? current_frame_->keypoints_[kp_idx].octave
+                        : 0;
+                const float ratio_margin = 0.75f * m2.distance - m1.distance;
+                LocalMapSourceBucket sb = LocalMapSourceBucket::GlobalFallback;
+                if (m1.queryIdx >= 0 &&
+                    m1.queryIdx < static_cast<int>(fallback_lm_buckets.size())) {
+                    sb = fallback_lm_buckets[static_cast<std::size_t>(m1.queryIdx)];
+                }
+                candidates.push_back(
+                    {m1.queryIdx, kp_idx, m1.distance, ratio_margin, octave, sb, false,
+                     std::numeric_limits<double>::quiet_NaN()});
             }
 
-            std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-                if (a.dist != b.dist) return a.dist < b.dist;
-                if (a.lm_idx != b.lm_idx) return a.lm_idx < b.lm_idx;
-                return a.kp_idx < b.kp_idx;
-            });
+            const SE3 T_cw_boot = current_frame_->getPose();
+            auto bootstrap_coarse_ok_and_err = [&](int lm_idx, int kp_idx, double& err_px) -> bool {
+                err_px = std::numeric_limits<double>::quiet_NaN();
+                if (lm_idx < 0 || lm_idx >= static_cast<int>(fallback_lm_pts.size()) || kp_idx < 0 ||
+                    kp_idx >= static_cast<int>(current_frame_->keypoints_.size())) {
+                    return false;
+                }
+                const auto& Pw = fallback_lm_pts[lm_idx];
+                Vec3 p_w(Pw.x, Pw.y, Pw.z);
+                Vec3 p_c = T_cw_boot * p_w;
+                if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) {
+                    return false;
+                }
+                if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) {
+                    return false;
+                }
+                const int oct =
+                    (kp_idx >= 0 && kp_idx < static_cast<int>(current_frame_->keypoints_.size()))
+                        ? current_frame_->keypoints_[kp_idx].octave
+                        : 0;
+                const double gate_px =
+                    55.0 * (1.0 + 0.12 * static_cast<double>(std::max(0, oct)));
+                Vec2 proj = current_frame_->camera_->project(p_c);
+                const auto& uv = current_frame_->keypoints_[kp_idx].pt;
+                const double dx = uv.x - proj[0];
+                const double dy = uv.y - proj[1];
+                err_px = std::sqrt(dx * dx + dy * dy);
+                return (dx * dx + dy * dy) <= gate_px * gate_px;
+            };
+
+            // Only break ties on equal descriptor distance: prefer reference KF landmarks over
+            // pure covisibility neighbors (ordering bucket before dist regressed room_mono ATE).
+            auto fallback_bucket_rank = [](LocalMapSourceBucket b) -> int {
+                switch (b) {
+                    case LocalMapSourceBucket::Reference:
+                        return 0;
+                    case LocalMapSourceBucket::PreviousReference:
+                        return 1;
+                    case LocalMapSourceBucket::ReferenceNeighbor:
+                        return 2;
+                    case LocalMapSourceBucket::PreviousReferenceNeighbor:
+                        return 3;
+                    case LocalMapSourceBucket::GlobalFallback:
+                        return 4;
+                    case LocalMapSourceBucket::Count:
+                        break;
+                }
+                return 5;
+            };
+            constexpr float kDistTieEps = 1e-4f;
+
+            if (late_sparse_mono_bootstrap) {
+                for (auto& c : candidates) {
+                    c.coarse_ok =
+                        bootstrap_coarse_ok_and_err(c.lm_idx, c.kp_idx, c.coarse_err_px);
+                }
+                std::sort(candidates.begin(), candidates.end(),
+                          [&](const MatchCandidate& a, const MatchCandidate& b) {
+                              if (a.coarse_ok != b.coarse_ok) {
+                                  return a.coarse_ok > b.coarse_ok;
+                              }
+                              if (std::abs(a.dist - b.dist) > kDistTieEps) {
+                                  return a.dist < b.dist;
+                              }
+                              const int ra = fallback_bucket_rank(a.source_bucket);
+                              const int rb = fallback_bucket_rank(b.source_bucket);
+                              if (ra != rb) {
+                                  return ra < rb;
+                              }
+                              if (a.lm_idx != b.lm_idx) {
+                                  return a.lm_idx < b.lm_idx;
+                              }
+                              return a.kp_idx < b.kp_idx;
+                          });
+            } else {
+                std::sort(candidates.begin(), candidates.end(), [](const MatchCandidate& a,
+                                                                   const MatchCandidate& b) {
+                    if (a.dist != b.dist) {
+                        return a.dist < b.dist;
+                    }
+                    if (a.lm_idx != b.lm_idx) {
+                        return a.lm_idx < b.lm_idx;
+                    }
+                    return a.kp_idx < b.kp_idx;
+                });
+            }
+
+            constexpr int kFallbackCandidateTraceTop = 20;
+            if (late_sparse_mono_bootstrap && !candidates.empty()) {
+                std::cout << "TrackLocalMap: FallbackCandidateTrace frame=" << current_frame_->id_
+                          << " order=coarse_dist_bucket_tie from_all="
+                          << (fallback_from_all_landmarks ? 1 : 0) << " top="
+                          << std::min(kFallbackCandidateTraceTop,
+                                      static_cast<int>(candidates.size()))
+                          << std::endl;
+                for (int ti = 0; ti < std::min(kFallbackCandidateTraceTop,
+                                               static_cast<int>(candidates.size()));
+                     ++ti) {
+                    const auto& c = candidates[static_cast<std::size_t>(ti)];
+                    std::cout << "  i=" << ti << " lm=" << c.lm_idx << " kp=" << c.kp_idx
+                              << " dist=" << c.dist << " ratio_m=" << c.ratio_margin
+                              << " oct=" << c.octave
+                              << " bucket=" << source_bucket_name(c.source_bucket)
+                              << " reproj_px="
+                              << (std::isfinite(c.coarse_err_px) ? c.coarse_err_px : -1.0)
+                              << " coarse_pass=" << (c.coarse_ok ? 1 : 0) << std::endl;
+                }
+            }
 
             for (size_t i = 0; i < candidates.size() && i < kMaxBootstrapMatches; ++i) {
                 const auto& c = candidates[i];
@@ -1106,6 +1474,10 @@ bool Tracking::trackLocalMap() {
                 lm_used[c.lm_idx] = true;
                 kp_used[c.kp_idx] = true;
             }
+            const std::size_t bootstrap_added_pre_pose =
+                object_points.size() > bootstrap_preexisting_matches
+                    ? object_points.size() - bootstrap_preexisting_matches
+                    : 0;
 
             if (fallback_from_all_landmarks) {
                 std::cout << "TrackLocalMap: Descriptor bootstrap using all "
@@ -1113,9 +1485,61 @@ bool Tracking::trackLocalMap() {
             }
 
             const double fallback_gate_px = fallback_from_all_landmarks ? 180.0 : 55.0;
-            filter_correspondences_by_pose(fallback_gate_px);
+            const double relaxed_fallback_gate_px = fallback_from_all_landmarks ? 260.0 : 85.0;
+            const auto object_points_before_pose_filter = object_points;
+            const auto image_points_before_pose_filter = image_points;
+            const auto matched_landmarks_before_pose_filter = matched_landmarks;
+            const auto matched_kp_indices_before_pose_filter = matched_kp_indices;
+
+            PoseFilterStats pose_filter_stats =
+                filter_correspondences_by_pose(fallback_gate_px, bootstrap_preexisting_matches);
+            bool retried_relaxed_pose_filter = false;
+            if (late_sparse_mono_bootstrap &&
+                object_points.size() < kMinBootstrapCorrespondences &&
+                pose_filter_stats.focus_reject_reprojection > 0) {
+                object_points = object_points_before_pose_filter;
+                image_points = image_points_before_pose_filter;
+                matched_landmarks = matched_landmarks_before_pose_filter;
+                matched_kp_indices = matched_kp_indices_before_pose_filter;
+                pose_filter_stats =
+                    filter_correspondences_by_pose(relaxed_fallback_gate_px, bootstrap_preexisting_matches);
+                retried_relaxed_pose_filter = true;
+            }
+            const std::size_t bootstrap_added_post_pose =
+                object_points.size() > bootstrap_preexisting_matches
+                    ? object_points.size() - bootstrap_preexisting_matches
+                    : 0;
 
             used_global_fallback = true;
+            std::cout << "TrackLocalMap: BootstrapStats"
+                      << " visible_pool=" << visible_pool_before_fallback
+                      << " visible_floor=" << fallback_visible_pool_floor
+                      << " pool=" << fallback_lm_list.size()
+                      << " knn=" << knn.size()
+                      << " two_nn=" << fallback_two_nn
+                      << " candidates=" << candidates.size()
+                      << " added_pre_pose=" << bootstrap_added_pre_pose
+                      << " added_post_pose=" << bootstrap_added_post_pose
+                      << " reject_dist=" << fallback_reject_distance
+                      << " reject_ratio=" << fallback_reject_ratio
+                      << " reject_index=" << fallback_reject_index
+                      << " reject_used=" << fallback_reject_used
+                      << " pose_total=" << pose_filter_stats.total
+                      << " pose_kept=" << pose_filter_stats.kept
+                      << " pose_reject_nonfinite=" << pose_filter_stats.reject_nonfinite
+                      << " pose_reject_depth=" << pose_filter_stats.reject_depth
+                      << " pose_reject_reproj=" << pose_filter_stats.reject_reprojection
+                      << " pose_added_total=" << pose_filter_stats.focus_total
+                      << " pose_added_kept=" << pose_filter_stats.focus_kept
+                      << " pose_added_reject_nonfinite=" << pose_filter_stats.focus_reject_nonfinite
+                      << " pose_added_reject_depth=" << pose_filter_stats.focus_reject_depth
+                      << " pose_added_reject_reproj=" << pose_filter_stats.focus_reject_reprojection
+                      << " pose_gate_px=" << (retried_relaxed_pose_filter
+                          ? relaxed_fallback_gate_px
+                          : fallback_gate_px)
+                      << " pose_relaxed_retry=" << (retried_relaxed_pose_filter ? 1 : 0)
+                      << " from_all=" << (fallback_from_all_landmarks ? 1 : 0)
+                      << std::endl;
             std::cout << "TrackLocalMap: Fallback global matches: " << object_points.size() << std::endl;
         }
     }
@@ -1205,6 +1629,9 @@ bool Tracking::trackLocalMap() {
     
     // If correspondences come from global descriptor matching, do not trust the motion-model pose as an initial guess.
     const bool use_extrinsic_guess = !used_global_fallback;
+    const int pnp_ransac_iterations = 150;
+    const double pnp_ransac_reproj_px = 10.0;
+    const double pnp_refine_gate_px = 8.0;
 
     enum class PnpMethod { EPNP, P3P, ITERATIVE };
     auto try_pnp = [&](PnpMethod method) -> bool {
@@ -1224,7 +1651,7 @@ bool Tracking::trackLocalMap() {
 
         bool ok = cv::solvePnPRansac(object_points, image_points, current_frame_->camera_->K(), cv::Mat(),
                                      rvec_tmp, tvec_tmp, use_extrinsic_guess,
-                                     150, 10.0, 0.995, tmp_inliers, flag);
+                                     pnp_ransac_iterations, pnp_ransac_reproj_px, 0.995, tmp_inliers, flag);
         if (ok) {
             rvec = rvec_tmp;
             tvec = tvec_tmp;
@@ -1243,7 +1670,7 @@ bool Tracking::trackLocalMap() {
             image_points,
             inliers,
             [&](const int corr_idx) { return matched_kp_indices[corr_idx]; },
-            8.0,
+            pnp_refine_gate_px,
             rvec,
             tvec,
             inliers);
@@ -1813,17 +2240,30 @@ bool Tracking::relocalize() {
                   << " (total_candidates=" << candidates.size() << ")" << std::endl;
     }
 
-    // Sort by score (number of matches)
+    // Sort by score (number of matches). On ties, prefer keyframes closer in time to the live
+    // frame (smaller |id - current|) before stable id ordering — helps room revisits vs arbitrary id.
+    const long current_frame_id = static_cast<long>(current_frame_->id_);
+    auto temporal_id_gap = [current_frame_id](const Candidate& c) -> long {
+        if (!c.kf) {
+            return std::numeric_limits<long>::max();
+        }
+        return std::llabs(current_frame_id - static_cast<long>(c.kf->id_));
+    };
     std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate& a, const Candidate& b) {
+              [&](const Candidate& a, const Candidate& b) {
                   if (a.local_to_anchor != b.local_to_anchor) {
                       return a.local_to_anchor > b.local_to_anchor;
                   }
-                  if (a.distance_to_anchor != b.distance_to_anchor) {
-                      return a.distance_to_anchor < b.distance_to_anchor;
-                  }
                   if (a.score == b.score) {
                       if (a.matches.size() == b.matches.size()) {
+                          if (a.distance_to_anchor != b.distance_to_anchor) {
+                              return a.distance_to_anchor < b.distance_to_anchor;
+                          }
+                          const long gap_a = temporal_id_gap(a);
+                          const long gap_b = temporal_id_gap(b);
+                          if (gap_a != gap_b) {
+                              return gap_a < gap_b;
+                          }
                           const long a_id = a.kf ? static_cast<long>(a.kf->id_) : -1L;
                           const long b_id = b.kf ? static_cast<long>(b.kf->id_) : -1L;
                           return a_id < b_id;
@@ -1837,6 +2277,106 @@ bool Tracking::relocalize() {
 
     // Try PnP with top N candidates
     const int max_candidates = 20;
+    struct SuccessfulRelocalization {
+        bool found = false;
+        int candidate_index = -1;
+        std::size_t inlier_count = 0;
+        SE3 pose = SE3();
+        std::vector<int> inlier_indices;
+        std::vector<int> match_indices;
+        double avg_reprojection_error_px = std::numeric_limits<double>::infinity();
+        int valid_reprojection_count = 0;
+        double pose_change_translation = std::numeric_limits<double>::infinity();
+        double pose_change_rotation = std::numeric_limits<double>::infinity();
+    };
+    SuccessfulRelocalization best_success;
+    const bool quality_first_recovery = prefer_local_candidates && have_local_candidate;
+
+    auto should_replace_best = [&](const Candidate& cand,
+                                   std::size_t inlier_count,
+                                   double avg_reprojection_error_px,
+                                   double pose_change_translation,
+                                   double pose_change_rotation) {
+        if (!best_success.found) {
+            return true;
+        }
+
+        const auto& best_candidate = candidates[best_success.candidate_index];
+        if (cand.local_to_anchor != best_candidate.local_to_anchor) {
+            return cand.local_to_anchor > best_candidate.local_to_anchor;
+        }
+
+        auto compare_smaller_with_margin = [](double lhs, double rhs, double margin) {
+            const bool lhs_finite = std::isfinite(lhs);
+            const bool rhs_finite = std::isfinite(rhs);
+            if (lhs_finite != rhs_finite) {
+                return lhs_finite ? -1 : 1;
+            }
+            if (!lhs_finite) {
+                return 0;
+            }
+            if (lhs + margin < rhs) {
+                return -1;
+            }
+            if (rhs + margin < lhs) {
+                return 1;
+            }
+            return 0;
+        };
+
+        if (quality_first_recovery) {
+            const std::size_t inlier_gap =
+                inlier_count > best_success.inlier_count
+                    ? inlier_count - best_success.inlier_count
+                    : best_success.inlier_count - inlier_count;
+            if (inlier_gap <= 1) {
+                const int trans_cmp = compare_smaller_with_margin(
+                    pose_change_translation, best_success.pose_change_translation, 0.03);
+                if (trans_cmp != 0) {
+                    return trans_cmp < 0;
+                }
+
+                const int rot_cmp = compare_smaller_with_margin(
+                    pose_change_rotation, best_success.pose_change_rotation, 0.01);
+                if (rot_cmp != 0) {
+                    return rot_cmp < 0;
+                }
+
+                const int reproj_cmp = compare_smaller_with_margin(
+                    avg_reprojection_error_px, best_success.avg_reprojection_error_px, 1.0);
+                if (reproj_cmp != 0) {
+                    return reproj_cmp < 0;
+                }
+            }
+        }
+
+        if (inlier_count != best_success.inlier_count) {
+            return inlier_count > best_success.inlier_count;
+        }
+        if (cand.valid_3d_matches != best_candidate.valid_3d_matches) {
+            return cand.valid_3d_matches > best_candidate.valid_3d_matches;
+        }
+        if (avg_reprojection_error_px != best_success.avg_reprojection_error_px) {
+            return avg_reprojection_error_px < best_success.avg_reprojection_error_px;
+        }
+        if (pose_change_translation != best_success.pose_change_translation) {
+            return pose_change_translation < best_success.pose_change_translation;
+        }
+        if (pose_change_rotation != best_success.pose_change_rotation) {
+            return pose_change_rotation < best_success.pose_change_rotation;
+        }
+        if (cand.score != best_candidate.score) {
+            return cand.score > best_candidate.score;
+        }
+        if (cand.distance_to_anchor != best_candidate.distance_to_anchor) {
+            return cand.distance_to_anchor < best_candidate.distance_to_anchor;
+        }
+
+        const long cand_id = cand.kf ? static_cast<long>(cand.kf->id_) : -1L;
+        const long best_id = best_candidate.kf ? static_cast<long>(best_candidate.kf->id_) : -1L;
+        return cand_id < best_id;
+    };
+
     for (int i = 0; i < std::min(static_cast<int>(candidates.size()), max_candidates); i++) {
         auto& cand = candidates[i];
 
@@ -1924,28 +2464,75 @@ bool Tracking::relocalize() {
                 continue;
             }
 
-            current_frame_->setPose(candidate_pose);
+            int valid_reprojection_count = 0;
+            const double avg_reprojection_error_px = computeAverageReprojectionError(
+                current_frame_, candidate_pose, pts3d, pts2d, inliers, &valid_reprojection_count);
+            const PoseChange pose_change =
+                computePoseChange(candidate_pose, recovery_state_.last_good_pose);
 
-            // Set landmark associations for inliers
-            current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
-            for (int idx : inliers) {
-                int orig_match_idx = match_indices[idx];
-                int kf_idx = cand.matches[orig_match_idx].trainIdx;
-                int curr_idx = cand.matches[orig_match_idx].queryIdx;
-                if (kf_idx >= 0 && kf_idx < static_cast<int>(cand.kf->landmarks_.size())) {
-                    current_frame_->landmarks_[curr_idx] = cand.kf->landmarks_[kf_idx];
-                }
-            }
-
-            // Update reference keyframe
-            setReferenceKeyframe(cand.kf);
-
-            std::cout << "Relocalize: Matched with KF " << cand.kf->id_
+            std::cout << "Relocalize: Candidate KF " << cand.kf->id_
                       << " inliers=" << inliers.size()
                       << " valid_3d=" << cand.valid_3d_matches
+                      << " reproj_px=" << avg_reprojection_error_px
+                      << " reproj_valid=" << valid_reprojection_count
+                      << " pose_trans=" << pose_change.translation
+                      << " pose_rot=" << pose_change.rotation
+                      << " dist_to_anchor=" << cand.distance_to_anchor
+                      << " local=" << (cand.local_to_anchor ? 1 : 0)
                       << std::endl;
-            return true;
+
+            if (should_replace_best(cand,
+                                    inliers.size(),
+                                    avg_reprojection_error_px,
+                                    pose_change.translation,
+                                    pose_change.rotation)) {
+                best_success.found = true;
+                best_success.candidate_index = i;
+                best_success.inlier_count = inliers.size();
+                best_success.pose = candidate_pose;
+                best_success.inlier_indices = inliers;
+                best_success.match_indices = match_indices;
+                best_success.avg_reprojection_error_px = avg_reprojection_error_px;
+                best_success.valid_reprojection_count = valid_reprojection_count;
+                best_success.pose_change_translation = pose_change.translation;
+                best_success.pose_change_rotation = pose_change.rotation;
+            }
         }
+    }
+
+    if (best_success.found) {
+        const auto& best_candidate = candidates[best_success.candidate_index];
+        current_frame_->setPose(best_success.pose);
+
+        current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
+        for (int idx : best_success.inlier_indices) {
+            if (idx < 0 || idx >= static_cast<int>(best_success.match_indices.size())) {
+                continue;
+            }
+            const int orig_match_idx = best_success.match_indices[idx];
+            if (orig_match_idx < 0 || orig_match_idx >= static_cast<int>(best_candidate.matches.size())) {
+                continue;
+            }
+            const int kf_idx = best_candidate.matches[orig_match_idx].trainIdx;
+            const int curr_idx = best_candidate.matches[orig_match_idx].queryIdx;
+            if (kf_idx >= 0 && kf_idx < static_cast<int>(best_candidate.kf->landmarks_.size()) &&
+                curr_idx >= 0 && curr_idx < static_cast<int>(current_frame_->landmarks_.size())) {
+                current_frame_->landmarks_[curr_idx] = best_candidate.kf->landmarks_[kf_idx];
+            }
+        }
+
+        setReferenceKeyframe(best_candidate.kf);
+
+        std::cout << "Relocalize: Matched with KF " << best_candidate.kf->id_
+                  << " inliers=" << best_success.inlier_count
+                  << " valid_3d=" << best_candidate.valid_3d_matches
+                  << " reproj_px=" << best_success.avg_reprojection_error_px
+                  << " reproj_valid=" << best_success.valid_reprojection_count
+                  << " pose_trans=" << best_success.pose_change_translation
+                  << " pose_rot=" << best_success.pose_change_rotation
+                  << " dist_to_anchor=" << best_candidate.distance_to_anchor
+                  << std::endl;
+        return true;
     }
 
     std::cout << "Relocalize: All candidate PnP attempts failed" << std::endl;

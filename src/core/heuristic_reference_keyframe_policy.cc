@@ -9,6 +9,10 @@ namespace {
 
 constexpr int kMinTrackedFeatures = 35;
 constexpr int kMinDetectedKeypoints = 150;
+constexpr int kLateSparseMonoRefreshFrames = 4;
+constexpr int kLateSparseMonoRefreshTrackedFloor = 20;
+constexpr int kLateSparseMonoRefreshKeypoints = 700;
+constexpr int kLateSparseMonoRefreshLandmarks = 20;
 
 double clampConfidence(double value) {
     return std::clamp(value, 0.05, 0.99);
@@ -26,6 +30,21 @@ std::string HeuristicReferenceKeyframePolicy::philosophy() const {
 
 ReferenceKeyframeDecision HeuristicReferenceKeyframePolicy::evaluate(
     const ReferenceKeyframePolicyInput& input) const {
+    const bool late_sparse_mono_refresh =
+        !input.has_depth &&
+        input.frames_since_reference >= kLateSparseMonoRefreshFrames &&
+        input.tracked_features >= kLateSparseMonoRefreshTrackedFloor &&
+        input.detected_keypoints >= kLateSparseMonoRefreshKeypoints &&
+        input.candidate_landmarks >= kLateSparseMonoRefreshLandmarks;
+
+    if (late_sparse_mono_refresh) {
+        return {
+            ReferenceKeyframeAction::PromoteNewReference,
+            clampConfidence(0.62 + 0.01 * static_cast<double>(input.frames_since_reference)),
+            "late sparse mono still has enough candidate support to refresh the reference"
+        };
+    }
+
     const bool sparse_mono_frame =
         !input.has_depth &&
         (input.tracked_features < kMinTrackedFeatures ||

@@ -66,6 +66,7 @@ void print_help(std::ostream& os) {
        << "  --metric-depth-model <model.onnx>   Metric DL depth in meters (build with -DUSE_DEPTH_DL=ON)\n"
        << "  --no-viz                            No OpenCV imshow window\n"
        << "  --run-summary-json <path>          Machine-readable run stats (see schema in source)\n"
+       << "  --keyframe-trace-csv <path>        CSV trace of needNewKeyframe() inputs, reasons, mono flags\n"
        << "  --strict-exit                       Exit 3 if tracking did not finish in OK state\n"
        << "\n"
        << "ORB vocabulary: last positional argument, or search data/ORBvoc.txt then ORBvoc.txt\n";
@@ -134,6 +135,7 @@ int main(int argc, char** argv) {
     std::string euroc_camera_config;
     std::string tum_camera_config;
     std::string run_summary_json_path;
+    std::string keyframe_trace_csv_path;
     bool stereo_mode = false;
     bool strict_exit = false;
     std::string euroc_seq_dir;
@@ -218,6 +220,8 @@ int main(int argc, char** argv) {
                 tum_camera_config = argv[++i];
             } else if (arg == "--run-summary-json" && i + 1 < argc) {
                 run_summary_json_path = argv[++i];
+            } else if (arg == "--keyframe-trace-csv" && i + 1 < argc) {
+                keyframe_trace_csv_path = argv[++i];
             } else if (arg == "--stereo") {
                 stereo_mode = true;
             } else if (arg == "--strict-exit") {
@@ -333,7 +337,7 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--depth-model" || arg == "--metric-depth-model" ||
             arg == "--reference-policy" || arg == "--tum-camera-config" ||
-            arg == "--euroc-camera-config" ||
+            arg == "--euroc-camera-config" || arg == "--keyframe-trace-csv" ||
             arg == "--run-summary-json" || arg == "--skip-frames" || arg == "--max-frames") {
             ++i;
             continue;
@@ -369,6 +373,16 @@ int main(int argc, char** argv) {
     tracker->setMap(map);
     tracker->setLocalMapping(local_mapping);
     tracker->setReferenceKeyframePolicy(create_reference_policy(reference_policy_name));
+    std::shared_ptr<std::ofstream> keyframe_trace_file;
+    if (!keyframe_trace_csv_path.empty()) {
+        keyframe_trace_file = std::make_shared<std::ofstream>(keyframe_trace_csv_path);
+        if (!*keyframe_trace_file) {
+            std::cerr << "Failed to open --keyframe-trace-csv: " << keyframe_trace_csv_path << std::endl;
+            return -1;
+        }
+        tracker->setKeyframeDecisionTraceSink(keyframe_trace_file);
+        std::cout << "Keyframe decision trace: " << keyframe_trace_csv_path << std::endl;
+    }
     const std::weak_ptr<Tracking> tracker_weak = tracker;
 
     std::cout << "Reference keyframe policy: " << reference_policy_name << std::endl;

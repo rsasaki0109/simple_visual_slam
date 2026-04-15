@@ -714,13 +714,61 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
         }
     }
 
+    // Sequential (odometry) edges between time-adjacent keyframes. Strengthens the graph when
+    // covisibility is sparse or missing between consecutive poses; skipped if a covisibility
+    // edge already covers the same undirected pair.
+    std::vector<Keyframe::Ptr> keyframes_sorted;
+    keyframes_sorted.reserve(all_keyframes.size());
+    for (const auto& kv : all_keyframes) {
+        if (kv.second) {
+            keyframes_sorted.push_back(kv.second);
+        }
+    }
+    std::sort(keyframes_sorted.begin(), keyframes_sorted.end(),
+              [](const Keyframe::Ptr& a, const Keyframe::Ptr& b) { return a->id_ < b->id_; });
+
+    int sequential_edges = 0;
+    // Weaker than typical covisibility/loop edges so strong loop constraints or BA snapshots
+    // still dominate; provides backbone when covisibility is missing between neighbors.
+    constexpr double kSequentialTranslationWeight = 0.15;
+    constexpr double kSequentialRotationWeight = 0.15;
+    for (std::size_t i = 0; i + 1 < keyframes_sorted.size(); ++i) {
+        const Keyframe::Ptr& kf = keyframes_sorted[i];
+        const Keyframe::Ptr& other = keyframes_sorted[i + 1];
+        const unsigned long id0 = std::min(kf->id_, other->id_);
+        const unsigned long id1 = std::max(kf->id_, other->id_);
+        if (!added_pairs.insert({id0, id1}).second) {
+            continue;
+        }
+
+        const auto snapshot_it = keyframe_snapshots.find(kf->id_);
+        const auto other_snapshot_it = keyframe_snapshots.find(other->id_);
+        if (snapshot_it == keyframe_snapshots.end() || other_snapshot_it == keyframe_snapshots.end()) {
+            continue;
+        }
+        const auto& snapshot = snapshot_it->second;
+        const auto& other_snapshot = other_snapshot_it->second;
+
+        PoseGraphEdge edge;
+        edge.from = kf;
+        edge.to = other;
+        edge.relative_pose =
+            Sim3(1.0, other_snapshot.rotation, other_snapshot.translation) *
+            Sim3(1.0, snapshot.rotation, snapshot.translation).inverse();
+        edge.translation_weight = kSequentialTranslationWeight;
+        edge.rotation_weight = kSequentialRotationWeight;
+        edge.scale_weight = fix_scale ? 100.0 : 1.5;
+        weighted_edges.push_back({edge, false, 1.0});
+        ++sequential_edges;
+    }
+
     int loop_edge_count = 0;
     for (const auto& edge : loop_edges) {
         weighted_edges.push_back({edge, true, 1.0});
         ++loop_edge_count;
     }
 
-    if (covisibility_edges == 0 && loop_edge_count == 0) {
+    if (covisibility_edges == 0 && loop_edge_count == 0 && sequential_edges == 0) {
         for (auto& kv : pose_params) {
             delete[] kv.second;
         }
@@ -862,6 +910,7 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
     std::cout << "PoseGraph: " << summary.BriefReport()
               << " | covisibility_edges=" << covisibility_edges
+              << " | sequential_edges=" << sequential_edges
               << " | loop_edges=" << loop_edge_count
               << " | irls_downweighted_loop_edges=" << irls_downweighted_edges
               << std::endl;
