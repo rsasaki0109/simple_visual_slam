@@ -830,18 +830,6 @@ bool Tracking::track() {
         loop_correction_state_.force_keyframe_insertion_once = false;
     }
 
-    // High-error band on freiburg1_room mono (see scripts/segment_ate_tum.py): ~[100,125).
-    if (current_frame_->depth_image_.empty() &&
-        current_frame_->id_ >= 100 && current_frame_->id_ < 126) {
-        const int ref_id = reference_keyframe_ ? static_cast<int>(reference_keyframe_->id_) : -1;
-        std::cout << "RoomFocusTrace frame=" << current_frame_->id_
-                  << " state=" << static_cast<int>(state_)
-                  << " tracked=" << num_tracked_features_
-                  << " ref_kf=" << ref_id
-                  << " stabil_left=" << recovery_state_.stabilization_frames_remaining
-                  << std::endl;
-    }
-
     return state_ == TrackingState::OK;
 }
 
@@ -1242,19 +1230,6 @@ bool Tracking::trackLocalMap() {
               << " behind/close=" << skipped_behind_or_close
               << " oob=" << skipped_oob
               << ")" << std::endl;
-    std::cout << "TrackLocalMap: LocalMapVisibility";
-    for (std::size_t bucket_idx = 0; bucket_idx < kNumLocalMapSourceBuckets; ++bucket_idx) {
-        const auto bucket = static_cast<LocalMapSourceBucket>(bucket_idx);
-        std::cout << ' ' << source_bucket_name(bucket)
-                  << "{nf=" << local_map_source_stats.rejected_nonfinite[bucket_idx]
-                  << ",depth=" << local_map_source_stats.rejected_depth[bucket_idx]
-                  << ",oob=" << local_map_source_stats.rejected_oob[bucket_idx]
-                  << ",vis=" << local_map_source_stats.visible[bucket_idx]
-                  << ",match=" << local_map_source_stats.matched[bucket_idx]
-                  << '}';
-    }
-    std::cout << std::endl;
-
     filter_correspondences_by_pose(35.0);
     if (!object_points.empty()) {
         std::cout << "TrackLocalMap: Pose-gated matches: " << object_points.size() << std::endl;
@@ -1460,28 +1435,6 @@ bool Tracking::trackLocalMap() {
                 });
             }
 
-            constexpr int kFallbackCandidateTraceTop = 20;
-            if (late_sparse_mono_bootstrap && !candidates.empty()) {
-                std::cout << "TrackLocalMap: FallbackCandidateTrace frame=" << current_frame_->id_
-                          << " order=coarse_dist_bucket_tie from_all="
-                          << (fallback_from_all_landmarks ? 1 : 0) << " top="
-                          << std::min(kFallbackCandidateTraceTop,
-                                      static_cast<int>(candidates.size()))
-                          << std::endl;
-                for (int ti = 0; ti < std::min(kFallbackCandidateTraceTop,
-                                               static_cast<int>(candidates.size()));
-                     ++ti) {
-                    const auto& c = candidates[static_cast<std::size_t>(ti)];
-                    std::cout << "  i=" << ti << " lm=" << c.lm_idx << " kp=" << c.kp_idx
-                              << " dist=" << c.dist << " ratio_m=" << c.ratio_margin
-                              << " oct=" << c.octave
-                              << " bucket=" << source_bucket_name(c.source_bucket)
-                              << " reproj_px="
-                              << (std::isfinite(c.coarse_err_px) ? c.coarse_err_px : -1.0)
-                              << " coarse_pass=" << (c.coarse_ok ? 1 : 0) << std::endl;
-                }
-            }
-
             for (size_t i = 0; i < candidates.size() && i < kMaxBootstrapMatches; ++i) {
                 const auto& c = candidates[i];
                 if (lm_used[c.lm_idx] || kp_used[c.kp_idx]) continue;
@@ -1529,35 +1482,6 @@ bool Tracking::trackLocalMap() {
                     : 0;
 
             used_global_fallback = true;
-            std::cout << "TrackLocalMap: BootstrapStats"
-                      << " visible_pool=" << visible_pool_before_fallback
-                      << " visible_floor=" << fallback_visible_pool_floor
-                      << " pool=" << fallback_lm_list.size()
-                      << " knn=" << knn.size()
-                      << " two_nn=" << fallback_two_nn
-                      << " candidates=" << candidates.size()
-                      << " added_pre_pose=" << bootstrap_added_pre_pose
-                      << " added_post_pose=" << bootstrap_added_post_pose
-                      << " reject_dist=" << fallback_reject_distance
-                      << " reject_ratio=" << fallback_reject_ratio
-                      << " reject_index=" << fallback_reject_index
-                      << " reject_used=" << fallback_reject_used
-                      << " pose_total=" << pose_filter_stats.total
-                      << " pose_kept=" << pose_filter_stats.kept
-                      << " pose_reject_nonfinite=" << pose_filter_stats.reject_nonfinite
-                      << " pose_reject_depth=" << pose_filter_stats.reject_depth
-                      << " pose_reject_reproj=" << pose_filter_stats.reject_reprojection
-                      << " pose_added_total=" << pose_filter_stats.focus_total
-                      << " pose_added_kept=" << pose_filter_stats.focus_kept
-                      << " pose_added_reject_nonfinite=" << pose_filter_stats.focus_reject_nonfinite
-                      << " pose_added_reject_depth=" << pose_filter_stats.focus_reject_depth
-                      << " pose_added_reject_reproj=" << pose_filter_stats.focus_reject_reprojection
-                      << " pose_gate_px=" << (retried_relaxed_pose_filter
-                          ? relaxed_fallback_gate_px
-                          : fallback_gate_px)
-                      << " pose_relaxed_retry=" << (retried_relaxed_pose_filter ? 1 : 0)
-                      << " from_all=" << (fallback_from_all_landmarks ? 1 : 0)
-                      << std::endl;
             std::cout << "TrackLocalMap: Fallback global matches: " << object_points.size() << std::endl;
         }
     }
