@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
+#include <limits>
 
 #include "core/common.h"
 #include "core/frame.h"
@@ -144,6 +145,7 @@ private:
     static constexpr double recovery_max_change_strict_ = 0.12;
     static constexpr double recovery_max_change_relaxed_ = 0.18;
     RecoveryState recovery_state_;
+    int frames_since_successful_relocalization_ = std::numeric_limits<int>::max();
     LoopCorrectionState loop_correction_state_;
 
     // Re-initialization state

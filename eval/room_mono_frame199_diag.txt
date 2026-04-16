@@ -96,3 +96,13 @@ Summary:
 - The selected-vs-rejected-below-K distribution is not informative here because candidate counts are all below `kMaxBootstrapMatches`, so `rejected_belowk=0`.
 - Within the selected top-K set, high coarse-error coarse-fail candidates remain visible in p90 (`~407-422 px`) and are removed by pose/PnP, so selected top-K is not cleanly separated by itself.
 - Source bucket is not a distinguishing signal among near-equal coarse-error candidates: frame 203 keeps both `ref` and `ref_neighbors` near 30 px, while frame 205 is all `ref` because those have the lowest coarse errors.
+
+## 2026-04-17 Phase A2 post-reloc cooldown
+
+Log: `log/room_mono_trace_phaseA2.log`
+Command: `./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room --max-frames 250 --repro-eval --no-viz --reference-policy heuristic`
+Cooldown constant: `kPostRelocEmergencyKfCooldownFrames = 3`.
+KF insertions in frames 195-210: V1 baseline `5`; Phase A2 `4`.
+Cooldown stdout firings: `2`.
+Gates: `room_mono_head_repro=0.176340` (SHA `70fff60ac7874535`), `xyz_mono_head_repro=0.028136` (SHA `583e07bf2ba4ecaf`); all five gates PASS and `ctest` stayed `62/62`.
+Summary: suppressing only the low-tracked-features emergency path after successful relocalization breaks part of the late KF burst without moving `xyz_mono`.

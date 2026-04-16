@@ -31,6 +31,9 @@ constexpr std::size_t kMinTrackReferenceInliers = 15;
 constexpr std::size_t kMinPoseRecomputeCorrespondences = 10;
 constexpr std::size_t kMinPoseRecomputeInliers = 20;
 constexpr std::size_t kMaxDepthLandmarksPerKeyframe = 600;
+// Defer low-tracked-features emergency KF insertion for N frames after a
+// successful relocalization to avoid KF bursts during recovery.
+constexpr int kPostRelocEmergencyKfCooldownFrames = 3;
 
 struct PoseChange {
     double translation = std::numeric_limits<double>::infinity();
@@ -710,6 +713,7 @@ bool Tracking::track() {
             loop_correction_state_.skip_velocity_update_once = false;
             recovery_state_.stabilization_frames_remaining =
                 recovery_stabilization_window_frames_;
+            frames_since_successful_relocalization_ = 0;
             recovery_state_.last_good_pose = current_frame_->getPose();
             reinitialization_state_.reference_frame.reset();
             reinitialization_state_.initializer.reset();
@@ -754,6 +758,9 @@ bool Tracking::track() {
     if (state_ == TrackingState::OK &&
         recovery_state_.stabilization_frames_remaining > 0) {
         --recovery_state_.stabilization_frames_remaining;
+    }
+    if (frames_since_successful_relocalization_ < std::numeric_limits<int>::max()) {
+        ++frames_since_successful_relocalization_;
     }
 
     // 5. Check if we need a new Keyframe (only if tracking is OK)
@@ -880,6 +887,15 @@ bool Tracking::needNewKeyframe() {
     // 2. Track quality: if tracked features drop below threshold, insert KF
     const int min_tracked_threshold = 60;
     if (num_tracked_features_ < min_tracked_threshold) {
+        if (frames_since_successful_relocalization_ <= kPostRelocEmergencyKfCooldownFrames) {
+            std::cout << "needNewKeyframe: Low tracked features (" << num_tracked_features_
+                      << ") within post-reloc cooldown ("
+                      << frames_since_successful_relocalization_ << "/"
+                      << kPostRelocEmergencyKfCooldownFrames << "), deferring." << std::endl;
+            traceKeyframeDecision(false, "post_reloc_cooldown_low_tracked",
+                                  ref_landmarks, tracked_ratio, frames_since_reference);
+            return false;
+        }
         std::cout << "needNewKeyframe: Low tracked features (" << num_tracked_features_ << "), inserting KF." << std::endl;
         traceKeyframeDecision(true, "low_tracked_features", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
@@ -2839,6 +2855,7 @@ bool Tracking::reinitialize() {
     // Reset re-init state
     reinitialization_state_.reference_frame.reset();
     reinitialization_state_.initializer.reset();
+    frames_since_successful_relocalization_ = std::numeric_limits<int>::max();
 
     std::cout << "Tracking: Re-init complete! " << inserted << " landmarks, "
               << map_->getAllKeyframes().size() << " total KFs" << std::endl;
