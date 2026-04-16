@@ -279,56 +279,6 @@ void Tracking::setReferenceKeyframe(Keyframe::Ptr kf) {
     reference_keyframe_ = kf;
 }
 
-void Tracking::setKeyframeDecisionTraceSink(std::shared_ptr<std::ostream> trace_sink) {
-    keyframe_decision_trace_sink_ = std::move(trace_sink);
-    keyframe_decision_trace_header_written_ = false;
-}
-
-void Tracking::traceKeyframeDecision(bool insert_keyframe,
-                                     const char* reason,
-                                     int ref_landmarks,
-                                     double tracked_ratio,
-                                     int frames_since_reference) {
-    if (!keyframe_decision_trace_sink_ || !current_frame_) {
-        return;
-    }
-
-    const bool mono_sparse_reference =
-        current_frame_->depth_image_.empty() && current_frame_->id_ >= 50 &&
-        current_frame_->id_ < 80 && ref_landmarks < 1300 && num_tracked_features_ < 900;
-    const double ratio_threshold_used = mono_sparse_reference ? 0.70 : 0.65;
-    const int mono_late_sparse_bootstrap =
-        current_frame_->depth_image_.empty() && current_frame_->id_ >= 180 &&
-        current_frame_->id_ < 250 && num_tracked_features_ <= 25 &&
-        current_frame_->keypoints_.size() >= 700
-            ? 1
-            : 0;
-
-    auto& os = *keyframe_decision_trace_sink_;
-    if (!keyframe_decision_trace_header_written_) {
-        os << "frame_id,reference_keyframe_id,frames_since_reference,tracked_features,ref_landmarks,"
-              "tracked_ratio,detected_keypoints,has_depth,tracking_state,insert_keyframe,reason,"
-              "mono_sparse_early_window,ratio_threshold,mono_late_sparse_bootstrap\n";
-        keyframe_decision_trace_header_written_ = true;
-    }
-
-    os << current_frame_->id_ << ','
-       << (reference_keyframe_ ? static_cast<long long>(reference_keyframe_->id_) : -1LL) << ','
-       << frames_since_reference << ','
-       << num_tracked_features_ << ','
-       << ref_landmarks << ','
-       << std::fixed << std::setprecision(6) << tracked_ratio << ','
-       << current_frame_->keypoints_.size() << ','
-       << (!current_frame_->depth_image_.empty() ? 1 : 0) << ','
-       << static_cast<int>(state_) << ','
-       << (insert_keyframe ? 1 : 0) << ','
-       << reason << ','
-       << (mono_sparse_reference ? 1 : 0) << ','
-       << std::setprecision(2) << ratio_threshold_used << ','
-       << mono_late_sparse_bootstrap << '\n';
-    os.flush();
-}
-
 bool Tracking::addFrame(Frame::Ptr frame) {
     current_frame_ = frame;
 
@@ -852,13 +802,11 @@ bool Tracking::needNewKeyframe() {
 
     if (loop_correction_state_.force_keyframe_insertion_once) {
         std::cout << "needNewKeyframe: Forced insertion after pending loop correction expiry." << std::endl;
-        traceKeyframeDecision(true, "forced_after_loop_deferral", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
     if (loop_correction_state_.pending) {
         std::cout << "needNewKeyframe: Deferring insertion until pending loop correction is resolved." << std::endl;
-        traceKeyframeDecision(false, "pending_loop_correction", ref_landmarks, tracked_ratio, frames_since_reference);
         return false;
     }
 
@@ -868,7 +816,6 @@ bool Tracking::needNewKeyframe() {
     const int min_frames_since_last_kf =
         current_frame_->depth_image_.empty() ? 4 : 3;
     if (frames_since_reference < min_frames_since_last_kf) {
-        traceKeyframeDecision(false, "min_frames_since_reference", ref_landmarks, tracked_ratio, frames_since_reference);
         return false;
     }
 
@@ -880,12 +827,9 @@ bool Tracking::needNewKeyframe() {
                       << ") within post-reloc cooldown ("
                       << frames_since_successful_relocalization_ << "/"
                       << kPostRelocEmergencyKfCooldownFrames << "), deferring." << std::endl;
-            traceKeyframeDecision(false, "post_reloc_cooldown_low_tracked",
-                                  ref_landmarks, tracked_ratio, frames_since_reference);
             return false;
         }
         std::cout << "needNewKeyframe: Low tracked features (" << num_tracked_features_ << "), inserting KF." << std::endl;
-        traceKeyframeDecision(true, "low_tracked_features", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
@@ -893,7 +837,6 @@ bool Tracking::needNewKeyframe() {
     const int max_frames_since_last_kf = 12;
     if (frames_since_reference >= max_frames_since_last_kf) {
         std::cout << "needNewKeyframe: Max frames reached, inserting KF." << std::endl;
-        traceKeyframeDecision(true, "max_frames_since_reference", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
@@ -908,19 +851,11 @@ bool Tracking::needNewKeyframe() {
         const double tracked_ratio_threshold = mono_sparse_reference ? 0.70 : 0.65;
         if (tracked_ratio < tracked_ratio_threshold) {
             std::cout << "needNewKeyframe: Low tracking ratio (" << tracked_ratio << "), inserting KF." << std::endl;
-            traceKeyframeDecision(true,
-                                  mono_sparse_reference ? "low_tracking_ratio_sparse_mono"
-                                                        : "low_tracking_ratio",
-                                  ref_landmarks,
-                                  tracked_ratio,
-                                  frames_since_reference);
             return true;
         }
-        traceKeyframeDecision(false, "ratio_ok", ref_landmarks, tracked_ratio, frames_since_reference);
         return false;
     }
 
-    traceKeyframeDecision(false, "no_reference_landmarks", ref_landmarks, -1.0, frames_since_reference);
     return false;
 }
 
