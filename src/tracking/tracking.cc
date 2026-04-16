@@ -1017,6 +1017,31 @@ bool Tracking::trackLocalMap() {
     std::vector<std::shared_ptr<Landmark>> matched_landmarks; // Keep track of LM for each point
     std::vector<int> matched_kp_indices; // Keep track of KP index for each point
 
+    struct FallbackTraceMatch {
+        unsigned long landmark_id = 0;
+        int keypoint_index = -1;
+        int candidate_rank = -1;
+        bool coarse_ok = false;
+        double coarse_err_px = std::numeric_limits<double>::quiet_NaN();
+        float descriptor_dist = std::numeric_limits<float>::infinity();
+        LocalMapSourceBucket source_bucket = LocalMapSourceBucket::GlobalFallback;
+    };
+
+    struct FallbackSummaryTrace {
+        bool active = false;
+        std::size_t candidate_count = 0;
+        std::size_t coarse_ok_count = 0;
+        std::size_t selected_topk_count = 0;
+        std::size_t rejected_belowk_count = 0;
+        double selected_topk_median_coarse_err_px = std::numeric_limits<double>::quiet_NaN();
+        double selected_topk_p90_coarse_err_px = std::numeric_limits<double>::quiet_NaN();
+        double rejected_belowk_median_coarse_err_px = std::numeric_limits<double>::quiet_NaN();
+        double rejected_belowk_p90_coarse_err_px = std::numeric_limits<double>::quiet_NaN();
+    };
+
+    std::vector<FallbackTraceMatch> fallback_trace_matches;
+    FallbackSummaryTrace fallback_summary_trace;
+
     std::vector<bool> keypoint_already_matched(current_frame_->keypoints_.size(), false);
 
     bool used_global_fallback = false;
@@ -1411,6 +1436,19 @@ bool Tracking::trackLocalMap() {
             const auto finite_coarse_err = [](double err_px) {
                 return std::isfinite(err_px) ? err_px : std::numeric_limits<double>::infinity();
             };
+            const auto trace_percentile = [](std::vector<double> values, double percentile) {
+                values.erase(std::remove_if(values.begin(), values.end(),
+                                            [](double v) { return !std::isfinite(v); }),
+                             values.end());
+                if (values.empty()) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                std::sort(values.begin(), values.end());
+                const double clamped = std::max(0.0, std::min(1.0, percentile));
+                const std::size_t idx = static_cast<std::size_t>(
+                    std::ceil(clamped * static_cast<double>(values.size())) - 1.0);
+                return values[std::min(idx, values.size() - 1)];
+            };
 
             if (late_sparse_mono_bootstrap) {
                 for (auto& c : candidates) {
@@ -1457,6 +1495,66 @@ bool Tracking::trackLocalMap() {
 
             constexpr int kFallbackCandidateTraceTop = 20;
             if (late_sparse_mono_bootstrap && !candidates.empty()) {
+                fallback_trace_matches.clear();
+                fallback_trace_matches.reserve(candidates.size());
+                fallback_summary_trace = FallbackSummaryTrace{};
+                fallback_summary_trace.active = true;
+                fallback_summary_trace.candidate_count = candidates.size();
+
+                std::vector<double> selected_topk_coarse_errs;
+                std::vector<double> rejected_belowk_coarse_errs;
+                selected_topk_coarse_errs.reserve(
+                    std::min(candidates.size(), kMaxBootstrapMatches));
+                if (candidates.size() > kMaxBootstrapMatches) {
+                    rejected_belowk_coarse_errs.reserve(candidates.size() - kMaxBootstrapMatches);
+                }
+
+                for (std::size_t rank = 0; rank < candidates.size(); ++rank) {
+                    const auto& c = candidates[rank];
+                    if (c.coarse_ok) {
+                        ++fallback_summary_trace.coarse_ok_count;
+                    }
+                    if (std::isfinite(c.coarse_err_px)) {
+                        if (rank < kMaxBootstrapMatches) {
+                            selected_topk_coarse_errs.push_back(c.coarse_err_px);
+                        } else {
+                            rejected_belowk_coarse_errs.push_back(c.coarse_err_px);
+                        }
+                    }
+                    if (c.lm_idx < 0 ||
+                        c.lm_idx >= static_cast<int>(fallback_lm_list.size())) {
+                        continue;
+                    }
+                    const auto& trace_lm = fallback_lm_list[static_cast<std::size_t>(c.lm_idx)];
+                    if (!trace_lm) {
+                        continue;
+                    }
+                    fallback_trace_matches.push_back({
+                        trace_lm->id_,
+                        c.kp_idx,
+                        static_cast<int>(rank),
+                        c.coarse_ok,
+                        c.coarse_err_px,
+                        c.dist,
+                        c.source_bucket,
+                    });
+                }
+
+                fallback_summary_trace.selected_topk_count =
+                    std::min(candidates.size(), kMaxBootstrapMatches);
+                fallback_summary_trace.rejected_belowk_count =
+                    candidates.size() > kMaxBootstrapMatches
+                        ? candidates.size() - kMaxBootstrapMatches
+                        : 0;
+                fallback_summary_trace.selected_topk_median_coarse_err_px =
+                    trace_percentile(selected_topk_coarse_errs, 0.50);
+                fallback_summary_trace.selected_topk_p90_coarse_err_px =
+                    trace_percentile(selected_topk_coarse_errs, 0.90);
+                fallback_summary_trace.rejected_belowk_median_coarse_err_px =
+                    trace_percentile(rejected_belowk_coarse_errs, 0.50);
+                fallback_summary_trace.rejected_belowk_p90_coarse_err_px =
+                    trace_percentile(rejected_belowk_coarse_errs, 0.90);
+
                 std::cout << "TrackLocalMap: FallbackCandidateTrace frame=" << current_frame_->id_
                           << " order=coarse_err_dist_bucket_tie from_all="
                           << (fallback_from_all_landmarks ? 1 : 0) << " top="
@@ -1687,6 +1785,68 @@ bool Tracking::trackLocalMap() {
             rvec,
             tvec,
             inliers);
+    }
+
+    if (late_sparse_mono_bootstrap && fallback_summary_trace.active) {
+        for (const int corr_idx : inliers) {
+            if (corr_idx < 0 ||
+                corr_idx >= static_cast<int>(matched_landmarks.size()) ||
+                corr_idx >= static_cast<int>(matched_kp_indices.size())) {
+                continue;
+            }
+            const auto& lm = matched_landmarks[static_cast<std::size_t>(corr_idx)];
+            if (!lm) {
+                continue;
+            }
+            const unsigned long landmark_id = lm->id_;
+            const int keypoint_index = matched_kp_indices[static_cast<std::size_t>(corr_idx)];
+            const FallbackTraceMatch* trace = nullptr;
+            for (const auto& candidate_trace : fallback_trace_matches) {
+                if (candidate_trace.landmark_id == landmark_id &&
+                    candidate_trace.keypoint_index == keypoint_index) {
+                    trace = &candidate_trace;
+                    break;
+                }
+            }
+            if (!trace) {
+                continue;
+            }
+            std::cout << "TrackLocalMap: FallbackInlier"
+                      << " frame=" << current_frame_->id_
+                      << " lm_id=" << trace->landmark_id
+                      << " kp=" << trace->keypoint_index
+                      << " rank=" << trace->candidate_rank
+                      << " coarse_ok=" << (trace->coarse_ok ? 1 : 0)
+                      << " coarse_err_px="
+                      << (std::isfinite(trace->coarse_err_px) ? trace->coarse_err_px : -1.0)
+                      << " dist=" << trace->descriptor_dist
+                      << " bucket=" << source_bucket_name(trace->source_bucket)
+                      << std::endl;
+        }
+        std::cout << "TrackLocalMap: FallbackSummary"
+                  << " frame=" << current_frame_->id_
+                  << " candidates=" << fallback_summary_trace.candidate_count
+                  << " coarse_ok=" << fallback_summary_trace.coarse_ok_count
+                  << " selected_topk=" << fallback_summary_trace.selected_topk_count
+                  << " selected_topk_med_coarse_err_px="
+                  << (std::isfinite(fallback_summary_trace.selected_topk_median_coarse_err_px)
+                          ? fallback_summary_trace.selected_topk_median_coarse_err_px
+                          : -1.0)
+                  << " selected_topk_p90_coarse_err_px="
+                  << (std::isfinite(fallback_summary_trace.selected_topk_p90_coarse_err_px)
+                          ? fallback_summary_trace.selected_topk_p90_coarse_err_px
+                          : -1.0)
+                  << " rejected_belowk=" << fallback_summary_trace.rejected_belowk_count
+                  << " rejected_belowk_med_coarse_err_px="
+                  << (std::isfinite(fallback_summary_trace.rejected_belowk_median_coarse_err_px)
+                          ? fallback_summary_trace.rejected_belowk_median_coarse_err_px
+                          : -1.0)
+                  << " rejected_belowk_p90_coarse_err_px="
+                  << (std::isfinite(fallback_summary_trace.rejected_belowk_p90_coarse_err_px)
+                          ? fallback_summary_trace.rejected_belowk_p90_coarse_err_px
+                          : -1.0)
+                  << " pnp_inliers=" << (success ? inliers.size() : 0)
+                  << std::endl;
     }
 
     if (success && inliers.size() >= kMinTrackLocalMapInliers) {
