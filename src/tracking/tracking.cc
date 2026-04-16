@@ -958,11 +958,6 @@ bool Tracking::trackLocalMap() {
 
     struct LocalMapSourceStats {
         std::array<std::size_t, kNumLocalMapSourceBuckets> pool_added{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_nonfinite{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_depth{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_oob{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> visible{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> matched{};
     };
 
     std::vector<Landmark::Ptr> landmarks;
@@ -1048,15 +1043,6 @@ bool Tracking::trackLocalMap() {
     std::cout << std::endl;
 
     struct PoseFilterStats {
-        std::size_t total = 0;
-        std::size_t kept = 0;
-        std::size_t reject_nonfinite = 0;
-        std::size_t reject_depth = 0;
-        std::size_t reject_reprojection = 0;
-        std::size_t focus_total = 0;
-        std::size_t focus_kept = 0;
-        std::size_t focus_reject_nonfinite = 0;
-        std::size_t focus_reject_depth = 0;
         std::size_t focus_reject_reprojection = 0;
     };
 
@@ -1079,26 +1065,14 @@ bool Tracking::trackLocalMap() {
         const SE3 T_cw_est = current_frame_->getPose();
         for (size_t i = 0; i < object_points.size(); ++i) {
             const bool in_focus = i >= focus_begin;
-            ++stats.total;
-            if (in_focus) {
-                ++stats.focus_total;
-            }
 
             const auto& Pw = object_points[i];
             Vec3 p_w(Pw.x, Pw.y, Pw.z);
             Vec3 p_c = T_cw_est * p_w;
             if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) {
-                ++stats.reject_nonfinite;
-                if (in_focus) {
-                    ++stats.focus_reject_nonfinite;
-                }
                 continue;
             }
             if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) {
-                ++stats.reject_depth;
-                if (in_focus) {
-                    ++stats.focus_reject_depth;
-                }
                 continue;
             }
 
@@ -1113,7 +1087,6 @@ bool Tracking::trackLocalMap() {
             const double dx = uv.x - proj[0];
             const double dy = uv.y - proj[1];
             if ((dx * dx + dy * dy) > gate_px * gate_px) {
-                ++stats.reject_reprojection;
                 if (in_focus) {
                     ++stats.focus_reject_reprojection;
                 }
@@ -1124,10 +1097,6 @@ bool Tracking::trackLocalMap() {
             filtered_image_points.push_back(uv);
             filtered_landmarks.push_back(matched_landmarks[i]);
             filtered_kp_indices.push_back(kp_idx);
-            ++stats.kept;
-            if (in_focus) {
-                ++stats.focus_kept;
-            }
         }
 
         object_points.swap(filtered_object_points);
@@ -1155,7 +1124,6 @@ bool Tracking::trackLocalMap() {
         Vec3 pos_w = lm->getPos();
         if (!std::isfinite(pos_w[0]) || !std::isfinite(pos_w[1]) || !std::isfinite(pos_w[2])) {
             skipped_nonfinite++;
-            ++local_map_source_stats.rejected_nonfinite[source_idx];
             continue;
         }
         Vec3 pos_c = current_frame_->getPose() * pos_w; // T_cw * pos_w
@@ -1164,22 +1132,19 @@ bool Tracking::trackLocalMap() {
         const double max_depth = 20.0;  // Reasonable for indoor scenes
         if (pos_c[2] <= 0.1 || pos_c[2] > max_depth) {
             skipped_behind_or_close++;
-            ++local_map_source_stats.rejected_depth[source_idx];
             continue; // Behind camera, too close, or too far
         }
-        
+
         Vec2 px = current_frame_->camera_->project(pos_c);
-        
+
         // Check bounds
         if (px[0] < 0 || px[0] >= current_frame_->image_.cols ||
             px[1] < 0 || px[1] >= current_frame_->image_.rows) {
             skipped_oob++;
-            ++local_map_source_stats.rejected_oob[source_idx];
             continue;
         }
-            
+
         visible_points++;
-        ++local_map_source_stats.visible[source_idx];
 
         // Cache visible landmarks for fallback matching
         visible_lm_descs.push_back(lm->descriptor_);
@@ -1220,7 +1185,6 @@ bool Tracking::trackLocalMap() {
             keypoint_already_matched[best_idx] = true;
             
             matches_found++;
-            ++local_map_source_stats.matched[source_idx];
         }
     }
     
