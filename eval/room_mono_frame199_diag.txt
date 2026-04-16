@@ -1,0 +1,98 @@
+# room_mono frame 199 — TrackLocalMap + recovery (repro snapshot)
+
+Generated: 2026-04-16
+Command (repo root):
+
+  ./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room \
+    --max-frames 250 --repro-eval --no-viz \
+    --keyframe-trace-csv log/room_mono_kf_probe.csv \
+    2>&1 | tee log/room_mono_tracklocalmap_probe.log
+
+Full log: log/room_mono_tracklocalmap_probe.log
+Keyframe CSV: log/room_mono_kf_probe.csv
+
+--- excerpt: awk '/^Frame 199:/{flag=1} flag{print} /^Frame 200:/{exit}' log/room_mono_tracklocalmap_probe.log
+
+Frame 199: 1375 kps | State: 2 | Pose:  0.459068 -0.208565 -0.198107
+Matches with last frame: 394
+TrackReferenceKeyframe: Propagated landmarks: 2
+TrackReferenceKeyframe: 3D-2D correspondences: 2
+TrackLocalMap: Landmarks to check: 680
+TrackLocalMap: LocalMapSources ref=97 ref_neighbors=583 prev_ref=0 prev_neighbors=0 global=0
+TrackLocalMap: Visible: 76, Matches: 12 (skipped nonfinite=0 behind/close=29 oob=575)
+TrackLocalMap: LocalMapVisibility ref{... vis=47,match=7} ref_neighbors{... vis=29,match=5} ...
+TrackLocalMap: Pose-gated matches: 9
+TrackLocalMap: Descriptor bootstrap using all 680 landmarks
+TrackLocalMap: BootstrapStats ... from_all=1 pose_relaxed_retry=1 ...
+TrackLocalMap: Fallback global matches: 15
+TrackLocalMap: CorrStats n=15 ... reproj_err_px[min/mean/max]=2.17077/94.631/445.325 used_global_fallback=1
+TrackLocalMap: PnP method=EPNP inliers=9
+TrackLocalMap: PnP rejected - insufficient inliers: 9 (min=12)
+Tracking: Lost, attempting relocalization...
+Relocalize: ... Candidate KF 191 inliers=13 ...
+Tracking: Relocalization successful!
+needNewKeyframe: Low tracked features (22), inserting KF.
+Tracking: Insert New Keyframe (ID=200)
+
+Facts:
+- Local map has 680 landmarks; 575 counted oob for projection — neighbor bucket is mostly off-screen.
+- After bootstrap, PnP has only 9 inliers (< 12) → track lost → relocalize against KF 191 succeeds.
+- needNewKeyframe path is low_tracked_features (22 < 60), consistent with keyframe CSV rows for 195–205.
+
+--- Frames 197–201 (same log, condensed)
+
+| Live frame (line `Frame N:`) | Landmarks to check | Visible | `from_all` bootstrap | PnP inliers (min 12) | Lost → reloc KF |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 197 | 427 | 87 | 0 | (lost before PnP line in block) | KF 185 → KF 198 inserted |
+| 198 | 937 | 84 | 0 | (lost) | KF 188 → KF 199 inserted |
+| 199 | 680 | 76 | 1 | 9 | KF 191 → KF 200 inserted |
+| 200 | 427 | 89 | 0 | 9 | KF 191 → KF 201 inserted |
+| 201 | 427 | 119 | 0 | 8 | KF 188 → KF 202 inserted |
+
+Notes:
+- 197–198: small pool / few projection matches; `from_all=0` but still **Lost** before stable local-map PnP (see log: relocalization runs).
+- 199: **only frame here** that expands to **all 680** landmarks (`from_all=1`); mean reproj **94.6 px** on 15 correspondences; PnP **9** inliers.
+- 200–201: `from_all=0` again; PnP still **9** or **8** inliers → lost → reloc succeeds; **KF 191** and **KF 188** alternate as best candidates.
+
+Raw multi-frame excerpt was generated with:
+
+  for n in 197 198 199 200 201; do
+    echo "========== Frame $n =========="
+    awk -v n="$n" 'BEGIN{pat="^Frame " n ":"} $0~pat{f=1} f{print} /^Frame / && !($0 ~ pat){if(f && seen++) exit}' "$LOG"
+  done
+
+## 2026-04-17 Phase B trace-only fallback diagnostics
+
+Log: `log/room_mono_trace_phaseB.log`
+Command: `./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room --max-frames 250 --repro-eval --no-viz --reference-policy heuristic`
+
+Short grep extract, frames 195-205:
+
+```text
+TrackLocalMap: FallbackCandidateTrace frame=195 order=coarse_err_dist_bucket_tie from_all=0 top=1
+TrackLocalMap: FallbackCandidateTrace frame=199 order=coarse_err_dist_bucket_tie from_all=0 top=1
+TrackLocalMap: FallbackCandidateTrace frame=200 order=coarse_err_dist_bucket_tie from_all=0 top=2
+TrackLocalMap: FallbackCandidateTrace frame=203 order=coarse_err_dist_bucket_tie from_all=0 top=3
+TrackLocalMap: FallbackInlier frame=203 lm_id=26570 kp=553 rank=0 coarse_ok=1 coarse_err_px=29.1966 dist=60 bucket=ref
+TrackLocalMap: FallbackInlier frame=203 lm_id=26276 kp=201 rank=1 coarse_ok=1 coarse_err_px=31.3218 dist=36 bucket=ref_neighbors
+TrackLocalMap: FallbackSummary frame=203 candidates=3 coarse_ok=2 selected_topk=3 selected_topk_med_coarse_err_px=31.3218 selected_topk_p90_coarse_err_px=422.41 rejected_belowk=0 rejected_belowk_med_coarse_err_px=-1 rejected_belowk_p90_coarse_err_px=-1 pnp_inliers=15
+TrackLocalMap: FallbackCandidateTrace frame=204 order=coarse_err_dist_bucket_tie from_all=0 top=1
+TrackLocalMap: FallbackInlier frame=204 lm_id=26570 kp=548 rank=0 coarse_ok=1 coarse_err_px=8.21464 dist=55 bucket=ref
+TrackLocalMap: FallbackSummary frame=204 candidates=1 coarse_ok=1 selected_topk=1 selected_topk_med_coarse_err_px=8.21464 selected_topk_p90_coarse_err_px=8.21464 rejected_belowk=0 rejected_belowk_med_coarse_err_px=-1 rejected_belowk_p90_coarse_err_px=-1 pnp_inliers=13
+TrackLocalMap: FallbackCandidateTrace frame=205 order=coarse_err_dist_bucket_tie from_all=0 top=8
+TrackLocalMap: FallbackInlier frame=205 lm_id=26236 kp=792 rank=0 coarse_ok=1 coarse_err_px=1.6395 dist=32 bucket=ref
+TrackLocalMap: FallbackInlier frame=205 lm_id=26404 kp=369 rank=1 coarse_ok=1 coarse_err_px=1.72842 dist=28 bucket=ref
+TrackLocalMap: FallbackInlier frame=205 lm_id=26128 kp=591 rank=2 coarse_ok=1 coarse_err_px=2.25364 dist=45 bucket=ref
+TrackLocalMap: FallbackInlier frame=205 lm_id=26255 kp=203 rank=3 coarse_ok=1 coarse_err_px=4.50439 dist=31 bucket=ref
+TrackLocalMap: FallbackInlier frame=205 lm_id=26686 kp=720 rank=4 coarse_ok=1 coarse_err_px=5.20084 dist=44 bucket=ref
+TrackLocalMap: FallbackSummary frame=205 candidates=8 coarse_ok=5 selected_topk=8 selected_topk_med_coarse_err_px=4.50439 selected_topk_p90_coarse_err_px=407.69 rejected_belowk=0 rejected_belowk_med_coarse_err_px=-1 rejected_belowk_p90_coarse_err_px=-1 pnp_inliers=20
+```
+
+Summary:
+- Gates before this trace stayed unchanged: `room_mono_head_repro=0.197177`, room mono SHA prefix `6583177e40532f6a`; `xyz_mono_head_repro=0.028136`.
+- Frame 199 has one coarse-pass fallback candidate but only two total local-map matches, so it does not reach PnP and cannot answer inlier correlation alone.
+- Frames 203-205 do answer it: the final fallback PnP inliers are exactly the lowest coarse-error ranks (`0-1`, `0`, and `0-4` respectively).
+- This says the coarse-error ranking is correlated with PnP inlier outcome when there is enough support; it does not look like descriptor-distance noise.
+- The selected-vs-rejected-below-K distribution is not informative here because candidate counts are all below `kMaxBootstrapMatches`, so `rejected_belowk=0`.
+- Within the selected top-K set, high coarse-error coarse-fail candidates remain visible in p90 (`~407-422 px`) and are removed by pose/PnP, so selected top-K is not cleanly separated by itself.
+- Source bucket is not a distinguishing signal among near-equal coarse-error candidates: frame 203 keeps both `ref` and `ref_neighbors` near 30 px, while frame 205 is all `ref` because those have the lowest coarse errors.
