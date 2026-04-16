@@ -1448,10 +1448,6 @@ bool Tracking::trackLocalMap() {
                 return 5;
             };
             constexpr float kDistTieEps = 1e-4f;
-            constexpr double kCoarseErrTieEps = 1e-6;
-            const auto finite_coarse_err = [](double err_px) {
-                return std::isfinite(err_px) ? err_px : std::numeric_limits<double>::infinity();
-            };
             const auto trace_percentile = [](std::vector<double> values, double percentile) {
                 values.erase(std::remove_if(values.begin(), values.end(),
                                             [](double v) { return !std::isfinite(v); }),
@@ -1475,13 +1471,6 @@ bool Tracking::trackLocalMap() {
                           [&](const MatchCandidate& a, const MatchCandidate& b) {
                               if (a.coarse_ok != b.coarse_ok) {
                                   return a.coarse_ok > b.coarse_ok;
-                              }
-                              if (a.coarse_ok && b.coarse_ok) {
-                                  const double ea = finite_coarse_err(a.coarse_err_px);
-                                  const double eb = finite_coarse_err(b.coarse_err_px);
-                                  if (std::abs(ea - eb) > kCoarseErrTieEps) {
-                                      return ea < eb;
-                                  }
                               }
                               if (std::abs(a.dist - b.dist) > kDistTieEps) {
                                   return a.dist < b.dist;
@@ -1572,7 +1561,7 @@ bool Tracking::trackLocalMap() {
                     trace_percentile(rejected_belowk_coarse_errs, 0.90);
 
                 std::cout << "TrackLocalMap: FallbackCandidateTrace frame=" << current_frame_->id_
-                          << " order=coarse_err_dist_bucket_tie from_all="
+                          << " order=coarse_dist_bucket_tie from_all="
                           << (fallback_from_all_landmarks ? 1 : 0) << " top="
                           << std::min(kFallbackCandidateTraceTop,
                                       static_cast<int>(candidates.size()))
