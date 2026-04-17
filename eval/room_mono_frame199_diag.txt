@@ -220,3 +220,46 @@ Conclusions:
 Practical recommendation recorded for the next session: anyone
 running 600-frame loop-enabled mono for measurement should prefer
 `--repro-eval` unless they are explicitly testing the loop thread.
+
+## 2026-04-18 ThreadSanitizer race triage
+
+Built with `-fsanitize=thread -fno-omit-frame-pointer -g` and ran
+`setarch $(uname -m) -R env TSAN_OPTIONS=... ./build_tsan/run_mono
+--tum data/tum/rgbd_dataset_freiburg1_room --max-frames 250 --no-viz
+data/ORBvoc.txt` (ASLR off via `setarch -R` to avoid TSan's
+"unexpected memory mapping" FATAL under newer kernel mmap randomness).
+
+First pass before any fix: 27 data races + 2 lock-order-inversions.
+Top hit by location: `src/core/landmark.h:30/31` -- plain `bool is_bad_`
+raced between `Optimizer::bundleAdjustment -> Landmark::setBad()`
+on the LocalMapping thread and `Tracking::needNewKeyframe ->
+Landmark::isBad()` on the main thread.
+
+Fix landed in commit ff74140: `is_bad_` is now `std::atomic<bool>`
+with release-store / acquire-load accessors, no behavior change on
+any of the seven regression gates.
+
+Post-fix TSan rerun: 34 data races (variance across runs; slightly
+higher but no longer featuring `landmark.h:30`). The remaining races
+fall into two buckets:
+
+1. `std::shared_ptr<Landmark>` access on shared containers --
+   `shared_ptr_base.h:1670 operator bool() const` and
+   `shared_ptr_base.h:1075 __shared_count(...)` copy construct --
+   flagged when main-thread `needNewKeyframe` / `trackLocalMap`
+   iterate `Keyframe::landmarks_` while LocalMapping swaps entries.
+   Fixing this requires a container-level lock (e.g. hold
+   `Keyframe::mutex_` around the landmark iteration, or introduce a
+   snapshot getter) rather than a one-line atomic change.
+2. `Tracking::current_frame_` shared_ptr swap: main thread
+   `addFrame()` assigns at tracking.cc:283 while the LocalMapping
+   thread's `onBACompleted` callback dereferences `current_frame_`
+   via `recomputeCurrentPose` (tracking.cc:1911). `pose_mutex_`
+   already exists; a minimal fix is to hold it across the swap and
+   around the callback read.
+
+Both are real races and plausibly related to the 600-frame async
+intermittent core dump described in the previous section. Each
+needs a targeted fix with the same scope-and-gate discipline as the
+is_bad_ atomic; deferring to a follow-up session so the fix can
+ship with its own TSan-verified "before / after" evidence.
