@@ -21,6 +21,7 @@ public:
     // Depth image (copied from Frame)
     cv::Mat depth_image_;
     bool depth_is_metric_ = true;
+    bool depth_is_learned_ = false;  // true if depth came from an ONNX model
 
     // Gravity direction in camera frame (from accelerometer, if available)
     // Used for gravity constraint in BA (constrains roll/pitch)

@@ -552,6 +552,7 @@ int main(int argc, char** argv) {
             if (run_dl) {
                 frame->depth_image_ = dl_depth_estimator->estimate(img);
                 frame->depth_is_metric_ = dl_depth_estimator->isMetric();
+                frame->depth_is_learned_ = true;
             }
         }
 #endif

@@ -9,6 +9,7 @@ Keyframe::Keyframe(Frame::Ptr frame)
       T_cw_(frame->getPose()),
       depth_image_(frame->depth_image_.empty() ? cv::Mat() : frame->depth_image_.clone()),
       depth_is_metric_(frame->depth_is_metric_),
+      depth_is_learned_(frame->depth_is_learned_),
       keypoints_(frame->keypoints_), descriptors_(frame->descriptors_.clone()),
       landmarks_(frame->landmarks_)
 {
