@@ -302,3 +302,28 @@ What is left in the 23 still-reported races:
 Neither is a one-commit fix. They stay as follow-ups for a dedicated
 session with the same discipline applied here (one race per commit,
 TSan before/after, all seven gates byte-identical).
+
+## 2026-04-18 race-fix validation on 600-frame async room_mono
+
+Re-ran the 3-rep 600-frame fr1_room async mono (no --accel, loop
+closing thread on) at HEAD 9b7f854 with the same command and evo_ape
+flags as the 2026-04-18 pre-fix measurement. All three reps completed
+cleanly with exit=0; no core dump:
+
+                   pre-race-fix          post-race-fix
+  rep1             0.834                 0.697
+  rep2             0.636                 0.569
+  rep3             core dump             0.762
+  crash rate       1/3                   0/3
+
+ATE variance is also slightly tighter (range 0.57-0.76 vs 0.48-0.93).
+This is a direct validation that the three targeted race fixes (
+ff74140 is_bad_ atomic, a2f65f1 current_frame_ pose_mutex_,
+996aefb Keyframe::landmarks_ kf->mutex_) eliminated the intermittent
+600-frame crash that the earlier diag section attributed to a
+threading race.
+
+Absolute ATE at 600 frames is still high (0.57-0.76 m) and
+non-deterministic versus the 0.1765 m head-250 reference; that is
+the downstream room_mono scale-drift / reference-KF collapse problem
+described earlier, not a threading bug.
