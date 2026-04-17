@@ -189,7 +189,19 @@ int addDepthPriorResiduals(ceres::Problem& problem,
             continue;
         }
 
-        const double sigma = keyframe->depth_is_metric_ ? 0.015 : 0.2;
+        // Sensor / stereo metric depth is trusted tightly (15 mm).
+        // Learned metric depth from an ONNX model is much noisier per-pixel, so
+        // we soften it substantially to avoid the BA baking depth outliers into
+        // the pose (observed as 3.5x room_mono regression with indoor_small).
+        // Non-metric (relative) DL depth stays at 0.2.
+        double sigma;
+        if (!keyframe->depth_is_metric_) {
+            sigma = 0.2;
+        } else if (keyframe->depth_is_learned_) {
+            sigma = 0.15;
+        } else {
+            sigma = 0.015;
+        }
         const double weight = 1.0 / sigma;
         const auto& camera = keyframe->camera_;
         ceres::CostFunction* depth_cost = DepthPriorError::Create(
