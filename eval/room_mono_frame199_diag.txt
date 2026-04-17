@@ -189,3 +189,34 @@ concrete room_mono lever is therefore *not* another threshold knob
 but something structural like reference-KF refresh under a dying
 propagation chain - and even that is a new-handoff-sized experiment
 given the failure rate of speculative attempts.
+
+## 2026-04-18 600-frame async crash is a threading race
+
+Running `./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room
+--max-frames 600 --no-viz data/ORBvoc.txt` three times with loop closing
+and mapping threads live (default async mode) produced one clean core
+dump at ~frame 195 during a relocalize cascade. Under `--repro-eval`
+(synchronous mapping, loop closing disabled) the same sequence ran
+three times with exit=0 and produced an identical ATE of 0.468671 m
+on every rep. An AddressSanitizer build ran a clean async 600-frame
+pass with zero memory errors and no crash, but ASan slows the tracker
+enough that the timing-sensitive path does not fire.
+
+Conclusions:
+
+- The crash is a threading race, almost certainly in the handoff
+  between Tracking, LocalMapping, and LoopClosing rather than a
+  single-threaded bug. `--repro-eval` dodges it entirely by removing
+  the LoopClosing thread.
+- A proper fix needs ThreadSanitizer (not AddressSanitizer) plus many
+  run reps to find the race, and then careful mutex / atomic audit on
+  Map::getAllKeyframes() / getAllLandmarks() and the LoopClosing
+  pose-graph handoff. Plan.md §6.1 already flags this as a known
+  concern in "Map API hygiene".
+- Async 600-frame ATE variance (0.48–0.93 m across three reps) is
+  large enough that single-rep comparisons are not meaningful for
+  that window; head-250 gates stay the reliable signal.
+
+Practical recommendation recorded for the next session: anyone
+running 600-frame loop-enabled mono for measurement should prefer
+`--repro-eval` unless they are explicitly testing the loop thread.
