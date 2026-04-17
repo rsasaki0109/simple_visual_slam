@@ -147,3 +147,45 @@ Implications for the next experiment (not executed in this session):
 - A plausible attack is to force a reference-KF **switch** (not insertion) when `TrackReferenceKeyframe: Propagated landmarks` falls below a small threshold (e.g. `< 10`). Switch target: the covisibility neighbor with the most projectable landmarks under the current pose estimate.
 - Any such change touches reference-policy code that was out of scope for V1-V3 handoffs. It would need a new handoff with that scope explicitly opened and the same `xyz_mono <= 0.030` guardrail.
 - V2 (`7fe7bbc` + `d4584b8`) remains the committed best. No further code change in this session.
+
+## 2026-04-17 Simplification pass and failed threshold attack
+
+Between V2 (`d4584b8`) and HEAD we ran an aggressive Tesla-style
+cleanup pass (commits `c81bcf2`, `9fbf2de`, `0f9c114`, `d2676a3`,
+`f2d7111`, `1af225d`, `776fd05`). Net: ~2325 tracked lines deleted
+(experimental `score`/`pipeline` reference policies + harness + docs,
+Phase B trace plumbing, four dead diagnostic prints, dead variables,
+struct trimming) with **byte-identical trajectory SHAs for all five
+gates**, i.e. zero behavioral change. Baseline drifted from
+`room_mono = 0.176340` to `0.176506` only because `c81bcf2` removed
+the V1 coarse-error tiebreak (plan.md already documented it as
+near-noise).
+
+After the cleanup, one targeted accuracy attempt was tried and
+reverted:
+
+- Hypothesis: lowering `kMinTrackLocalMapInliers` from `12` to `10`
+  would let frames like 192 (9 post-PnP inliers) keep tracking instead
+  of entering the lost -> relocalize -> cascade loop.
+- Result: `xyz_mono` unchanged at `0.028136` (guardrail held; it never
+  visits the 9-11 inlier regime), but `room_mono` regressed
+  `0.176506 -> 0.290476` (+64.7%). Different SHA `2d4c8960de94298f`.
+- Interpretation: the `12` minimum is a load-bearing safety valve.
+  Accepting a marginal PnP solution with ~10 inliers produces a bad
+  pose that then gets baked into `current_frame_->landmarks_` and
+  pollutes downstream propagation. The old "reject -> relocalize" path
+  was, on average, less harmful than "accept with 10 inliers".
+- Add to ruled-out: any monotone reduction of `kMinTrackLocalMapInliers`
+  without a companion pose-quality gate. If revisited, pair the lower
+  threshold with tighter reprojection / pose-change checks rather than
+  lowering the inlier count alone.
+
+Two independent speculative attacks (V3 ultra-sparse skip, this
+12->10 threshold) have now regressed `room_mono` by ~65-68% versus the
+V2 baseline. The pattern is consistent: threshold or gating changes
+that "let more frames through" tend to accept bad state, which
+cascades, which is worse than the localize/recover path. The next
+concrete room_mono lever is therefore *not* another threshold knob
+but something structural like reference-KF refresh under a dying
+propagation chain - and even that is a new-handoff-sized experiment
+given the failure rate of speculative attempts.
