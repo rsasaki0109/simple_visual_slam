@@ -40,7 +40,17 @@ if(NOT Ceres_FOUND)
     # Avoid depending on system glog/gflags.
     set(MINIGLOG ON CACHE BOOL "" FORCE)
     set(GFLAGS OFF CACHE BOOL "" FORCE)
-    
+
+    # Ceres optionally links CXSparse. On recent Ubuntu runners
+    # (libsuitesparse-dev 5.10+), the CMake-exported target is renamed
+    # from CXSparse::CXSparse to SuiteSparse::CXSparse, which breaks
+    # Ceres 2.1.0's hard-coded target name at
+    # internal/ceres/CMakeLists.txt:329. Disable CXSparse in Ceres --
+    # we do not rely on its linear solvers here, and the other solvers
+    # (DENSE_SCHUR / SPARSE_NORMAL_CHOLESKY via Eigen) cover both local
+    # BA and pose graph paths.
+    set(CXSPARSE OFF CACHE BOOL "" FORCE)
+
     FetchContent_MakeAvailable(ceres)
     
     # Create alias if needed
