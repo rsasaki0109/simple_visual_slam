@@ -54,6 +54,21 @@
 
 ## 600-Frame Validation
 
+### Refresh at HEAD `3d7b5f1` (2026-04-18)
+
+| Run | ATE (m) | ATE RMSE (m) |
+| --- | ---: | ---: |
+| `rep1` | 0.125949 | 0.134467 |
+| `rep2` | 0.146260 | 0.154620 |
+| `rep3` | 0.110414 | 0.122939 |
+
+- Median 600-frame ATE: `0.125949 m`
+- Command: `./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room --depth --max-frames 600 --no-viz data/ORBvoc.txt`
+- evo_ape flags: `--align --correct_scale --t_max_diff 0.05`
+- Net assessment: all three runs completed in the `0.11-0.15 m` band. The previous snapshot (below) had a median `0.617 m` with worst-case `0.871 m`. Variance and worst-case dropped by ~80% each since the V2 post-reloc cooldown (`0220ea7`) and the surrounding simplification pass landed. The three runs are now close enough that a single `rep` is roughly representative rather than a lottery.
+
+### Earlier snapshot (pre-cooldown, 2026-04-14)
+
 | Run | ATE (m) | Loop Detections | Pending Loop Corrections Applied | Stabilization Rejections | Forced Reference Refreshes |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `rep1` | 0.13731232 | 7 | 3 | 0 | 1 |
@@ -61,9 +76,8 @@
 | `rep3` | 0.87081246 | 7 | 5 | 1 | 1 |
 
 - Median 600-frame ATE: `0.61716193 m`
-- Reference point: the loop-enabled `room_depth` head-250 median above was `0.08255800 m`, so the longer `600`-frame run is much less stable.
-- Inference from logs: the loop-correction stabilization path is active, not dead code. `rep2` and `rep3` both logged `TrackLocalMap: REJECTED - Recovery stabilization kept prior pose` and then forced reference refreshes after pending-loop-correction expiry, while `rep1` completed without stabilization rejections and had the best ATE.
-- Net assessment: the loop stabilization changes help catch some bad post-loop handoffs, but they do not yet make `room_depth` reliable over `600` frames with loop closing enabled; two of the three runs still ended with large drift.
+- Reference point: the loop-enabled `room_depth` head-250 median above was `0.08255800 m`, so the longer `600`-frame run was much less stable at that time.
+- Inference from logs: the loop-correction stabilization path was active, not dead code. `rep2` and `rep3` both logged `TrackLocalMap: REJECTED - Recovery stabilization kept prior pose` and then forced reference refreshes after pending-loop-correction expiry, while `rep1` completed without stabilization rejections and had the best ATE.
 
 ## Covisibility-Weighted Loop-Enabled Comparison (room_depth)
 
