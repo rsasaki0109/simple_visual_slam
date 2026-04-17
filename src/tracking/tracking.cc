@@ -436,18 +436,38 @@ bool Tracking::initialize() {
         // Second frame, try to initialize
         if (initializer_->initialize(current_frame_)) {
             std::cout << "Tracking: Initialization SUCCESS!" << std::endl;
-            
-            // 1. Create Keyframes
+
+            // Gravity alignment (mono init): rotate the world frame so gravity
+            // points in [0, 0, -1], matching the assumption in the BA gravity
+            // prior. Without this, GravityPriorError silently no-ops on mono
+            // because gravity_aligned_ stays false. The initializer operates in
+            // c1-frame coordinates and is independent of world, so we can apply
+            // the alignment here and then rewrite all poses and landmarks.
+            SE3 T_align;  // identity by default (no-op when no accel)
+            if (!gravity_aligned_ && !accel_buffer_.empty()) {
+                Vec3 gravity = AccelerometerProcessor::estimateGravity(accel_buffer_);
+                if (gravity.norm() > 0.5) {
+                    Mat33 R_align = AccelerometerProcessor::computeGravityAlignment(gravity);
+                    T_align = SE3(R_align, Vec3(0, 0, 0));
+                    gravity_aligned_ = true;
+                    std::cout << "Tracking: Applied gravity alignment (mono init)" << std::endl;
+                }
+            }
+            initial_frame_->setPose(T_align);
+
+            // 1. Create Keyframes (poses will be refreshed below; gravity is set
+            //    now that gravity_aligned_ may have flipped to true)
             auto kf_init = std::make_shared<Keyframe>(initial_frame_);
             auto kf_cur = std::make_shared<Keyframe>(current_frame_);
             setKeyframeGravity(kf_init);
             setKeyframeGravity(kf_cur);
-            
-            // Set Pose for current (T_cw)
-            // Initializer returns T_c1_c2 which we defined as T_c2_c1 (Pose of 2 w.r.t 1)
-            // T_cw_cur = T_c2_c1 * T_cw_ref (where T_cw_ref is Identity)
-            current_frame_->setPose(initializer_->T_c1_c2_);
+
+            // Set Pose for current (T_cw):
+            // Initializer returns T_c1_c2 which we defined as T_c2_c1 (Pose of c2 w.r.t c1).
+            // With initial at T_align, T_c2_w_new = T_c2_c1 * T_c1_w_new = T_c2_c1 * T_align.
+            current_frame_->setPose(initializer_->T_c1_c2_ * T_align);
             kf_cur->T_cw_ = current_frame_->getPose();
+            kf_init->T_cw_ = initial_frame_->getPose();
             
             std::cout << "Tracking: Initialized Pose T_c2_c1: \n" << current_frame_->getPose().matrix() << std::endl;
             
@@ -486,7 +506,10 @@ bool Tracking::initialize() {
                     const double nrm = std::sqrt(static_cast<double>(pt3d.x) * pt3d.x + static_cast<double>(pt3d.y) * pt3d.y + static_cast<double>(pt3d.z) * pt3d.z);
                     norm_max = std::max(norm_max, nrm);
 
-                    Vec3 pos_w(pt3d.x, pt3d.y, pt3d.z); // Ref is World
+                    // Triangulated points come out of the initializer in c1-frame
+                    // coordinates. Transform into the (possibly gravity-aligned)
+                    // world frame: p_world = T_c1_w^{-1} * p_c1 = T_align^{-1} * p_c1.
+                    Vec3 pos_w = T_align.inverse() * Vec3(pt3d.x, pt3d.y, pt3d.z);
                     
                     auto lm = std::make_shared<Landmark>(i, pos_w); // ID? Use global ID counter later
                     
