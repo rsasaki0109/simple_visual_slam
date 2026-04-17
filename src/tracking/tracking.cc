@@ -31,6 +31,9 @@ constexpr std::size_t kMinTrackReferenceInliers = 15;
 constexpr std::size_t kMinPoseRecomputeCorrespondences = 10;
 constexpr std::size_t kMinPoseRecomputeInliers = 20;
 constexpr std::size_t kMaxDepthLandmarksPerKeyframe = 600;
+// Defer low-tracked-features emergency KF insertion for N frames after a
+// successful relocalization to avoid KF bursts during recovery.
+constexpr int kPostRelocEmergencyKfCooldownFrames = 3;
 
 struct PoseChange {
     double translation = std::numeric_limits<double>::infinity();
@@ -276,58 +279,18 @@ void Tracking::setReferenceKeyframe(Keyframe::Ptr kf) {
     reference_keyframe_ = kf;
 }
 
-void Tracking::setKeyframeDecisionTraceSink(std::shared_ptr<std::ostream> trace_sink) {
-    keyframe_decision_trace_sink_ = std::move(trace_sink);
-    keyframe_decision_trace_header_written_ = false;
-}
-
-void Tracking::traceKeyframeDecision(bool insert_keyframe,
-                                     const char* reason,
-                                     int ref_landmarks,
-                                     double tracked_ratio,
-                                     int frames_since_reference) {
-    if (!keyframe_decision_trace_sink_ || !current_frame_) {
-        return;
-    }
-
-    const bool mono_sparse_reference =
-        current_frame_->depth_image_.empty() && current_frame_->id_ >= 50 &&
-        current_frame_->id_ < 80 && ref_landmarks < 1300 && num_tracked_features_ < 900;
-    const double ratio_threshold_used = mono_sparse_reference ? 0.70 : 0.65;
-    const int mono_late_sparse_bootstrap =
-        current_frame_->depth_image_.empty() && current_frame_->id_ >= 180 &&
-        current_frame_->id_ < 250 && num_tracked_features_ <= 25 &&
-        current_frame_->keypoints_.size() >= 700
-            ? 1
-            : 0;
-
-    auto& os = *keyframe_decision_trace_sink_;
-    if (!keyframe_decision_trace_header_written_) {
-        os << "frame_id,reference_keyframe_id,frames_since_reference,tracked_features,ref_landmarks,"
-              "tracked_ratio,detected_keypoints,has_depth,tracking_state,insert_keyframe,reason,"
-              "mono_sparse_early_window,ratio_threshold,mono_late_sparse_bootstrap\n";
-        keyframe_decision_trace_header_written_ = true;
-    }
-
-    os << current_frame_->id_ << ','
-       << (reference_keyframe_ ? static_cast<long long>(reference_keyframe_->id_) : -1LL) << ','
-       << frames_since_reference << ','
-       << num_tracked_features_ << ','
-       << ref_landmarks << ','
-       << std::fixed << std::setprecision(6) << tracked_ratio << ','
-       << current_frame_->keypoints_.size() << ','
-       << (!current_frame_->depth_image_.empty() ? 1 : 0) << ','
-       << static_cast<int>(state_) << ','
-       << (insert_keyframe ? 1 : 0) << ','
-       << reason << ','
-       << (mono_sparse_reference ? 1 : 0) << ','
-       << std::setprecision(2) << ratio_threshold_used << ','
-       << mono_late_sparse_bootstrap << '\n';
-    os.flush();
-}
-
 bool Tracking::addFrame(Frame::Ptr frame) {
-    current_frame_ = frame;
+    // Only the main thread writes current_frame_ / last_frame_, but the
+    // LocalMapping on_ba_completed_ callback reads current_frame_ under
+    // pose_mutex_. Without the matching lock on this side, TSan flags the
+    // shared_ptr swap as a data race. Hold pose_mutex_ only across the
+    // swap itself so the rest of addFrame -- which is heavy and internally
+    // synchronizes via Frame / Keyframe mutexes -- does not block the
+    // LocalMapping thread.
+    {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        current_frame_ = frame;
+    }
 
     if (state_ == TrackingState::NO_IMAGES_YET) {
         state_ = TrackingState::NOT_INITIALIZED;
@@ -340,7 +303,10 @@ bool Tracking::addFrame(Frame::Ptr frame) {
         success = track();
     }
 
-    last_frame_ = current_frame_;
+    {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        last_frame_ = current_frame_;
+    }
     return success;
 }
 
@@ -483,18 +449,38 @@ bool Tracking::initialize() {
         // Second frame, try to initialize
         if (initializer_->initialize(current_frame_)) {
             std::cout << "Tracking: Initialization SUCCESS!" << std::endl;
-            
-            // 1. Create Keyframes
+
+            // Gravity alignment (mono init): rotate the world frame so gravity
+            // points in [0, 0, -1], matching the assumption in the BA gravity
+            // prior. Without this, GravityPriorError silently no-ops on mono
+            // because gravity_aligned_ stays false. The initializer operates in
+            // c1-frame coordinates and is independent of world, so we can apply
+            // the alignment here and then rewrite all poses and landmarks.
+            SE3 T_align;  // identity by default (no-op when no accel)
+            if (!gravity_aligned_ && !accel_buffer_.empty()) {
+                Vec3 gravity = AccelerometerProcessor::estimateGravity(accel_buffer_);
+                if (gravity.norm() > 0.5) {
+                    Mat33 R_align = AccelerometerProcessor::computeGravityAlignment(gravity);
+                    T_align = SE3(R_align, Vec3(0, 0, 0));
+                    gravity_aligned_ = true;
+                    std::cout << "Tracking: Applied gravity alignment (mono init)" << std::endl;
+                }
+            }
+            initial_frame_->setPose(T_align);
+
+            // 1. Create Keyframes (poses will be refreshed below; gravity is set
+            //    now that gravity_aligned_ may have flipped to true)
             auto kf_init = std::make_shared<Keyframe>(initial_frame_);
             auto kf_cur = std::make_shared<Keyframe>(current_frame_);
             setKeyframeGravity(kf_init);
             setKeyframeGravity(kf_cur);
-            
-            // Set Pose for current (T_cw)
-            // Initializer returns T_c1_c2 which we defined as T_c2_c1 (Pose of 2 w.r.t 1)
-            // T_cw_cur = T_c2_c1 * T_cw_ref (where T_cw_ref is Identity)
-            current_frame_->setPose(initializer_->T_c1_c2_);
+
+            // Set Pose for current (T_cw):
+            // Initializer returns T_c1_c2 which we defined as T_c2_c1 (Pose of c2 w.r.t c1).
+            // With initial at T_align, T_c2_w_new = T_c2_c1 * T_c1_w_new = T_c2_c1 * T_align.
+            current_frame_->setPose(initializer_->T_c1_c2_ * T_align);
             kf_cur->T_cw_ = current_frame_->getPose();
+            kf_init->T_cw_ = initial_frame_->getPose();
             
             std::cout << "Tracking: Initialized Pose T_c2_c1: \n" << current_frame_->getPose().matrix() << std::endl;
             
@@ -533,7 +519,10 @@ bool Tracking::initialize() {
                     const double nrm = std::sqrt(static_cast<double>(pt3d.x) * pt3d.x + static_cast<double>(pt3d.y) * pt3d.y + static_cast<double>(pt3d.z) * pt3d.z);
                     norm_max = std::max(norm_max, nrm);
 
-                    Vec3 pos_w(pt3d.x, pt3d.y, pt3d.z); // Ref is World
+                    // Triangulated points come out of the initializer in c1-frame
+                    // coordinates. Transform into the (possibly gravity-aligned)
+                    // world frame: p_world = T_c1_w^{-1} * p_c1 = T_align^{-1} * p_c1.
+                    Vec3 pos_w = T_align.inverse() * Vec3(pt3d.x, pt3d.y, pt3d.z);
                     
                     auto lm = std::make_shared<Landmark>(i, pos_w); // ID? Use global ID counter later
                     
@@ -710,6 +699,7 @@ bool Tracking::track() {
             loop_correction_state_.skip_velocity_update_once = false;
             recovery_state_.stabilization_frames_remaining =
                 recovery_stabilization_window_frames_;
+            frames_since_successful_relocalization_ = 0;
             recovery_state_.last_good_pose = current_frame_->getPose();
             reinitialization_state_.reference_frame.reset();
             reinitialization_state_.initializer.reset();
@@ -754,6 +744,9 @@ bool Tracking::track() {
     if (state_ == TrackingState::OK &&
         recovery_state_.stabilization_frames_remaining > 0) {
         --recovery_state_.stabilization_frames_remaining;
+    }
+    if (frames_since_successful_relocalization_ < std::numeric_limits<int>::max()) {
+        ++frames_since_successful_relocalization_;
     }
 
     // 5. Check if we need a new Keyframe (only if tracking is OK)
@@ -823,18 +816,6 @@ bool Tracking::track() {
         loop_correction_state_.force_keyframe_insertion_once = false;
     }
 
-    // High-error band on freiburg1_room mono (see scripts/segment_ate_tum.py): ~[100,125).
-    if (current_frame_->depth_image_.empty() &&
-        current_frame_->id_ >= 100 && current_frame_->id_ < 126) {
-        const int ref_id = reference_keyframe_ ? static_cast<int>(reference_keyframe_->id_) : -1;
-        std::cout << "RoomFocusTrace frame=" << current_frame_->id_
-                  << " state=" << static_cast<int>(state_)
-                  << " tracked=" << num_tracked_features_
-                  << " ref_kf=" << ref_id
-                  << " stabil_left=" << recovery_state_.stabilization_frames_remaining
-                  << std::endl;
-    }
-
     return state_ == TrackingState::OK;
 }
 
@@ -857,13 +838,11 @@ bool Tracking::needNewKeyframe() {
 
     if (loop_correction_state_.force_keyframe_insertion_once) {
         std::cout << "needNewKeyframe: Forced insertion after pending loop correction expiry." << std::endl;
-        traceKeyframeDecision(true, "forced_after_loop_deferral", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
     if (loop_correction_state_.pending) {
         std::cout << "needNewKeyframe: Deferring insertion until pending loop correction is resolved." << std::endl;
-        traceKeyframeDecision(false, "pending_loop_correction", ref_landmarks, tracked_ratio, frames_since_reference);
         return false;
     }
 
@@ -873,15 +852,20 @@ bool Tracking::needNewKeyframe() {
     const int min_frames_since_last_kf =
         current_frame_->depth_image_.empty() ? 4 : 3;
     if (frames_since_reference < min_frames_since_last_kf) {
-        traceKeyframeDecision(false, "min_frames_since_reference", ref_landmarks, tracked_ratio, frames_since_reference);
         return false;
     }
 
     // 2. Track quality: if tracked features drop below threshold, insert KF
     const int min_tracked_threshold = 60;
     if (num_tracked_features_ < min_tracked_threshold) {
+        if (frames_since_successful_relocalization_ <= kPostRelocEmergencyKfCooldownFrames) {
+            std::cout << "needNewKeyframe: Low tracked features (" << num_tracked_features_
+                      << ") within post-reloc cooldown ("
+                      << frames_since_successful_relocalization_ << "/"
+                      << kPostRelocEmergencyKfCooldownFrames << "), deferring." << std::endl;
+            return false;
+        }
         std::cout << "needNewKeyframe: Low tracked features (" << num_tracked_features_ << "), inserting KF." << std::endl;
-        traceKeyframeDecision(true, "low_tracked_features", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
@@ -889,7 +873,6 @@ bool Tracking::needNewKeyframe() {
     const int max_frames_since_last_kf = 12;
     if (frames_since_reference >= max_frames_since_last_kf) {
         std::cout << "needNewKeyframe: Max frames reached, inserting KF." << std::endl;
-        traceKeyframeDecision(true, "max_frames_since_reference", ref_landmarks, tracked_ratio, frames_since_reference);
         return true;
     }
 
@@ -904,19 +887,11 @@ bool Tracking::needNewKeyframe() {
         const double tracked_ratio_threshold = mono_sparse_reference ? 0.70 : 0.65;
         if (tracked_ratio < tracked_ratio_threshold) {
             std::cout << "needNewKeyframe: Low tracking ratio (" << tracked_ratio << "), inserting KF." << std::endl;
-            traceKeyframeDecision(true,
-                                  mono_sparse_reference ? "low_tracking_ratio_sparse_mono"
-                                                        : "low_tracking_ratio",
-                                  ref_landmarks,
-                                  tracked_ratio,
-                                  frames_since_reference);
             return true;
         }
-        traceKeyframeDecision(false, "ratio_ok", ref_landmarks, tracked_ratio, frames_since_reference);
         return false;
     }
 
-    traceKeyframeDecision(false, "no_reference_landmarks", ref_landmarks, -1.0, frames_since_reference);
     return false;
 }
 
@@ -954,11 +929,6 @@ bool Tracking::trackLocalMap() {
 
     struct LocalMapSourceStats {
         std::array<std::size_t, kNumLocalMapSourceBuckets> pool_added{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_nonfinite{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_depth{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> rejected_oob{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> visible{};
-        std::array<std::size_t, kNumLocalMapSourceBuckets> matched{};
     };
 
     std::vector<Landmark::Ptr> landmarks;
@@ -969,7 +939,16 @@ bool Tracking::trackLocalMap() {
     auto add_landmarks_from_kf = [&](const Keyframe::Ptr& kf,
                                      LocalMapSourceBucket source_bucket) {
         if (!kf) return;
-        for (const auto& lm : kf->landmarks_) {
+        // Snapshot under kf->mutex_ so we don't race with LocalMapping
+        // writing kf->landmarks_[i] = lm in createNewMapPoints. TSan flagged
+        // shared_ptr<Landmark>::operator bool() reads here tearing against
+        // the concurrent shared_ptr assignment on the mapping thread.
+        std::vector<Landmark::Ptr> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(kf->mutex_);
+            snapshot = kf->landmarks_;
+        }
+        for (const auto& lm : snapshot) {
             if (!lm || lm->isBad()) continue;
             if (!landmark_ids.insert(lm->id_).second) continue;
             landmarks.push_back(lm);
@@ -1044,15 +1023,6 @@ bool Tracking::trackLocalMap() {
     std::cout << std::endl;
 
     struct PoseFilterStats {
-        std::size_t total = 0;
-        std::size_t kept = 0;
-        std::size_t reject_nonfinite = 0;
-        std::size_t reject_depth = 0;
-        std::size_t reject_reprojection = 0;
-        std::size_t focus_total = 0;
-        std::size_t focus_kept = 0;
-        std::size_t focus_reject_nonfinite = 0;
-        std::size_t focus_reject_depth = 0;
         std::size_t focus_reject_reprojection = 0;
     };
 
@@ -1075,26 +1045,14 @@ bool Tracking::trackLocalMap() {
         const SE3 T_cw_est = current_frame_->getPose();
         for (size_t i = 0; i < object_points.size(); ++i) {
             const bool in_focus = i >= focus_begin;
-            ++stats.total;
-            if (in_focus) {
-                ++stats.focus_total;
-            }
 
             const auto& Pw = object_points[i];
             Vec3 p_w(Pw.x, Pw.y, Pw.z);
             Vec3 p_c = T_cw_est * p_w;
             if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) {
-                ++stats.reject_nonfinite;
-                if (in_focus) {
-                    ++stats.focus_reject_nonfinite;
-                }
                 continue;
             }
             if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) {
-                ++stats.reject_depth;
-                if (in_focus) {
-                    ++stats.focus_reject_depth;
-                }
                 continue;
             }
 
@@ -1109,7 +1067,6 @@ bool Tracking::trackLocalMap() {
             const double dx = uv.x - proj[0];
             const double dy = uv.y - proj[1];
             if ((dx * dx + dy * dy) > gate_px * gate_px) {
-                ++stats.reject_reprojection;
                 if (in_focus) {
                     ++stats.focus_reject_reprojection;
                 }
@@ -1120,10 +1077,6 @@ bool Tracking::trackLocalMap() {
             filtered_image_points.push_back(uv);
             filtered_landmarks.push_back(matched_landmarks[i]);
             filtered_kp_indices.push_back(kp_idx);
-            ++stats.kept;
-            if (in_focus) {
-                ++stats.focus_kept;
-            }
         }
 
         object_points.swap(filtered_object_points);
@@ -1151,7 +1104,6 @@ bool Tracking::trackLocalMap() {
         Vec3 pos_w = lm->getPos();
         if (!std::isfinite(pos_w[0]) || !std::isfinite(pos_w[1]) || !std::isfinite(pos_w[2])) {
             skipped_nonfinite++;
-            ++local_map_source_stats.rejected_nonfinite[source_idx];
             continue;
         }
         Vec3 pos_c = current_frame_->getPose() * pos_w; // T_cw * pos_w
@@ -1160,22 +1112,19 @@ bool Tracking::trackLocalMap() {
         const double max_depth = 20.0;  // Reasonable for indoor scenes
         if (pos_c[2] <= 0.1 || pos_c[2] > max_depth) {
             skipped_behind_or_close++;
-            ++local_map_source_stats.rejected_depth[source_idx];
             continue; // Behind camera, too close, or too far
         }
-        
+
         Vec2 px = current_frame_->camera_->project(pos_c);
-        
+
         // Check bounds
         if (px[0] < 0 || px[0] >= current_frame_->image_.cols ||
             px[1] < 0 || px[1] >= current_frame_->image_.rows) {
             skipped_oob++;
-            ++local_map_source_stats.rejected_oob[source_idx];
             continue;
         }
-            
+
         visible_points++;
-        ++local_map_source_stats.visible[source_idx];
 
         // Cache visible landmarks for fallback matching
         visible_lm_descs.push_back(lm->descriptor_);
@@ -1216,7 +1165,6 @@ bool Tracking::trackLocalMap() {
             keypoint_already_matched[best_idx] = true;
             
             matches_found++;
-            ++local_map_source_stats.matched[source_idx];
         }
     }
     
@@ -1226,19 +1174,6 @@ bool Tracking::trackLocalMap() {
               << " behind/close=" << skipped_behind_or_close
               << " oob=" << skipped_oob
               << ")" << std::endl;
-    std::cout << "TrackLocalMap: LocalMapVisibility";
-    for (std::size_t bucket_idx = 0; bucket_idx < kNumLocalMapSourceBuckets; ++bucket_idx) {
-        const auto bucket = static_cast<LocalMapSourceBucket>(bucket_idx);
-        std::cout << ' ' << source_bucket_name(bucket)
-                  << "{nf=" << local_map_source_stats.rejected_nonfinite[bucket_idx]
-                  << ",depth=" << local_map_source_stats.rejected_depth[bucket_idx]
-                  << ",oob=" << local_map_source_stats.rejected_oob[bucket_idx]
-                  << ",vis=" << local_map_source_stats.visible[bucket_idx]
-                  << ",match=" << local_map_source_stats.matched[bucket_idx]
-                  << '}';
-    }
-    std::cout << std::endl;
-
     filter_correspondences_by_pose(35.0);
     if (!object_points.empty()) {
         std::cout << "TrackLocalMap: Pose-gated matches: " << object_points.size() << std::endl;
@@ -1258,10 +1193,7 @@ bool Tracking::trackLocalMap() {
         bool fallback_from_all_landmarks = false;
         const std::size_t bootstrap_preexisting_matches = object_points.size();
         std::vector<LocalMapSourceBucket> fallback_lm_buckets;
-        const std::size_t visible_pool_before_fallback = fallback_lm_list.size();
-        // Mono: default 80 would expand to the full local map when visible count is 75–79 (see logs:
-        // `from_all=1`, pool=680). Tracked feature count is often >25 there, so late_sparse_mono
-        // alone cannot gate this; lower the floor for all mono runs.
+        // Mono uses a floor of 75; RGB-D (which can rebuild correspondences from depth) uses 80.
         const bool mono_no_depth = current_frame_->depth_image_.empty();
         const std::size_t fallback_visible_pool_floor = mono_no_depth ? 75U : 80U;
         if (fallback_lm_list.size() < fallback_visible_pool_floor &&
@@ -1293,11 +1225,6 @@ bool Tracking::trackLocalMap() {
             std::vector<std::vector<cv::DMatch>> knn;
             bf.knnMatch(fallback_lm_descs, current_frame_->descriptors_, knn, 2);
 
-            std::size_t fallback_two_nn = 0;
-            std::size_t fallback_reject_distance = 0;
-            std::size_t fallback_reject_ratio = 0;
-            std::size_t fallback_reject_index = 0;
-            std::size_t fallback_reject_used = 0;
             std::vector<bool> kp_used = keypoint_already_matched;
             std::vector<bool> lm_used(fallback_lm_list.size(), false);
 
@@ -1305,37 +1232,30 @@ bool Tracking::trackLocalMap() {
                 int lm_idx;
                 int kp_idx;
                 float dist;
-                float ratio_margin;
                 int octave;
                 LocalMapSourceBucket source_bucket;
                 bool coarse_ok = false;
-                double coarse_err_px = std::numeric_limits<double>::quiet_NaN();
             };
             std::vector<MatchCandidate> candidates;
 
             for (const auto& ms : knn) {
                 if (ms.size() < 2) continue;
-                ++fallback_two_nn;
                 const auto& m1 = ms[0];
                 const auto& m2 = ms[1];
 
-                // Stricter Lowe ratio test (0.6) + tighter absolute distance gate (50)
+                // Distance/ratio gates: matches that pass both feed the candidate list.
                 if (m1.distance > 65.0f) {
-                    ++fallback_reject_distance;
                     continue;
                 }
                 if (m1.distance >= 0.75f * m2.distance) {
-                    ++fallback_reject_ratio;
                     continue;
                 }
 
                 if (m1.queryIdx < 0 || m1.queryIdx >= static_cast<int>(fallback_lm_list.size()) ||
                     m1.trainIdx < 0 || m1.trainIdx >= static_cast<int>(current_frame_->keypoints_.size())) {
-                    ++fallback_reject_index;
                     continue;
                 }
                 if (lm_used[m1.queryIdx] || kp_used[m1.trainIdx]) {
-                    ++fallback_reject_used;
                     continue;
                 }
 
@@ -1344,20 +1264,16 @@ bool Tracking::trackLocalMap() {
                     (kp_idx >= 0 && kp_idx < static_cast<int>(current_frame_->keypoints_.size()))
                         ? current_frame_->keypoints_[kp_idx].octave
                         : 0;
-                const float ratio_margin = 0.75f * m2.distance - m1.distance;
                 LocalMapSourceBucket sb = LocalMapSourceBucket::GlobalFallback;
                 if (m1.queryIdx >= 0 &&
                     m1.queryIdx < static_cast<int>(fallback_lm_buckets.size())) {
                     sb = fallback_lm_buckets[static_cast<std::size_t>(m1.queryIdx)];
                 }
-                candidates.push_back(
-                    {m1.queryIdx, kp_idx, m1.distance, ratio_margin, octave, sb, false,
-                     std::numeric_limits<double>::quiet_NaN()});
+                candidates.push_back({m1.queryIdx, kp_idx, m1.distance, octave, sb, false});
             }
 
             const SE3 T_cw_boot = current_frame_->getPose();
-            auto bootstrap_coarse_ok_and_err = [&](int lm_idx, int kp_idx, double& err_px) -> bool {
-                err_px = std::numeric_limits<double>::quiet_NaN();
+            auto bootstrap_coarse_ok = [&](int lm_idx, int kp_idx) -> bool {
                 if (lm_idx < 0 || lm_idx >= static_cast<int>(fallback_lm_pts.size()) || kp_idx < 0 ||
                     kp_idx >= static_cast<int>(current_frame_->keypoints_.size())) {
                     return false;
@@ -1371,22 +1287,20 @@ bool Tracking::trackLocalMap() {
                 if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) {
                     return false;
                 }
-                const int oct =
-                    (kp_idx >= 0 && kp_idx < static_cast<int>(current_frame_->keypoints_.size()))
-                        ? current_frame_->keypoints_[kp_idx].octave
-                        : 0;
+                const int oct = current_frame_->keypoints_[kp_idx].octave;
                 const double gate_px =
                     55.0 * (1.0 + 0.12 * static_cast<double>(std::max(0, oct)));
                 Vec2 proj = current_frame_->camera_->project(p_c);
                 const auto& uv = current_frame_->keypoints_[kp_idx].pt;
                 const double dx = uv.x - proj[0];
                 const double dy = uv.y - proj[1];
-                err_px = std::sqrt(dx * dx + dy * dy);
                 return (dx * dx + dy * dy) <= gate_px * gate_px;
             };
 
-            // Only break ties on equal descriptor distance: prefer reference KF landmarks over
-            // pure covisibility neighbors (ordering bucket before dist regressed room_mono ATE).
+            // For late sparse mono recovery, prefer candidates that are already most
+            // geometrically consistent with the current pose estimate, then fall back to
+            // descriptor strength. Bucket source remains a deterministic tie-break only:
+            // ordering bucket before descriptor distance regressed room_mono ATE.
             auto fallback_bucket_rank = [](LocalMapSourceBucket b) -> int {
                 switch (b) {
                     case LocalMapSourceBucket::Reference:
@@ -1409,7 +1323,7 @@ bool Tracking::trackLocalMap() {
             if (late_sparse_mono_bootstrap) {
                 for (auto& c : candidates) {
                     c.coarse_ok =
-                        bootstrap_coarse_ok_and_err(c.lm_idx, c.kp_idx, c.coarse_err_px);
+                        bootstrap_coarse_ok(c.lm_idx, c.kp_idx);
                 }
                 std::sort(candidates.begin(), candidates.end(),
                           [&](const MatchCandidate& a, const MatchCandidate& b) {
@@ -1442,28 +1356,6 @@ bool Tracking::trackLocalMap() {
                 });
             }
 
-            constexpr int kFallbackCandidateTraceTop = 20;
-            if (late_sparse_mono_bootstrap && !candidates.empty()) {
-                std::cout << "TrackLocalMap: FallbackCandidateTrace frame=" << current_frame_->id_
-                          << " order=coarse_dist_bucket_tie from_all="
-                          << (fallback_from_all_landmarks ? 1 : 0) << " top="
-                          << std::min(kFallbackCandidateTraceTop,
-                                      static_cast<int>(candidates.size()))
-                          << std::endl;
-                for (int ti = 0; ti < std::min(kFallbackCandidateTraceTop,
-                                               static_cast<int>(candidates.size()));
-                     ++ti) {
-                    const auto& c = candidates[static_cast<std::size_t>(ti)];
-                    std::cout << "  i=" << ti << " lm=" << c.lm_idx << " kp=" << c.kp_idx
-                              << " dist=" << c.dist << " ratio_m=" << c.ratio_margin
-                              << " oct=" << c.octave
-                              << " bucket=" << source_bucket_name(c.source_bucket)
-                              << " reproj_px="
-                              << (std::isfinite(c.coarse_err_px) ? c.coarse_err_px : -1.0)
-                              << " coarse_pass=" << (c.coarse_ok ? 1 : 0) << std::endl;
-                }
-            }
-
             for (size_t i = 0; i < candidates.size() && i < kMaxBootstrapMatches; ++i) {
                 const auto& c = candidates[i];
                 if (lm_used[c.lm_idx] || kp_used[c.kp_idx]) continue;
@@ -1474,11 +1366,6 @@ bool Tracking::trackLocalMap() {
                 lm_used[c.lm_idx] = true;
                 kp_used[c.kp_idx] = true;
             }
-            const std::size_t bootstrap_added_pre_pose =
-                object_points.size() > bootstrap_preexisting_matches
-                    ? object_points.size() - bootstrap_preexisting_matches
-                    : 0;
-
             if (fallback_from_all_landmarks) {
                 std::cout << "TrackLocalMap: Descriptor bootstrap using all "
                           << fallback_lm_list.size() << " landmarks" << std::endl;
@@ -1493,7 +1380,6 @@ bool Tracking::trackLocalMap() {
 
             PoseFilterStats pose_filter_stats =
                 filter_correspondences_by_pose(fallback_gate_px, bootstrap_preexisting_matches);
-            bool retried_relaxed_pose_filter = false;
             if (late_sparse_mono_bootstrap &&
                 object_points.size() < kMinBootstrapCorrespondences &&
                 pose_filter_stats.focus_reject_reprojection > 0) {
@@ -1503,43 +1389,9 @@ bool Tracking::trackLocalMap() {
                 matched_kp_indices = matched_kp_indices_before_pose_filter;
                 pose_filter_stats =
                     filter_correspondences_by_pose(relaxed_fallback_gate_px, bootstrap_preexisting_matches);
-                retried_relaxed_pose_filter = true;
             }
-            const std::size_t bootstrap_added_post_pose =
-                object_points.size() > bootstrap_preexisting_matches
-                    ? object_points.size() - bootstrap_preexisting_matches
-                    : 0;
 
             used_global_fallback = true;
-            std::cout << "TrackLocalMap: BootstrapStats"
-                      << " visible_pool=" << visible_pool_before_fallback
-                      << " visible_floor=" << fallback_visible_pool_floor
-                      << " pool=" << fallback_lm_list.size()
-                      << " knn=" << knn.size()
-                      << " two_nn=" << fallback_two_nn
-                      << " candidates=" << candidates.size()
-                      << " added_pre_pose=" << bootstrap_added_pre_pose
-                      << " added_post_pose=" << bootstrap_added_post_pose
-                      << " reject_dist=" << fallback_reject_distance
-                      << " reject_ratio=" << fallback_reject_ratio
-                      << " reject_index=" << fallback_reject_index
-                      << " reject_used=" << fallback_reject_used
-                      << " pose_total=" << pose_filter_stats.total
-                      << " pose_kept=" << pose_filter_stats.kept
-                      << " pose_reject_nonfinite=" << pose_filter_stats.reject_nonfinite
-                      << " pose_reject_depth=" << pose_filter_stats.reject_depth
-                      << " pose_reject_reproj=" << pose_filter_stats.reject_reprojection
-                      << " pose_added_total=" << pose_filter_stats.focus_total
-                      << " pose_added_kept=" << pose_filter_stats.focus_kept
-                      << " pose_added_reject_nonfinite=" << pose_filter_stats.focus_reject_nonfinite
-                      << " pose_added_reject_depth=" << pose_filter_stats.focus_reject_depth
-                      << " pose_added_reject_reproj=" << pose_filter_stats.focus_reject_reprojection
-                      << " pose_gate_px=" << (retried_relaxed_pose_filter
-                          ? relaxed_fallback_gate_px
-                          : fallback_gate_px)
-                      << " pose_relaxed_retry=" << (retried_relaxed_pose_filter ? 1 : 0)
-                      << " from_all=" << (fallback_from_all_landmarks ? 1 : 0)
-                      << std::endl;
             std::cout << "TrackLocalMap: Fallback global matches: " << object_points.size() << std::endl;
         }
     }
@@ -2666,6 +2518,7 @@ bool Tracking::reinitialize() {
     // Reset re-init state
     reinitialization_state_.reference_frame.reset();
     reinitialization_state_.initializer.reset();
+    frames_since_successful_relocalization_ = std::numeric_limits<int>::max();
 
     std::cout << "Tracking: Re-init complete! " << inserted << " landmarks, "
               << map_->getAllKeyframes().size() << " total KFs" << std::endl;

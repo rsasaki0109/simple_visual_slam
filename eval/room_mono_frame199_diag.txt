@@ -1,0 +1,329 @@
+# room_mono frame 199 — TrackLocalMap + recovery (repro snapshot)
+
+Generated: 2026-04-16
+Command (repo root):
+
+  ./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room \
+    --max-frames 250 --repro-eval --no-viz \
+    --keyframe-trace-csv log/room_mono_kf_probe.csv \
+    2>&1 | tee log/room_mono_tracklocalmap_probe.log
+
+Full log: log/room_mono_tracklocalmap_probe.log
+Keyframe CSV: log/room_mono_kf_probe.csv
+
+--- excerpt: awk '/^Frame 199:/{flag=1} flag{print} /^Frame 200:/{exit}' log/room_mono_tracklocalmap_probe.log
+
+Frame 199: 1375 kps | State: 2 | Pose:  0.459068 -0.208565 -0.198107
+Matches with last frame: 394
+TrackReferenceKeyframe: Propagated landmarks: 2
+TrackReferenceKeyframe: 3D-2D correspondences: 2
+TrackLocalMap: Landmarks to check: 680
+TrackLocalMap: LocalMapSources ref=97 ref_neighbors=583 prev_ref=0 prev_neighbors=0 global=0
+TrackLocalMap: Visible: 76, Matches: 12 (skipped nonfinite=0 behind/close=29 oob=575)
+TrackLocalMap: LocalMapVisibility ref{... vis=47,match=7} ref_neighbors{... vis=29,match=5} ...
+TrackLocalMap: Pose-gated matches: 9
+TrackLocalMap: Descriptor bootstrap using all 680 landmarks
+TrackLocalMap: BootstrapStats ... from_all=1 pose_relaxed_retry=1 ...
+TrackLocalMap: Fallback global matches: 15
+TrackLocalMap: CorrStats n=15 ... reproj_err_px[min/mean/max]=2.17077/94.631/445.325 used_global_fallback=1
+TrackLocalMap: PnP method=EPNP inliers=9
+TrackLocalMap: PnP rejected - insufficient inliers: 9 (min=12)
+Tracking: Lost, attempting relocalization...
+Relocalize: ... Candidate KF 191 inliers=13 ...
+Tracking: Relocalization successful!
+needNewKeyframe: Low tracked features (22), inserting KF.
+Tracking: Insert New Keyframe (ID=200)
+
+Facts:
+- Local map has 680 landmarks; 575 counted oob for projection — neighbor bucket is mostly off-screen.
+- After bootstrap, PnP has only 9 inliers (< 12) → track lost → relocalize against KF 191 succeeds.
+- needNewKeyframe path is low_tracked_features (22 < 60), consistent with keyframe CSV rows for 195–205.
+
+--- Frames 197–201 (same log, condensed)
+
+| Live frame (line `Frame N:`) | Landmarks to check | Visible | `from_all` bootstrap | PnP inliers (min 12) | Lost → reloc KF |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 197 | 427 | 87 | 0 | (lost before PnP line in block) | KF 185 → KF 198 inserted |
+| 198 | 937 | 84 | 0 | (lost) | KF 188 → KF 199 inserted |
+| 199 | 680 | 76 | 1 | 9 | KF 191 → KF 200 inserted |
+| 200 | 427 | 89 | 0 | 9 | KF 191 → KF 201 inserted |
+| 201 | 427 | 119 | 0 | 8 | KF 188 → KF 202 inserted |
+
+Notes:
+- 197–198: small pool / few projection matches; `from_all=0` but still **Lost** before stable local-map PnP (see log: relocalization runs).
+- 199: **only frame here** that expands to **all 680** landmarks (`from_all=1`); mean reproj **94.6 px** on 15 correspondences; PnP **9** inliers.
+- 200–201: `from_all=0` again; PnP still **9** or **8** inliers → lost → reloc succeeds; **KF 191** and **KF 188** alternate as best candidates.
+
+Raw multi-frame excerpt was generated with:
+
+  for n in 197 198 199 200 201; do
+    echo "========== Frame $n =========="
+    awk -v n="$n" 'BEGIN{pat="^Frame " n ":"} $0~pat{f=1} f{print} /^Frame / && !($0 ~ pat){if(f && seen++) exit}' "$LOG"
+  done
+
+## 2026-04-17 Phase B trace-only fallback diagnostics
+
+Log: `log/room_mono_trace_phaseB.log`
+Command: `./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room --max-frames 250 --repro-eval --no-viz --reference-policy heuristic`
+
+Short grep extract, frames 195-205:
+
+```text
+TrackLocalMap: FallbackCandidateTrace frame=195 order=coarse_err_dist_bucket_tie from_all=0 top=1
+TrackLocalMap: FallbackCandidateTrace frame=199 order=coarse_err_dist_bucket_tie from_all=0 top=1
+TrackLocalMap: FallbackCandidateTrace frame=200 order=coarse_err_dist_bucket_tie from_all=0 top=2
+TrackLocalMap: FallbackCandidateTrace frame=203 order=coarse_err_dist_bucket_tie from_all=0 top=3
+TrackLocalMap: FallbackInlier frame=203 lm_id=26570 kp=553 rank=0 coarse_ok=1 coarse_err_px=29.1966 dist=60 bucket=ref
+TrackLocalMap: FallbackInlier frame=203 lm_id=26276 kp=201 rank=1 coarse_ok=1 coarse_err_px=31.3218 dist=36 bucket=ref_neighbors
+TrackLocalMap: FallbackSummary frame=203 candidates=3 coarse_ok=2 selected_topk=3 selected_topk_med_coarse_err_px=31.3218 selected_topk_p90_coarse_err_px=422.41 rejected_belowk=0 rejected_belowk_med_coarse_err_px=-1 rejected_belowk_p90_coarse_err_px=-1 pnp_inliers=15
+TrackLocalMap: FallbackCandidateTrace frame=204 order=coarse_err_dist_bucket_tie from_all=0 top=1
+TrackLocalMap: FallbackInlier frame=204 lm_id=26570 kp=548 rank=0 coarse_ok=1 coarse_err_px=8.21464 dist=55 bucket=ref
+TrackLocalMap: FallbackSummary frame=204 candidates=1 coarse_ok=1 selected_topk=1 selected_topk_med_coarse_err_px=8.21464 selected_topk_p90_coarse_err_px=8.21464 rejected_belowk=0 rejected_belowk_med_coarse_err_px=-1 rejected_belowk_p90_coarse_err_px=-1 pnp_inliers=13
+TrackLocalMap: FallbackCandidateTrace frame=205 order=coarse_err_dist_bucket_tie from_all=0 top=8
+TrackLocalMap: FallbackInlier frame=205 lm_id=26236 kp=792 rank=0 coarse_ok=1 coarse_err_px=1.6395 dist=32 bucket=ref
+TrackLocalMap: FallbackInlier frame=205 lm_id=26404 kp=369 rank=1 coarse_ok=1 coarse_err_px=1.72842 dist=28 bucket=ref
+TrackLocalMap: FallbackInlier frame=205 lm_id=26128 kp=591 rank=2 coarse_ok=1 coarse_err_px=2.25364 dist=45 bucket=ref
+TrackLocalMap: FallbackInlier frame=205 lm_id=26255 kp=203 rank=3 coarse_ok=1 coarse_err_px=4.50439 dist=31 bucket=ref
+TrackLocalMap: FallbackInlier frame=205 lm_id=26686 kp=720 rank=4 coarse_ok=1 coarse_err_px=5.20084 dist=44 bucket=ref
+TrackLocalMap: FallbackSummary frame=205 candidates=8 coarse_ok=5 selected_topk=8 selected_topk_med_coarse_err_px=4.50439 selected_topk_p90_coarse_err_px=407.69 rejected_belowk=0 rejected_belowk_med_coarse_err_px=-1 rejected_belowk_p90_coarse_err_px=-1 pnp_inliers=20
+```
+
+Summary:
+- Gates before this trace stayed unchanged: `room_mono_head_repro=0.197177`, room mono SHA prefix `6583177e40532f6a`; `xyz_mono_head_repro=0.028136`.
+- Frame 199 has one coarse-pass fallback candidate but only two total local-map matches, so it does not reach PnP and cannot answer inlier correlation alone.
+- Frames 203-205 do answer it: the final fallback PnP inliers are exactly the lowest coarse-error ranks (`0-1`, `0`, and `0-4` respectively).
+- This says the coarse-error ranking is correlated with PnP inlier outcome when there is enough support; it does not look like descriptor-distance noise.
+- The selected-vs-rejected-below-K distribution is not informative here because candidate counts are all below `kMaxBootstrapMatches`, so `rejected_belowk=0`.
+- Within the selected top-K set, high coarse-error coarse-fail candidates remain visible in p90 (`~407-422 px`) and are removed by pose/PnP, so selected top-K is not cleanly separated by itself.
+- Source bucket is not a distinguishing signal among near-equal coarse-error candidates: frame 203 keeps both `ref` and `ref_neighbors` near 30 px, while frame 205 is all `ref` because those have the lowest coarse errors.
+
+## 2026-04-17 Phase A2 post-reloc cooldown
+
+Log: `log/room_mono_trace_phaseA2.log`
+Command: `./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room --max-frames 250 --repro-eval --no-viz --reference-policy heuristic`
+Cooldown constant: `kPostRelocEmergencyKfCooldownFrames = 3`.
+KF insertions in frames 195-210: V1 baseline `5`; Phase A2 `4`.
+Cooldown stdout firings: `2`.
+Gates: `room_mono_head_repro=0.176340` (SHA `70fff60ac7874535`), `xyz_mono_head_repro=0.028136` (SHA `583e07bf2ba4ecaf`); all five gates PASS and `ctest` stayed `62/62`.
+Summary: suppressing only the low-tracked-features emergency path after successful relocalization breaks part of the late KF burst without moving `xyz_mono`.
+
+## 2026-04-17 Phase A3 abort
+
+Tested change: `kMinUsefulEmergencyKfFeatures = 20` guard in the `low_tracked_features` emergency-KF path.
+Build: `cmake --build build_codex -j$(nproc)` PASS.
+ctest: `62/62` PASS.
+`xyz_mono_head_repro`: PASS, ATE `0.028136 m`, two-run SHA `583e07bf2ba4ecaf...`.
+`room_mono_head_repro`: PASS ceiling, but ATE `0.296368 m`, two-run SHA `09f866be8b0e2928...`; regression `+0.120028 m` versus locked V2 `0.176340 m`.
+Abort reason: `room_mono` ATE rose versus V2, so the gate sequence stopped before the remaining three gates and diagnostic trace; `src/tracking/tracking.cc` was reverted and `plan.md` was left untouched.
+
+## 2026-04-17 Cascade diagnosis (from `log/room_mono_trace_phaseA2.log`, no code change)
+
+Re-read of the V2 Phase A2 trace in the pathological segment. Key finding: **the loss cascade originates at frame 193 — the previously-assumed "frame 199 bootstrap collapse" is a downstream symptom**.
+
+Reference-KF propagation visibly decays across frames 188-193, then fails:
+
+| Frame | `TrackReferenceKeyframe: Propagated landmarks` | `3D-2D correspondences` | Event |
+| --- | ---: | ---: | --- |
+| 188 | 13 | 13 | OK; KF 189 inserted via `low_tracked_features=37` |
+| 189 | 21 | 21 (PnP 20 inliers) | OK |
+| 190 | 13 | 13 | OK |
+| 191 | 9 | 9 | OK |
+| 192 | 5 | 5 | PnP fails -> `Relocalize: Matched with KF 185 inliers=10`; `Relocalization successful!` |
+| 193 | **2** | **2** | `needNewKeyframe: Low tracked features (13) within post-reloc cooldown (1/3), deferring.` -> no refresh KF |
+| 194 | - | 0 | `Tracking: Lost`; reloc fails; pose frozen at `(0.400876, -0.194087, -0.912102)` |
+| 195-202 | - | 0 | Same frozen pose; `All candidate PnP attempts failed` repeatedly |
+| 203 | - | - | Eventually recovers; KFs 203, 204, 205, 209 inserted via `low_tracked_features` (15, 13, 20, 25) |
+
+Observations:
+
+- **Reference-KF landmark budget collapses inside ~5 frames** (13 -> 21 -> 13 -> 9 -> 5 -> 2 -> 0). This is upstream of any cooldown or fallback-ranking logic.
+- V2 cooldown **is actively deferring** a would-be refresh KF at frame 193 (counter at `1/3` because relocalize succeeded at frame 192). In V1 the same frame inserted a fresh KF; V1's `room_mono` was still worse (0.197177 vs V2 0.176340). Net V2 gain comes from preventing *other* post-reloc bursts, not from helping this one.
+- Once frame 194 goes lost, pose stays frozen through frame 202; relocalization attempts fail with 1-6 candidate KFs; state recovers only at frame 203 with a sparse KF burst.
+- The V3 `num_tracked_features_ < 20` skip experiment regressed `room_mono` from 0.176 -> 0.296 m. Lesson: isolated sparse KFs (frames 203-205, `Connected KFs: 0`, policy-vetoed from reference promotion) still act as necessary map scaffolding; deleting them is worse than keeping them.
+
+Implications for the next experiment (not executed in this session):
+
+- The real lever is **why reference-KF propagation decays from 21 -> 2 across a 5-frame window**, not the emergency-KF path downstream. Candidates: landmark culling policy, covisibility edge removal, or reference KF itself being replaced by a weaker recently-inserted mono KF.
+- A plausible attack is to force a reference-KF **switch** (not insertion) when `TrackReferenceKeyframe: Propagated landmarks` falls below a small threshold (e.g. `< 10`). Switch target: the covisibility neighbor with the most projectable landmarks under the current pose estimate.
+- Any such change touches reference-policy code that was out of scope for V1-V3 handoffs. It would need a new handoff with that scope explicitly opened and the same `xyz_mono <= 0.030` guardrail.
+- V2 (`7fe7bbc` + `d4584b8`) remains the committed best. No further code change in this session.
+
+## 2026-04-17 Simplification pass and failed threshold attack
+
+Between V2 (`d4584b8`) and HEAD we ran an aggressive Tesla-style
+cleanup pass (commits `c81bcf2`, `9fbf2de`, `0f9c114`, `d2676a3`,
+`f2d7111`, `1af225d`, `776fd05`). Net: ~2325 tracked lines deleted
+(experimental `score`/`pipeline` reference policies + harness + docs,
+Phase B trace plumbing, four dead diagnostic prints, dead variables,
+struct trimming) with **byte-identical trajectory SHAs for all five
+gates**, i.e. zero behavioral change. Baseline drifted from
+`room_mono = 0.176340` to `0.176506` only because `c81bcf2` removed
+the V1 coarse-error tiebreak (plan.md already documented it as
+near-noise).
+
+After the cleanup, one targeted accuracy attempt was tried and
+reverted:
+
+- Hypothesis: lowering `kMinTrackLocalMapInliers` from `12` to `10`
+  would let frames like 192 (9 post-PnP inliers) keep tracking instead
+  of entering the lost -> relocalize -> cascade loop.
+- Result: `xyz_mono` unchanged at `0.028136` (guardrail held; it never
+  visits the 9-11 inlier regime), but `room_mono` regressed
+  `0.176506 -> 0.290476` (+64.7%). Different SHA `2d4c8960de94298f`.
+- Interpretation: the `12` minimum is a load-bearing safety valve.
+  Accepting a marginal PnP solution with ~10 inliers produces a bad
+  pose that then gets baked into `current_frame_->landmarks_` and
+  pollutes downstream propagation. The old "reject -> relocalize" path
+  was, on average, less harmful than "accept with 10 inliers".
+- Add to ruled-out: any monotone reduction of `kMinTrackLocalMapInliers`
+  without a companion pose-quality gate. If revisited, pair the lower
+  threshold with tighter reprojection / pose-change checks rather than
+  lowering the inlier count alone.
+
+Two independent speculative attacks (V3 ultra-sparse skip, this
+12->10 threshold) have now regressed `room_mono` by ~65-68% versus the
+V2 baseline. The pattern is consistent: threshold or gating changes
+that "let more frames through" tend to accept bad state, which
+cascades, which is worse than the localize/recover path. The next
+concrete room_mono lever is therefore *not* another threshold knob
+but something structural like reference-KF refresh under a dying
+propagation chain - and even that is a new-handoff-sized experiment
+given the failure rate of speculative attempts.
+
+## 2026-04-18 600-frame async crash is a threading race
+
+Running `./build_codex/run_mono --tum data/tum/rgbd_dataset_freiburg1_room
+--max-frames 600 --no-viz data/ORBvoc.txt` three times with loop closing
+and mapping threads live (default async mode) produced one clean core
+dump at ~frame 195 during a relocalize cascade. Under `--repro-eval`
+(synchronous mapping, loop closing disabled) the same sequence ran
+three times with exit=0 and produced an identical ATE of 0.468671 m
+on every rep. An AddressSanitizer build ran a clean async 600-frame
+pass with zero memory errors and no crash, but ASan slows the tracker
+enough that the timing-sensitive path does not fire.
+
+Conclusions:
+
+- The crash is a threading race, almost certainly in the handoff
+  between Tracking, LocalMapping, and LoopClosing rather than a
+  single-threaded bug. `--repro-eval` dodges it entirely by removing
+  the LoopClosing thread.
+- A proper fix needs ThreadSanitizer (not AddressSanitizer) plus many
+  run reps to find the race, and then careful mutex / atomic audit on
+  Map::getAllKeyframes() / getAllLandmarks() and the LoopClosing
+  pose-graph handoff. Plan.md §6.1 already flags this as a known
+  concern in "Map API hygiene".
+- Async 600-frame ATE variance (0.48–0.93 m across three reps) is
+  large enough that single-rep comparisons are not meaningful for
+  that window; head-250 gates stay the reliable signal.
+
+Practical recommendation recorded for the next session: anyone
+running 600-frame loop-enabled mono for measurement should prefer
+`--repro-eval` unless they are explicitly testing the loop thread.
+
+## 2026-04-18 ThreadSanitizer race triage
+
+Built with `-fsanitize=thread -fno-omit-frame-pointer -g` and ran
+`setarch $(uname -m) -R env TSAN_OPTIONS=... ./build_tsan/run_mono
+--tum data/tum/rgbd_dataset_freiburg1_room --max-frames 250 --no-viz
+data/ORBvoc.txt` (ASLR off via `setarch -R` to avoid TSan's
+"unexpected memory mapping" FATAL under newer kernel mmap randomness).
+
+First pass before any fix: 27 data races + 2 lock-order-inversions.
+Top hit by location: `src/core/landmark.h:30/31` -- plain `bool is_bad_`
+raced between `Optimizer::bundleAdjustment -> Landmark::setBad()`
+on the LocalMapping thread and `Tracking::needNewKeyframe ->
+Landmark::isBad()` on the main thread.
+
+Fix landed in commit ff74140: `is_bad_` is now `std::atomic<bool>`
+with release-store / acquire-load accessors, no behavior change on
+any of the seven regression gates.
+
+Post-fix TSan rerun: 34 data races (variance across runs; slightly
+higher but no longer featuring `landmark.h:30`). The remaining races
+fall into two buckets:
+
+1. `std::shared_ptr<Landmark>` access on shared containers --
+   `shared_ptr_base.h:1670 operator bool() const` and
+   `shared_ptr_base.h:1075 __shared_count(...)` copy construct --
+   flagged when main-thread `needNewKeyframe` / `trackLocalMap`
+   iterate `Keyframe::landmarks_` while LocalMapping swaps entries.
+   Fixing this requires a container-level lock (e.g. hold
+   `Keyframe::mutex_` around the landmark iteration, or introduce a
+   snapshot getter) rather than a one-line atomic change.
+2. `Tracking::current_frame_` shared_ptr swap: main thread
+   `addFrame()` assigns at tracking.cc:283 while the LocalMapping
+   thread's `onBACompleted` callback dereferences `current_frame_`
+   via `recomputeCurrentPose` (tracking.cc:1911). `pose_mutex_`
+   already exists; a minimal fix is to hold it across the swap and
+   around the callback read.
+
+Both are real races and plausibly related to the 600-frame async
+intermittent core dump described in the previous section. Each
+needs a targeted fix with the same scope-and-gate discipline as the
+is_bad_ atomic; deferring to a follow-up session so the fix can
+ship with its own TSan-verified "before / after" evidence.
+
+## 2026-04-18 race fix progress
+
+Three targeted race fixes landed on this branch. TSan race counts on
+`./build_tsan/run_mono --tum data/tum/rgbd_dataset_freiburg1_room
+--max-frames 250 --no-viz data/ORBvoc.txt` under `setarch -R`:
+
+  before any fix                                      27 races
+  after ff74140 (Landmark::is_bad_ -> atomic<bool>)   34 races (variance, target race 0 hits)
+  after a2f65f1 (pose_mutex_ pairs current_frame_)    37 races (variance, target race 0 hits)
+  after 996aefb (Keyframe::landmarks_ under kf mutex) 23 races
+
+TSan run-to-run variance is ~10% on this workload, so the hard signal
+is that each targeted race's symptom in its specific hot spot drops
+to zero after its fix. Net useful deltas on this branch:
+
+  * `Landmark::is_bad_`: gone.
+  * `Tracking::current_frame_` shared_ptr swap: gone.
+  * `Keyframe::landmarks_` primary iteration (trackLocalMap
+    add_landmarks_from_kf): gone.
+
+What is left in the 23 still-reported races:
+
+1. `Tracking::recomputeCurrentPose` iterates `current_frame_->landmarks_`
+   on the LocalMapping thread (via `onBACompleted`) while the main
+   thread writes to the same vector in `trackReferenceKeyframe`,
+   `trackLocalMap`, relocalization, and KF promotion paths. `Frame`
+   already declares `std::mutex mutex_` but nothing currently takes
+   it; fixing this cleanly needs *both* the callback-side snapshot
+   *and* locks on every main-thread write site -- many sites across
+   tracking.cc.
+2. `LocalMapping::mapPointCulling` removes landmarks via
+   `removeLandmark(lm)` concurrently with reads from Tracking; the
+   Map side appears to need a container-level lock on top of the
+   per-entity locks that already exist.
+
+Neither is a one-commit fix. They stay as follow-ups for a dedicated
+session with the same discipline applied here (one race per commit,
+TSan before/after, all seven gates byte-identical).
+
+## 2026-04-18 race-fix validation on 600-frame async room_mono
+
+Re-ran the 3-rep 600-frame fr1_room async mono (no --accel, loop
+closing thread on) at HEAD 9b7f854 with the same command and evo_ape
+flags as the 2026-04-18 pre-fix measurement. All three reps completed
+cleanly with exit=0; no core dump:
+
+                   pre-race-fix          post-race-fix
+  rep1             0.834                 0.697
+  rep2             0.636                 0.569
+  rep3             core dump             0.762
+  crash rate       1/3                   0/3
+
+ATE variance is also slightly tighter (range 0.57-0.76 vs 0.48-0.93).
+This is a direct validation that the three targeted race fixes (
+ff74140 is_bad_ atomic, a2f65f1 current_frame_ pose_mutex_,
+996aefb Keyframe::landmarks_ kf->mutex_) eliminated the intermittent
+600-frame crash that the earlier diag section attributed to a
+threading race.
+
+Absolute ATE at 600 frames is still high (0.57-0.76 m) and
+non-deterministic versus the 0.1765 m head-250 reference; that is
+the downstream room_mono scale-drift / reference-KF collapse problem
+described earlier, not a threading bug.

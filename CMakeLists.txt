@@ -40,7 +40,17 @@ if(NOT Ceres_FOUND)
     # Avoid depending on system glog/gflags.
     set(MINIGLOG ON CACHE BOOL "" FORCE)
     set(GFLAGS OFF CACHE BOOL "" FORCE)
-    
+
+    # Ceres optionally links CXSparse. On recent Ubuntu runners
+    # (libsuitesparse-dev 5.10+), the CMake-exported target is renamed
+    # from CXSparse::CXSparse to SuiteSparse::CXSparse, which breaks
+    # Ceres 2.1.0's hard-coded target name at
+    # internal/ceres/CMakeLists.txt:329. Disable CXSparse in Ceres --
+    # we do not rely on its linear solvers here, and the other solvers
+    # (DENSE_SCHUR / SPARSE_NORMAL_CHOLESKY via Eigen) cover both local
+    # BA and pose graph paths.
+    set(CXSPARSE OFF CACHE BOOL "" FORCE)
+
     FetchContent_MakeAvailable(ceres)
     
     # Create alias if needed
@@ -165,20 +175,6 @@ target_include_directories(svslam_reference_policy_core PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-add_library(svslam_reference_policy_experiments
-    src/experiments/reference_keyframe/score_reference_keyframe_policy.cc
-    src/experiments/reference_keyframe/pipeline_reference_keyframe_policy.cc
-)
-
-target_include_directories(svslam_reference_policy_experiments PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-    $<INSTALL_INTERFACE:include>
-)
-
-target_link_libraries(svslam_reference_policy_experiments PUBLIC
-    svslam_reference_policy_core
-)
-
 add_library(svslam_core
     src/core/camera.cc
     src/core/frame.cc
@@ -239,15 +235,7 @@ configure_file(
 
 add_executable(run_mono apps/run_mono.cc)
 target_include_directories(run_mono PRIVATE ${SVSLAM_GENERATED_INCLUDE_DIR})
-target_link_libraries(run_mono PRIVATE svslam_core svslam_reference_policy_experiments)
-
-add_executable(reference_policy_experiments
-    tools/reference_policy_experiments.cc
-)
-target_link_libraries(reference_policy_experiments PRIVATE svslam_reference_policy_experiments)
-target_include_directories(reference_policy_experiments PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
+target_link_libraries(run_mono PRIVATE svslam_core)
 
 # Tests
 option(BUILD_TESTS "Build unit tests" ON)
@@ -284,7 +272,6 @@ if(BUILD_TESTS)
     endif()
     target_link_libraries(svslam_tests PRIVATE
         svslam_core
-        svslam_reference_policy_experiments
         GTest::gtest_main
     )
 

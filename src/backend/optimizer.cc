@@ -189,7 +189,19 @@ int addDepthPriorResiduals(ceres::Problem& problem,
             continue;
         }
 
-        const double sigma = keyframe->depth_is_metric_ ? 0.015 : 0.2;
+        // Sensor / stereo metric depth is trusted tightly (15 mm).
+        // Learned metric depth from an ONNX model is much noisier per-pixel, so
+        // we soften it substantially to avoid the BA baking depth outliers into
+        // the pose (observed as 3.5x room_mono regression with indoor_small).
+        // Non-metric (relative) DL depth stays at 0.2.
+        double sigma;
+        if (!keyframe->depth_is_metric_) {
+            sigma = 0.2;
+        } else if (keyframe->depth_is_learned_) {
+            sigma = 0.15;
+        } else {
+            sigma = 0.015;
+        }
         const double weight = 1.0 / sigma;
         const auto& camera = keyframe->camera_;
         ceres::CostFunction* depth_cost = DepthPriorError::Create(
@@ -828,7 +840,12 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-        options.sparse_linear_algebra_library_type = ceres::SUITE_SPARSE;
+        // EIGEN_SPARSE is bundled with Ceres and does not require system
+        // SuiteSparse/CXSparse, which lets us disable CXSPARSE in the Ceres
+        // FetchContent build (see CMakeLists.txt) and keep CI green on
+        // Ubuntu runners where the find_package(CXSparse) target name
+        // changed under libsuitesparse-dev 5.10+.
+        options.sparse_linear_algebra_library_type = ceres::EIGEN_SPARSE;
         options.num_threads = ceres_num_threads_from_env();
         options.max_num_iterations = std::max(iterations, loop_edge_count > 0 ? 90 : iterations);
         options.minimizer_progress_to_stdout = false;
@@ -836,7 +853,7 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
         std::cout << "PoseGraph(" << pass_name
                   << "): linear_solver=SPARSE_NORMAL_CHOLESKY"
-                  << " sparse_library=SUITE_SPARSE"
+                  << " sparse_library=EIGEN_SPARSE"
                   << " loss_loop=Cauchy"
                   << " loss_covisibility=Huber"
                   << " max_iterations=" << options.max_num_iterations

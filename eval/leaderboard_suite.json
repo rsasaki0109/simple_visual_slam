@@ -41,30 +41,6 @@
       "reference_policy": "heuristic",
       "use_depth": true,
       "use_accel": true
-    },
-    {
-      "id": "mono_score",
-      "reference_policy": "score",
-      "use_depth": false,
-      "use_accel": false
-    },
-    {
-      "id": "depth_score",
-      "reference_policy": "score",
-      "use_depth": true,
-      "use_accel": false
-    },
-    {
-      "id": "mono_pipeline",
-      "reference_policy": "pipeline",
-      "use_depth": false,
-      "use_accel": false
-    },
-    {
-      "id": "depth_pipeline",
-      "reference_policy": "pipeline",
-      "use_depth": true,
-      "use_accel": false
     }
   ]
 }

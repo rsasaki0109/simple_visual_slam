@@ -372,9 +372,17 @@ void LocalMapping::createNewMapPoints() {
                  lm->addObservation(neighbor, idx2);
                  lm->descriptor_ = current_processed_kf_->descriptors_.row(idx1).clone();
 
-                 // Add to keyframes
-                 current_processed_kf_->landmarks_[idx1] = lm;
-                 neighbor->landmarks_[idx2] = lm;
+                 // Add to keyframes. Take each kf->mutex_ separately so we do
+                 // not hold two keyframe locks at once (avoids lock-order
+                 // inversion vs other paths that take these locks singly).
+                 {
+                     std::lock_guard<std::mutex> lock(current_processed_kf_->mutex_);
+                     current_processed_kf_->landmarks_[idx1] = lm;
+                 }
+                 {
+                     std::lock_guard<std::mutex> lock(neighbor->mutex_);
+                     neighbor->landmarks_[idx2] = lm;
+                 }
 
                  map_->addLandmark(lm);
                  recent_landmarks_.push_back({lm, processed_keyframe_count_});
