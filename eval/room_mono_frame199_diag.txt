@@ -106,3 +106,44 @@ KF insertions in frames 195-210: V1 baseline `5`; Phase A2 `4`.
 Cooldown stdout firings: `2`.
 Gates: `room_mono_head_repro=0.176340` (SHA `70fff60ac7874535`), `xyz_mono_head_repro=0.028136` (SHA `583e07bf2ba4ecaf`); all five gates PASS and `ctest` stayed `62/62`.
 Summary: suppressing only the low-tracked-features emergency path after successful relocalization breaks part of the late KF burst without moving `xyz_mono`.
+
+## 2026-04-17 Phase A3 abort
+
+Tested change: `kMinUsefulEmergencyKfFeatures = 20` guard in the `low_tracked_features` emergency-KF path.
+Build: `cmake --build build_codex -j$(nproc)` PASS.
+ctest: `62/62` PASS.
+`xyz_mono_head_repro`: PASS, ATE `0.028136 m`, two-run SHA `583e07bf2ba4ecaf...`.
+`room_mono_head_repro`: PASS ceiling, but ATE `0.296368 m`, two-run SHA `09f866be8b0e2928...`; regression `+0.120028 m` versus locked V2 `0.176340 m`.
+Abort reason: `room_mono` ATE rose versus V2, so the gate sequence stopped before the remaining three gates and diagnostic trace; `src/tracking/tracking.cc` was reverted and `plan.md` was left untouched.
+
+## 2026-04-17 Cascade diagnosis (from `log/room_mono_trace_phaseA2.log`, no code change)
+
+Re-read of the V2 Phase A2 trace in the pathological segment. Key finding: **the loss cascade originates at frame 193 — the previously-assumed "frame 199 bootstrap collapse" is a downstream symptom**.
+
+Reference-KF propagation visibly decays across frames 188-193, then fails:
+
+| Frame | `TrackReferenceKeyframe: Propagated landmarks` | `3D-2D correspondences` | Event |
+| --- | ---: | ---: | --- |
+| 188 | 13 | 13 | OK; KF 189 inserted via `low_tracked_features=37` |
+| 189 | 21 | 21 (PnP 20 inliers) | OK |
+| 190 | 13 | 13 | OK |
+| 191 | 9 | 9 | OK |
+| 192 | 5 | 5 | PnP fails -> `Relocalize: Matched with KF 185 inliers=10`; `Relocalization successful!` |
+| 193 | **2** | **2** | `needNewKeyframe: Low tracked features (13) within post-reloc cooldown (1/3), deferring.` -> no refresh KF |
+| 194 | - | 0 | `Tracking: Lost`; reloc fails; pose frozen at `(0.400876, -0.194087, -0.912102)` |
+| 195-202 | - | 0 | Same frozen pose; `All candidate PnP attempts failed` repeatedly |
+| 203 | - | - | Eventually recovers; KFs 203, 204, 205, 209 inserted via `low_tracked_features` (15, 13, 20, 25) |
+
+Observations:
+
+- **Reference-KF landmark budget collapses inside ~5 frames** (13 -> 21 -> 13 -> 9 -> 5 -> 2 -> 0). This is upstream of any cooldown or fallback-ranking logic.
+- V2 cooldown **is actively deferring** a would-be refresh KF at frame 193 (counter at `1/3` because relocalize succeeded at frame 192). In V1 the same frame inserted a fresh KF; V1's `room_mono` was still worse (0.197177 vs V2 0.176340). Net V2 gain comes from preventing *other* post-reloc bursts, not from helping this one.
+- Once frame 194 goes lost, pose stays frozen through frame 202; relocalization attempts fail with 1-6 candidate KFs; state recovers only at frame 203 with a sparse KF burst.
+- The V3 `num_tracked_features_ < 20` skip experiment regressed `room_mono` from 0.176 -> 0.296 m. Lesson: isolated sparse KFs (frames 203-205, `Connected KFs: 0`, policy-vetoed from reference promotion) still act as necessary map scaffolding; deleting them is worse than keeping them.
+
+Implications for the next experiment (not executed in this session):
+
+- The real lever is **why reference-KF propagation decays from 21 -> 2 across a 5-frame window**, not the emergency-KF path downstream. Candidates: landmark culling policy, covisibility edge removal, or reference KF itself being replaced by a weaker recently-inserted mono KF.
+- A plausible attack is to force a reference-KF **switch** (not insertion) when `TrackReferenceKeyframe: Propagated landmarks` falls below a small threshold (e.g. `< 10`). Switch target: the covisibility neighbor with the most projectable landmarks under the current pose estimate.
+- Any such change touches reference-policy code that was out of scope for V1-V3 handoffs. It would need a new handoff with that scope explicitly opened and the same `xyz_mono <= 0.030` guardrail.
+- V2 (`7fe7bbc` + `d4584b8`) remains the committed best. No further code change in this session.
