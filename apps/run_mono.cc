@@ -20,8 +20,6 @@
 #include "io/tum_pinhole_calibration.h"
 #include "io/map_io.h"
 #include "core/heuristic_reference_keyframe_policy.h"
-#include "experiments/reference_keyframe/pipeline_reference_keyframe_policy.h"
-#include "experiments/reference_keyframe/score_reference_keyframe_policy.h"
 #include "tracking/tracking.h"
 #include "backend/local_mapping.h"
 #include "loop_closing/loop_closing.h"
@@ -60,7 +58,7 @@ void print_help(std::ostream& os) {
        << "  --depth                             Use depth.txt / sensor depth when available\n"
        << "  --accel                             Load accelerometer.txt into tracker when available\n"
        << "  --repro-eval                        Synchronous mapping; deterministic BA ordering for replay\n"
-       << "  --reference-policy <heuristic|score|pipeline>\n"
+       << "  --reference-policy heuristic\n"
        << "  --skip-frames N   --max-frames N\n"
        << "  --depth-model <model.onnx>          DL depth (build with -DUSE_DEPTH_DL=ON)\n"
        << "  --metric-depth-model <model.onnx>   Metric DL depth in meters (build with -DUSE_DEPTH_DL=ON)\n"
@@ -117,7 +115,7 @@ int main(int argc, char** argv) {
                   << "  ./run_mono --version | -V     (print semver from CMake project VERSION)\n"
                   << "  ./run_mono <video_path> [vocab_path]\n"
                   << "  ./run_mono --euroc <sequence_dir> [--euroc-camera-config <calib.json>] [--stereo] [vocab_path]\n"
-                  << "  ./run_mono --tum <sequence_dir> [--tum-camera-config <calib.json>] [--depth] [--accel] [--repro-eval] [--reference-policy <heuristic|score|pipeline>] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [--metric-depth-model <path.onnx>] [--run-summary-json <path>] [--strict-exit] [vocab_path]\n" << std::endl;
+                  << "  ./run_mono --tum <sequence_dir> [--tum-camera-config <calib.json>] [--depth] [--accel] [--repro-eval] [--reference-policy heuristic] [--skip-frames N] [--max-frames N] [--depth-model <path.onnx>] [--metric-depth-model <path.onnx>] [--run-summary-json <path>] [--strict-exit] [vocab_path]\n" << std::endl;
         return -1;
     }
 
@@ -182,14 +180,8 @@ int main(int argc, char** argv) {
         if (name == "heuristic") {
             return std::make_unique<HeuristicReferenceKeyframePolicy>();
         }
-        if (name == "score") {
-            return std::make_unique<ScoreReferenceKeyframePolicy>();
-        }
-        if (name == "pipeline") {
-            return std::make_unique<PipelineReferenceKeyframePolicy>();
-        }
         throw std::runtime_error(
-            "Unknown reference policy: " + name + " (expected heuristic, score, or pipeline)");
+            "Unknown reference policy: " + name + " (expected heuristic)");
     };
 
     // Parse optional flags
