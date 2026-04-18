@@ -40,18 +40,27 @@ public:
     // Back-project pixel with known depth to 3D world point
     Vec3 backprojectWithDepth(const cv::KeyPoint& kp, float depth_m) const;
 
+    // Snapshot landmarks_ under mutex_ for safe cross-thread iteration.
+    // Writers on tracking thread must take mutex_ around landmarks_ writes;
+    // readers on other threads (LocalMapping onBACompleted path) should call
+    // this instead of iterating landmarks_ directly.
+    std::vector<std::shared_ptr<Landmark>> snapshotLandmarks() const;
+
     // Features
     std::vector<cv::KeyPoint> keypoints_;
     cv::Mat descriptors_;
 
-    // Map points associated with features
+    // Map points associated with features.
+    // Writes must be guarded by mutex_ once this Frame has been published as
+    // Tracking::current_frame_ (LocalMapping::onBACompleted reads it via the
+    // tracking BA callback). See snapshotLandmarks() for reads.
     std::vector<std::shared_ptr<Landmark>> landmarks_;
     
     // Grid for fast search (optional, but good for requirements)
     // Skipping grid implementation for now to keep it minimal, 
     // but reserving member if needed or just using brute force for now.
     
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 };
 
 }

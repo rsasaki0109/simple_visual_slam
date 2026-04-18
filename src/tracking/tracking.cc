@@ -238,6 +238,10 @@ void assignFrameLandmarksFromInliers(const Frame::Ptr& frame,
         return;
     }
 
+    // Hold frame->mutex_ around the assign + writes: onBACompleted may be
+    // snapshotting frame->landmarks_ on the LocalMapping thread at the same
+    // time.
+    std::lock_guard<std::mutex> lock(frame->mutex_);
     frame->landmarks_.assign(frame->keypoints_.size(), nullptr);
     for (const int index : inliers) {
         if (index < 0 || index >= static_cast<int>(keypoint_indices.size()) ||
@@ -330,6 +334,10 @@ bool Tracking::initializeWithDepth() {
     int created = 0;
     static unsigned long depth_lm_id = 200000;
 
+    // kf is not yet published to the map, so kf->landmarks_ writes are
+    // single-threaded. current_frame_ is published; hold its mutex_ across
+    // the loop to avoid racing with onBACompleted reads.
+    std::lock_guard<std::mutex> frame_lock(current_frame_->mutex_);
     for (size_t i = 0; i < kf->keypoints_.size(); ++i) {
         auto lm = createDepthLandmark(kf, i, depth_lm_id);
         if (!lm) {
@@ -540,10 +548,19 @@ bool Tracking::initialize() {
                     // Add landmarks to keyframes
                     kf_init->landmarks_[idx_ref] = lm;
                     kf_cur->landmarks_[idx_cur] = lm;
-                    
-                    // Update Frames as well so they are tracked
-                    initial_frame_->landmarks_[idx_ref] = lm;
-                    current_frame_->landmarks_[idx_cur] = lm;
+
+                    // Update Frames as well so they are tracked. Both frames
+                    // are published (initial_frame_ may still be the target
+                    // of an onBACompleted snapshot path), so take each
+                    // mutex_ around the single-slot write.
+                    {
+                        std::lock_guard<std::mutex> lock(initial_frame_->mutex_);
+                        initial_frame_->landmarks_[idx_ref] = lm;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(current_frame_->mutex_);
+                        current_frame_->landmarks_[idx_cur] = lm;
+                    }
                     
                     // Add to map
                     if (map_) {
@@ -826,8 +843,15 @@ bool Tracking::needNewKeyframe() {
     const int frames_since_reference =
         static_cast<int>(current_frame_->id_ - reference_keyframe_->id_);
 
+    // Snapshot reference_keyframe_->landmarks_ under kf->mutex_ —
+    // LocalMapping::createNewMapPoints writes the same container.
+    std::vector<Landmark::Ptr> ref_landmarks_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(reference_keyframe_->mutex_);
+        ref_landmarks_snapshot = reference_keyframe_->landmarks_;
+    }
     int ref_landmarks = 0;
-    for (auto& lm : reference_keyframe_->landmarks_) {
+    for (auto& lm : ref_landmarks_snapshot) {
         if (lm && !lm->isBad()) {
             ref_landmarks++;
         }
@@ -1648,7 +1672,9 @@ bool Tracking::trackReferenceKeyframe() {
     
     // Propagate landmark associations from last frame via feature matches.
     // This is critical for bootstrapping 3D-2D PnP in subsequent frames.
-    current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
+    // Hold current_frame_->mutex_ across assign + inner writes: onBACompleted
+    // may snapshot landmarks_ concurrently. last_frame_ is only read and
+    // only the tracking thread writes it, so reads below are safe.
     int propagated = 0;
 
     // Optimization: Pose from 3D-2D
@@ -1656,37 +1682,42 @@ bool Tracking::trackReferenceKeyframe() {
     std::vector<cv::Point2f> image_points;
     std::vector<int> current_kp_indices;
     std::vector<Landmark::Ptr> propagated_landmarks;
-    
-    for (const auto& m : good_matches) {
-        // Query is current, Train is last
-        int idx_last = m.trainIdx;
-        int idx_curr = m.queryIdx;
-        
-        if (idx_last >= 0 && idx_last < static_cast<int>(last_frame_->landmarks_.size()) &&
-            last_frame_->landmarks_[idx_last]) {
-            // Found a map point
-            Vec3 pos = last_frame_->landmarks_[idx_last]->getPos();
-            if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) continue;
 
-            Vec3 p_c = current_frame_->getPose() * pos;
-            if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) continue;
-            if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) continue;
+    {
+        std::lock_guard<std::mutex> lock(current_frame_->mutex_);
+        current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
 
-            const int octave = current_frame_->keypoints_[idx_curr].octave;
-            const double gate_px = 48.0 * (1.0 + 0.12 * static_cast<double>(std::max(0, octave)));
-            Vec2 proj = current_frame_->camera_->project(p_c);
-            const auto& uv = current_frame_->keypoints_[idx_curr].pt;
-            const double dx = uv.x - proj[0];
-            const double dy = uv.y - proj[1];
-            if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+        for (const auto& m : good_matches) {
+            // Query is current, Train is last
+            int idx_last = m.trainIdx;
+            int idx_curr = m.queryIdx;
 
-            object_points.push_back(cv::Point3f(pos.x(), pos.y(), pos.z()));
-            image_points.push_back(uv);
+            if (idx_last >= 0 && idx_last < static_cast<int>(last_frame_->landmarks_.size()) &&
+                last_frame_->landmarks_[idx_last]) {
+                // Found a map point
+                Vec3 pos = last_frame_->landmarks_[idx_last]->getPos();
+                if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) continue;
 
-            current_frame_->landmarks_[idx_curr] = last_frame_->landmarks_[idx_last];
-            current_kp_indices.push_back(idx_curr);
-            propagated_landmarks.push_back(last_frame_->landmarks_[idx_last]);
-            propagated++;
+                Vec3 p_c = current_frame_->getPose() * pos;
+                if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) continue;
+                if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) continue;
+
+                const int octave = current_frame_->keypoints_[idx_curr].octave;
+                const double gate_px = 48.0 * (1.0 + 0.12 * static_cast<double>(std::max(0, octave)));
+                Vec2 proj = current_frame_->camera_->project(p_c);
+                const auto& uv = current_frame_->keypoints_[idx_curr].pt;
+                const double dx = uv.x - proj[0];
+                const double dy = uv.y - proj[1];
+                if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+
+                object_points.push_back(cv::Point3f(pos.x(), pos.y(), pos.z()));
+                image_points.push_back(uv);
+
+                current_frame_->landmarks_[idx_curr] = last_frame_->landmarks_[idx_last];
+                current_kp_indices.push_back(idx_curr);
+                propagated_landmarks.push_back(last_frame_->landmarks_[idx_last]);
+                propagated++;
+            }
         }
     }
 
@@ -1844,8 +1875,12 @@ std::size_t Tracking::countValidFrameLandmarks(const Frame::Ptr& frame) {
         return 0;
     }
 
+    // Snapshot under frame->mutex_ — this path is reached from onBACompleted
+    // on the LocalMapping thread while the tracking thread may concurrently
+    // write frame->landmarks_[i].
+    const auto snapshot = frame->snapshotLandmarks();
     std::size_t correspondences = 0;
-    for (const auto& lm : frame->landmarks_) {
+    for (const auto& lm : snapshot) {
         if (!lm || lm->isBad()) continue;
         const Vec3 pos = lm->getPos();
         if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) {
@@ -1925,13 +1960,16 @@ bool Tracking::recomputeCurrentPose() {
         return false;
     }
 
-    // Collect 3D-2D correspondences from current frame's landmark associations
+    // Collect 3D-2D correspondences from current frame's landmark associations.
+    // Snapshot landmarks_ under current_frame_->mutex_ — this runs on the
+    // LocalMapping thread via onBACompleted while tracking may be writing.
+    const auto landmarks_snapshot = current_frame_->snapshotLandmarks();
     std::vector<cv::Point3f> pts3d;
     std::vector<cv::Point2f> pts2d;
     std::vector<int> indices;
 
-    for (size_t i = 0; i < current_frame_->landmarks_.size(); i++) {
-        auto lm = current_frame_->landmarks_[i];
+    for (size_t i = 0; i < landmarks_snapshot.size(); i++) {
+        auto lm = landmarks_snapshot[i];
         if (!lm || lm->isBad()) continue;
 
         Vec3 pos = lm->getPos();  // BA-updated position
@@ -2063,11 +2101,19 @@ bool Tracking::relocalize() {
             }
         }
 
+        // Snapshot kf->landmarks_ under kf->mutex_ to avoid racing with
+        // LocalMapping::createNewMapPoints writes on the same container.
+        std::vector<Landmark::Ptr> kf_landmarks_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(kf->mutex_);
+            kf_landmarks_snapshot = kf->landmarks_;
+        }
+
         int valid_3d_matches = 0;
         for (const auto& m : good) {
             const int kf_idx = m.trainIdx;
-            if (kf_idx < 0 || kf_idx >= static_cast<int>(kf->landmarks_.size())) continue;
-            const auto& lm = kf->landmarks_[kf_idx];
+            if (kf_idx < 0 || kf_idx >= static_cast<int>(kf_landmarks_snapshot.size())) continue;
+            const auto& lm = kf_landmarks_snapshot[kf_idx];
             if (!lm || lm->isBad()) continue;
 
             const Vec3 pos = lm->getPos();
@@ -2237,14 +2283,23 @@ bool Tracking::relocalize() {
         std::vector<cv::Point2f> pts2d;
         std::vector<int> match_indices;
 
+        // Snapshot cand.kf->landmarks_ under kf->mutex_ — LocalMapping's
+        // createNewMapPoints writes kf->landmarks_[idx] concurrently and TSan
+        // flagged the unprotected read here.
+        std::vector<Landmark::Ptr> kf_landmarks;
+        {
+            std::lock_guard<std::mutex> lock(cand.kf->mutex_);
+            kf_landmarks = cand.kf->landmarks_;
+        }
+
         for (size_t m_idx = 0; m_idx < cand.matches.size(); m_idx++) {
             auto& m = cand.matches[m_idx];
             int kf_idx = m.trainIdx;
             int curr_idx = m.queryIdx;
 
-            if (kf_idx >= 0 && kf_idx < static_cast<int>(cand.kf->landmarks_.size()) &&
-                cand.kf->landmarks_[kf_idx]) {
-                auto lm = cand.kf->landmarks_[kf_idx];
+            if (kf_idx >= 0 && kf_idx < static_cast<int>(kf_landmarks.size()) &&
+                kf_landmarks[kf_idx]) {
+                auto lm = kf_landmarks[kf_idx];
                 if (lm->isBad()) continue;
 
                 Vec3 pos = lm->getPos();
@@ -2356,20 +2411,35 @@ bool Tracking::relocalize() {
         const auto& best_candidate = candidates[best_success.candidate_index];
         current_frame_->setPose(best_success.pose);
 
-        current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
-        for (int idx : best_success.inlier_indices) {
-            if (idx < 0 || idx >= static_cast<int>(best_success.match_indices.size())) {
-                continue;
-            }
-            const int orig_match_idx = best_success.match_indices[idx];
-            if (orig_match_idx < 0 || orig_match_idx >= static_cast<int>(best_candidate.matches.size())) {
-                continue;
-            }
-            const int kf_idx = best_candidate.matches[orig_match_idx].trainIdx;
-            const int curr_idx = best_candidate.matches[orig_match_idx].queryIdx;
-            if (kf_idx >= 0 && kf_idx < static_cast<int>(best_candidate.kf->landmarks_.size()) &&
-                curr_idx >= 0 && curr_idx < static_cast<int>(current_frame_->landmarks_.size())) {
-                current_frame_->landmarks_[curr_idx] = best_candidate.kf->landmarks_[kf_idx];
+        // Snapshot best_candidate.kf->landmarks_ first (separate lock) so we
+        // don't hold two container mutexes at once — LocalMapping only takes
+        // one KF mutex at a time, and the existing race-fix convention avoids
+        // lock-order inversion.
+        std::vector<Landmark::Ptr> best_kf_landmarks;
+        {
+            std::lock_guard<std::mutex> lock(best_candidate.kf->mutex_);
+            best_kf_landmarks = best_candidate.kf->landmarks_;
+        }
+
+        // Lock current_frame_->mutex_ around assign + inner writes to avoid
+        // racing with onBACompleted snapshot on the LocalMapping thread.
+        {
+            std::lock_guard<std::mutex> lock(current_frame_->mutex_);
+            current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
+            for (int idx : best_success.inlier_indices) {
+                if (idx < 0 || idx >= static_cast<int>(best_success.match_indices.size())) {
+                    continue;
+                }
+                const int orig_match_idx = best_success.match_indices[idx];
+                if (orig_match_idx < 0 || orig_match_idx >= static_cast<int>(best_candidate.matches.size())) {
+                    continue;
+                }
+                const int kf_idx = best_candidate.matches[orig_match_idx].trainIdx;
+                const int curr_idx = best_candidate.matches[orig_match_idx].queryIdx;
+                if (kf_idx >= 0 && kf_idx < static_cast<int>(best_kf_landmarks.size()) &&
+                    curr_idx >= 0 && curr_idx < static_cast<int>(current_frame_->landmarks_.size())) {
+                    current_frame_->landmarks_[curr_idx] = best_kf_landmarks[kf_idx];
+                }
             }
         }
 
@@ -2498,8 +2568,14 @@ bool Tracking::reinitialize() {
 
         kf_ref->landmarks_[tp.idx_ref] = lm;
         kf_cur->landmarks_[tp.idx_cur] = lm;
-        reinitialization_state_.reference_frame->landmarks_[tp.idx_ref] = lm;
-        current_frame_->landmarks_[tp.idx_cur] = lm;
+        {
+            std::lock_guard<std::mutex> lock(reinitialization_state_.reference_frame->mutex_);
+            reinitialization_state_.reference_frame->landmarks_[tp.idx_ref] = lm;
+        }
+        {
+            std::lock_guard<std::mutex> lock(current_frame_->mutex_);
+            current_frame_->landmarks_[tp.idx_cur] = lm;
+        }
 
         if (map_) {
             map_->addLandmark(lm);

@@ -49,4 +49,9 @@ void Frame::extractORB(const cv::Ptr<cv::Feature2D>& detector) {
     landmarks_.resize(keypoints_.size(), nullptr);
 }
 
+std::vector<std::shared_ptr<Landmark>> Frame::snapshotLandmarks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return landmarks_;
+}
+
 }
