@@ -280,7 +280,17 @@ void Tracking::setReferenceKeyframe(Keyframe::Ptr kf) {
 }
 
 bool Tracking::addFrame(Frame::Ptr frame) {
-    current_frame_ = frame;
+    // Only the main thread writes current_frame_ / last_frame_, but the
+    // LocalMapping on_ba_completed_ callback reads current_frame_ under
+    // pose_mutex_. Without the matching lock on this side, TSan flags the
+    // shared_ptr swap as a data race. Hold pose_mutex_ only across the
+    // swap itself so the rest of addFrame -- which is heavy and internally
+    // synchronizes via Frame / Keyframe mutexes -- does not block the
+    // LocalMapping thread.
+    {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        current_frame_ = frame;
+    }
 
     if (state_ == TrackingState::NO_IMAGES_YET) {
         state_ = TrackingState::NOT_INITIALIZED;
@@ -293,7 +303,10 @@ bool Tracking::addFrame(Frame::Ptr frame) {
         success = track();
     }
 
-    last_frame_ = current_frame_;
+    {
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        last_frame_ = current_frame_;
+    }
     return success;
 }
 
