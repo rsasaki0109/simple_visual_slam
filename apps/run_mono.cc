@@ -425,6 +425,9 @@ int main(int argc, char** argv) {
                 accel.az = imu.accel.z();
                 tracker->accel_buffer_.push_back(accel);
             }
+            if (euroc.hasCam0FromImuExtrinsic()) {
+                tracker->setImuToCameraExtrinsic(euroc.cam0FromImuExtrinsic());
+            }
             std::cout << "IMU integration: ENABLED (accel+gyro, "
                       << tracker->imu_buffer_.size() << " samples)" << std::endl;
         } else if (use_accel) {

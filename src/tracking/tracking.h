@@ -97,6 +97,18 @@ public:
     // it without threading more state through the call sites.
     std::vector<ImuEntry> imu_buffer_;
 
+    // IMU→camera extrinsic (T_cam_imu: transforms IMU/body frame points into
+    // the camera frame). Defaults to identity for datasets without a known
+    // extrinsic (TUM, or EuRoC without sensor.yaml). Set from EurocDataset
+    // in run_mono before the first frame arrives.
+    SE3 T_cam_imu_;
+    bool has_cam_imu_extrinsic_ = false;
+
+    void setImuToCameraExtrinsic(const SE3& T_cam_imu) {
+        T_cam_imu_ = T_cam_imu;
+        has_cam_imu_extrinsic_ = true;
+    }
+
 private:
     struct RecoveryState {
         int lost_frame_count = 0;
@@ -131,6 +143,18 @@ private:
     bool reinitialize();  // Re-initialize from scratch when lost for too long
     void setReferenceKeyframe(Keyframe::Ptr kf);
     void setKeyframeGravity(Keyframe::Ptr kf);  // Set gravity from accel data
+    // Preintegrate imu_buffer_ between last_frame_ and current_frame_ and
+    // write an IMU-predicted world-frame velocity into current_frame_.
+    // No-op unless gravity_aligned_ and IMU samples span the interval.
+    void predictVelocityFromImu();
+    // Fold the post-tracking visual pose delta into current_frame_->velocity_
+    // so Keyframe::velocity_ (and therefore the BA velocity prior) reflects a
+    // visually-corrected IMU estimate instead of pure open-loop integration.
+    void reconcileVelocityWithVisual();
+    // Preintegrate imu_buffer_ from prev_kf's timestamp to kf's timestamp and
+    // attach the resulting span to kf->prev_imu_span_ for BA consumption.
+    void populateKeyframeImuSpan(const std::shared_ptr<Keyframe>& kf,
+                                 const std::shared_ptr<Keyframe>& prev_kf);
     static std::size_t countValidFrameLandmarks(const Frame::Ptr& frame);
 
     cv::Ptr<cv::DescriptorMatcher> matcher_;

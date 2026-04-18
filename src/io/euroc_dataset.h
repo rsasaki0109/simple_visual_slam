@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "core/common.h"
 #include "io/euroc_pinhole_calibration.h"
 #include "sensors/imu.h"
 
@@ -37,6 +38,12 @@ public:
     const std::vector<ImuEntry>& allImu() const { return imu_entries_; }
     // Returns IMU samples strictly within (t0, t1]. Inputs in seconds.
     std::vector<ImuEntry> getImuBetween(double t0, double t1) const;
+
+    // Extrinsic for cam0: T_cam_imu (transforms IMU-body-frame points to
+    // cam0 frame). EuRoC sensor.yaml stores this as T_BS with body := IMU.
+    // Returns identity if cam0.T_BS was not parsed.
+    SE3 cam0FromImuExtrinsic() const { return cam0_from_imu_; }
+    bool hasCam0FromImuExtrinsic() const { return has_cam0_from_imu_; }
 
 private:
     struct CsvEntry {
@@ -84,6 +91,9 @@ private:
     size_t index_ = 0;
     bool stereo_enabled_ = false;
     double stereo_baseline_meters_ = 0.0;
+
+    SE3 cam0_from_imu_;  // defaults to identity
+    bool has_cam0_from_imu_ = false;
 };
 
 }  // namespace svslam

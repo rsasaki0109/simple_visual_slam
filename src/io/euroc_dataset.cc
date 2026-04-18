@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 
+#include <Eigen/SVD>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -146,6 +147,30 @@ EurocDataset::EurocDataset(const std::string& seq_dir,
         return;
     }
 
+    // Cache cam0's T_BS (body=IMU → cam0) as a Sophus SE3 for downstream
+    // preintegration consumers. EuRoC matrices are stored row-major.
+    if (cam0_calib.T_BS.size() == 16) {
+        Eigen::Matrix4d T_cam_imu_mat;
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                T_cam_imu_mat(r, c) = cam0_calib.T_BS[static_cast<size_t>(r * 4 + c)];
+            }
+        }
+        // Renormalize the rotation block so SE3's internal quaternion stays
+        // unit-length despite the YAML's 6-digit truncation.
+        Eigen::Matrix3d R = T_cam_imu_mat.block<3, 3>(0, 0);
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+            R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d R_ortho = svd.matrixU() * svd.matrixV().transpose();
+        if (R_ortho.determinant() < 0.0) {
+            Eigen::Matrix3d V = svd.matrixV();
+            V.col(2) *= -1.0;
+            R_ortho = svd.matrixU() * V.transpose();
+        }
+        cam0_from_imu_ = SE3(R_ortho, T_cam_imu_mat.block<3, 1>(0, 3));
+        has_cam0_from_imu_ = true;
+    }
+
     initCalibration(cam0_calib, K_, dist_coeffs_, new_K_, undist_map1_, undist_map2_);
     if (stereo_enabled_) {
         initCalibration(cam1_calib, right_K_, right_dist_coeffs_, right_new_K_, right_undist_map1_,
@@ -229,6 +254,32 @@ bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path, EurocPinh
         return false;
     }
 
+    // Slurp the whole file so we can fold multi-line YAML arrays (EuRoC
+    // stores T_BS's 16 values wrapped across 4 lines) into a single virtual
+    // line before handing it to parseArrayLine.
+    std::string raw((std::istreambuf_iterator<char>(ifs)),
+                     std::istreambuf_iterator<char>());
+
+    // Collapse any '[' ... ']' block into one line. Safe here because
+    // sensor.yaml only uses bracket arrays for numeric sequences.
+    std::string flat;
+    flat.reserve(raw.size());
+    int bracket_depth = 0;
+    for (char c : raw) {
+        if (c == '[') {
+            ++bracket_depth;
+            flat.push_back(c);
+        } else if (c == ']') {
+            --bracket_depth;
+            flat.push_back(c);
+        } else if (bracket_depth > 0 && (c == '\n' || c == '\r')) {
+            flat.push_back(' ');
+        } else {
+            flat.push_back(c);
+        }
+    }
+
+    std::stringstream folded(flat);
     bool got_intrinsics = false;
     bool got_resolution = false;
     std::vector<double> values;
@@ -236,7 +287,7 @@ bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path, EurocPinh
     bool in_t_bs_block = false;
 
     std::string line;
-    while (std::getline(ifs, line)) {
+    while (std::getline(folded, line)) {
         line = trim(line);
         if (line.empty()) continue;
         if (line[0] == '#') continue;

@@ -14,6 +14,7 @@
 #include "core/keyframe.h"
 #include "core/landmark.h"
 #include "sensors/accelerometer.h"
+#include "sensors/imu_preintegrator.h"
 
 namespace svslam {
 
@@ -320,6 +321,15 @@ bool Tracking::initializeWithDepth() {
     if (!gravity_aligned_ && !accel_buffer_.empty()) {
         Vec3 gravity = AccelerometerProcessor::estimateGravity(accel_buffer_);
         if (gravity.norm() > 0.5) {
+            // Accelerometer samples live in the IMU body frame; if T_cam_imu
+            // is set (EuRoC), rotate into the camera frame before building
+            // the align transform so the computed R_align lives in the
+            // camera-from-world sense that setPose(T_cw) expects. On
+            // sensors where IMU ≈ camera (TUM freiburg1), T_cam_imu_ is
+            // identity and this is a no-op.
+            if (has_cam_imu_extrinsic_) {
+                gravity = T_cam_imu_.so3() * gravity;
+            }
             Mat33 R_align = AccelerometerProcessor::computeGravityAlignment(gravity);
             SE3 T_aligned(R_align, Vec3(0, 0, 0));
             current_frame_->setPose(T_aligned);
@@ -468,6 +478,9 @@ bool Tracking::initialize() {
             if (!gravity_aligned_ && !accel_buffer_.empty()) {
                 Vec3 gravity = AccelerometerProcessor::estimateGravity(accel_buffer_);
                 if (gravity.norm() > 0.5) {
+                    if (has_cam_imu_extrinsic_) {
+                        gravity = T_cam_imu_.so3() * gravity;
+                    }
                     Mat33 R_align = AccelerometerProcessor::computeGravityAlignment(gravity);
                     T_align = SE3(R_align, Vec3(0, 0, 0));
                     gravity_aligned_ = true;
@@ -660,6 +673,11 @@ bool Tracking::track() {
             SE3 T_cw_pred = velocity_ * last_frame_->getPose();
             current_frame_->setPose(T_cw_pred);
         }
+
+        // IMU preintegration -> world-frame velocity estimate on current_frame_.
+        // Pose uses the visual motion model above; IMU only seeds Frame::velocity_
+        // so BA can apply a loose velocity prior. See predictVelocityFromImu().
+        predictVelocityFromImu();
     }
 
     // 2. Track Reference Keyframe (Frame-to-Frame matching for now)
@@ -700,6 +718,7 @@ bool Tracking::track() {
             loop_correction_state_.skip_velocity_update_once = false;
         } else if (last_frame_) {
             velocity_ = current_frame_->getPose() * last_frame_->getPose().inverse();
+            reconcileVelocityWithVisual();
         }
     } else {
         std::cout << "Tracking: Lost, attempting relocalization..." << std::endl;
@@ -772,6 +791,11 @@ bool Tracking::track() {
         // Create new Keyframe
         auto kf = std::make_shared<Keyframe>(current_frame_);
         setKeyframeGravity(kf);
+        // Capture IMU preintegration from the previous reference KF. BA reads
+        // kf->prev_imu_span_ when the span is valid; otherwise it falls back
+        // to the loose velocity prior. reference_keyframe_ has not yet been
+        // updated to this kf, so it points at the correct predecessor.
+        populateKeyframeImuSpan(kf, reference_keyframe_);
         for (size_t i = 0; i < kf->landmarks_.size(); ++i) {
             auto& lm = kf->landmarks_[i];
             if (!lm || lm->isBad()) continue;
@@ -2627,6 +2651,150 @@ void Tracking::setKeyframeGravity(Keyframe::Ptr kf) {
     // For TUM datasets, accelerometer frame ≈ camera frame (close enough for prior)
     kf->gravity_in_camera_ = g_sensor.normalized();
     kf->has_gravity_ = true;
+}
+
+void Tracking::predictVelocityFromImu() {
+    if (!last_frame_ || !current_frame_) return;
+    if (imu_buffer_.empty()) return;
+    if (!gravity_aligned_) return;
+
+    const double t_i = last_frame_->timestamp_;
+    const double t_j = current_frame_->timestamp_;
+    if (!(t_j > t_i) || (t_j - t_i) > 1.0) return;
+
+    // Pick IMU samples whose timestamp falls in [t_i, t_j]. imu_buffer_ is
+    // already sorted ascending at load time (EuRoC imu0 CSV order).
+    auto begin_it = std::lower_bound(
+        imu_buffer_.begin(), imu_buffer_.end(), t_i,
+        [](const ImuEntry& e, double t) { return e.timestamp_sec < t; });
+    auto end_it = std::upper_bound(
+        imu_buffer_.begin(), imu_buffer_.end(), t_j,
+        [](double t, const ImuEntry& e) { return t < e.timestamp_sec; });
+    if (std::distance(begin_it, end_it) < 2) return;
+
+    // Biases are zero in Stage 0b until a VIO backend estimates them; keep the
+    // last-frame copy so upstream code can refine them later without touching
+    // this call site.
+    ImuPreintegrator preint(last_frame_->accel_bias_, last_frame_->gyro_bias_);
+    auto prev_it = begin_it;
+    auto next_it = prev_it + 1;
+    while (next_it != end_it) {
+        const double dt_step = next_it->timestamp_sec - prev_it->timestamp_sec;
+        if (dt_step > 0.0 && dt_step < 0.5) {
+            // Midpoint-free: integrate using the earlier sample; fine for a
+            // loose prior at EuRoC's 200 Hz IMU rate.
+            preint.integrate(prev_it->accel, prev_it->gyro, dt_step);
+        }
+        prev_it = next_it;
+        ++next_it;
+    }
+    if (preint.deltaT() <= 0.0) return;
+
+    // Convert the camera pose T_cw to an IMU-body pose T_wb so the Forster
+    // integrator runs in the frame it measures in. With T_cam_imu_ unset the
+    // formula collapses to the camera-is-body approximation.
+    const SE3 T_cw_last = last_frame_->getPose();
+    const SE3 T_wc_last = T_cw_last.inverse();
+    const SE3 T_wb_last = T_wc_last * T_cam_imu_;
+    const Sophus::SO3d R_wb_last = T_wb_last.so3();
+    const Vec3 p_wb_last = T_wb_last.translation();
+
+    // Lever-arm between IMU and camera is small on EuRoC (<= ~5 cm) so we
+    // treat body and camera world-frame velocities as equal to keep the BA
+    // prior consumer simple. The residual's loose sigma absorbs the error.
+    const Vec3 v_wb_last = last_frame_->has_velocity_
+        ? last_frame_->velocity_
+        : Vec3::Zero();
+    const Vec3 gravity_w(0.0, 0.0, -9.81);
+
+    Sophus::SO3d R_wb_new;
+    Vec3 v_wb_new;
+    Vec3 p_wb_new;
+    preint.predict(R_wb_last, v_wb_last, p_wb_last, gravity_w,
+                   R_wb_new, v_wb_new, p_wb_new);
+    if (!v_wb_new.allFinite()) return;
+
+    current_frame_->velocity_ = v_wb_new;
+    current_frame_->has_velocity_ = true;
+    current_frame_->accel_bias_ = last_frame_->accel_bias_;
+    current_frame_->gyro_bias_ = last_frame_->gyro_bias_;
+}
+
+void Tracking::populateKeyframeImuSpan(const Keyframe::Ptr& kf,
+                                       const Keyframe::Ptr& prev_kf) {
+    if (!kf || !prev_kf || imu_buffer_.empty()) return;
+    const double t_i = prev_kf->timestamp_;
+    const double t_j = kf->timestamp_;
+    if (!(t_j > t_i) || (t_j - t_i) > 5.0) return;
+
+    auto begin_it = std::lower_bound(
+        imu_buffer_.begin(), imu_buffer_.end(), t_i,
+        [](const ImuEntry& e, double t) { return e.timestamp_sec < t; });
+    auto end_it = std::upper_bound(
+        imu_buffer_.begin(), imu_buffer_.end(), t_j,
+        [](double t, const ImuEntry& e) { return t < e.timestamp_sec; });
+    if (std::distance(begin_it, end_it) < 2) return;
+
+    ImuPreintegrator preint(prev_kf->accel_bias_, prev_kf->gyro_bias_);
+    auto prev_it = begin_it;
+    auto next_it = prev_it + 1;
+    while (next_it != end_it) {
+        const double dt_step = next_it->timestamp_sec - prev_it->timestamp_sec;
+        if (dt_step > 0.0 && dt_step < 0.5) {
+            preint.integrate(prev_it->accel, prev_it->gyro, dt_step);
+        }
+        prev_it = next_it;
+        ++next_it;
+    }
+    if (preint.deltaT() <= 0.0) return;
+
+    auto span = std::make_unique<ImuPreintegrationSpan>();
+    span->delta_R = preint.deltaR();
+    span->delta_v = preint.deltaV();
+    span->delta_p = preint.deltaP();
+    span->dt = preint.deltaT();
+    span->bias_accel = prev_kf->accel_bias_;
+    span->bias_gyro = prev_kf->gyro_bias_;
+    span->from_kf_id = prev_kf->id_;
+    span->T_cam_imu = T_cam_imu_;
+    span->valid = span->delta_v.allFinite() && span->delta_p.allFinite();
+    if (span->valid) {
+        kf->prev_imu_span_ = std::move(span);
+    }
+}
+
+void Tracking::reconcileVelocityWithVisual() {
+    if (!last_frame_ || !current_frame_) return;
+    const double dt = current_frame_->timestamp_ - last_frame_->timestamp_;
+    if (!(dt > 0.0) || dt > 1.0) return;
+
+    const Vec3 p_wc_curr = current_frame_->getPose().inverse().translation();
+    const Vec3 p_wc_last = last_frame_->getPose().inverse().translation();
+    const Vec3 v_visual = (p_wc_curr - p_wc_last) / dt;
+    if (!v_visual.allFinite()) return;
+
+    // IMU prediction weight for the blend. 0 = trust visual fully (default);
+    // 1 = keep raw IMU estimate untouched. Biases are uncalibrated in Stage
+    // 0b so a low alpha is usually best.
+    double alpha_imu = 0.3;
+    if (const char* env = std::getenv("SVSLAM_VIO_VELOCITY_IMU_ALPHA")) {
+        char* end = nullptr;
+        const double parsed = std::strtod(env, &end);
+        if (end != env && std::isfinite(parsed) && parsed >= 0.0 && parsed <= 1.0) {
+            alpha_imu = parsed;
+        }
+    }
+
+    if (current_frame_->has_velocity_) {
+        current_frame_->velocity_ =
+            alpha_imu * current_frame_->velocity_ + (1.0 - alpha_imu) * v_visual;
+    } else if (std::getenv("SVSLAM_VIO_ENABLE_VISUAL_VELOCITY")) {
+        // Opt-in: also populate velocity on non-IMU runs so the BA prior acts
+        // as a trajectory-smoothness regularizer. Default behavior preserves
+        // existing TUM gates untouched.
+        current_frame_->velocity_ = v_visual;
+        current_frame_->has_velocity_ = true;
+    }
 }
 
 }
