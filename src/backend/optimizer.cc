@@ -840,7 +840,12 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-        options.sparse_linear_algebra_library_type = ceres::SUITE_SPARSE;
+        // EIGEN_SPARSE is bundled with Ceres and does not require system
+        // SuiteSparse/CXSparse, which lets us disable CXSPARSE in the Ceres
+        // FetchContent build (see CMakeLists.txt) and keep CI green on
+        // Ubuntu runners where the find_package(CXSparse) target name
+        // changed under libsuitesparse-dev 5.10+.
+        options.sparse_linear_algebra_library_type = ceres::EIGEN_SPARSE;
         options.num_threads = ceres_num_threads_from_env();
         options.max_num_iterations = std::max(iterations, loop_edge_count > 0 ? 90 : iterations);
         options.minimizer_progress_to_stdout = false;
@@ -848,7 +853,7 @@ void Optimizer::poseGraphOptimization(Map::Ptr map,
 
         std::cout << "PoseGraph(" << pass_name
                   << "): linear_solver=SPARSE_NORMAL_CHOLESKY"
-                  << " sparse_library=SUITE_SPARSE"
+                  << " sparse_library=EIGEN_SPARSE"
                   << " loss_loop=Cauchy"
                   << " loss_covisibility=Huber"
                   << " max_iterations=" << options.max_num_iterations
