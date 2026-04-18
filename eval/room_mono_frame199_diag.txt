@@ -263,3 +263,42 @@ intermittent core dump described in the previous section. Each
 needs a targeted fix with the same scope-and-gate discipline as the
 is_bad_ atomic; deferring to a follow-up session so the fix can
 ship with its own TSan-verified "before / after" evidence.
+
+## 2026-04-18 race fix progress
+
+Three targeted race fixes landed on this branch. TSan race counts on
+`./build_tsan/run_mono --tum data/tum/rgbd_dataset_freiburg1_room
+--max-frames 250 --no-viz data/ORBvoc.txt` under `setarch -R`:
+
+  before any fix                                      27 races
+  after ff74140 (Landmark::is_bad_ -> atomic<bool>)   34 races (variance, target race 0 hits)
+  after a2f65f1 (pose_mutex_ pairs current_frame_)    37 races (variance, target race 0 hits)
+  after 996aefb (Keyframe::landmarks_ under kf mutex) 23 races
+
+TSan run-to-run variance is ~10% on this workload, so the hard signal
+is that each targeted race's symptom in its specific hot spot drops
+to zero after its fix. Net useful deltas on this branch:
+
+  * `Landmark::is_bad_`: gone.
+  * `Tracking::current_frame_` shared_ptr swap: gone.
+  * `Keyframe::landmarks_` primary iteration (trackLocalMap
+    add_landmarks_from_kf): gone.
+
+What is left in the 23 still-reported races:
+
+1. `Tracking::recomputeCurrentPose` iterates `current_frame_->landmarks_`
+   on the LocalMapping thread (via `onBACompleted`) while the main
+   thread writes to the same vector in `trackReferenceKeyframe`,
+   `trackLocalMap`, relocalization, and KF promotion paths. `Frame`
+   already declares `std::mutex mutex_` but nothing currently takes
+   it; fixing this cleanly needs *both* the callback-side snapshot
+   *and* locks on every main-thread write site -- many sites across
+   tracking.cc.
+2. `LocalMapping::mapPointCulling` removes landmarks via
+   `removeLandmark(lm)` concurrently with reads from Tracking; the
+   Map side appears to need a container-level lock on top of the
+   per-entity locks that already exist.
+
+Neither is a one-commit fix. They stay as follow-ups for a dedicated
+session with the same discipline applied here (one race per commit,
+TSan before/after, all seven gates byte-identical).
