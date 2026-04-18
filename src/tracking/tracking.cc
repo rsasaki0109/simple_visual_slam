@@ -939,7 +939,16 @@ bool Tracking::trackLocalMap() {
     auto add_landmarks_from_kf = [&](const Keyframe::Ptr& kf,
                                      LocalMapSourceBucket source_bucket) {
         if (!kf) return;
-        for (const auto& lm : kf->landmarks_) {
+        // Snapshot under kf->mutex_ so we don't race with LocalMapping
+        // writing kf->landmarks_[i] = lm in createNewMapPoints. TSan flagged
+        // shared_ptr<Landmark>::operator bool() reads here tearing against
+        // the concurrent shared_ptr assignment on the mapping thread.
+        std::vector<Landmark::Ptr> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(kf->mutex_);
+            snapshot = kf->landmarks_;
+        }
+        for (const auto& lm : snapshot) {
             if (!lm || lm->isBad()) continue;
             if (!landmark_ids.insert(lm->id_).second) continue;
             landmarks.push_back(lm);
