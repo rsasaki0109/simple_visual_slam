@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-15T12:00:00+09:00",
+  "generated_at": "2026-04-18T00:00:00+09:00",
   "comparison_protocol": {
     "reference": "eval/comparison_protocol.md",
     "evo_ape_flags": [
@@ -10,7 +10,7 @@
     ],
     "simple_visual_slam": {
       "build_dir": "build_codex",
-      "git_head": "2ac7ffaa365e7a144802e7bcc325182c724cb375",
+      "git_head": "df644d2e6c8782cea22cd6ba7398a45825e1ab06",
       "version": "SimpleVisualSLAM 0.2.0",
       "tracked_frame_window": 250,
       "common_flags": [
@@ -63,7 +63,7 @@
       "modality": "mono",
       "simple_visual_slam": {
         "trajectory_path": "build_codex/trajectory.txt",
-        "ate_mean_m": 0.02702567
+        "ate_mean_m": 0.02813558
       },
       "stella_vslam": {
         "provided_trajectory_path": "/media/sasaki/aiueo/ai_coding_ws/stella_eval/xyz_mono/frame_trajectory.txt",
@@ -74,7 +74,7 @@
       },
       "comparison": {
         "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
-        "delta_simple_minus_stella_m": 0.01288997,
+        "delta_simple_minus_stella_m": 0.01399988,
         "winner": "stella_vslam",
         "simple_loses": true,
         "loss_hypothesis": "Monocular still trails stella on xyz head-250, but the gap narrowed materially versus older SimpleVisualSLAM snapshots in this file."
@@ -107,7 +107,7 @@
       "modality": "mono",
       "simple_visual_slam": {
         "trajectory_path": "build_codex/trajectory.txt",
-        "ate_mean_m": 0.22049743
+        "ate_mean_m": 0.17650551
       },
       "stella_vslam": {
         "provided_trajectory_path": "/media/sasaki/aiueo/ai_coding_ws/stella_eval/room_mono/frame_trajectory.txt",
@@ -118,10 +118,10 @@
       },
       "comparison": {
         "basis": "SimpleVisualSLAM 250 tracked frames vs first 250 poses of provided stella trajectory",
-        "delta_simple_minus_stella_m": 0.19306197,
+        "delta_simple_minus_stella_m": 0.14907005,
         "winner": "stella_vslam",
         "simple_loses": true,
-        "loss_hypothesis": "Monocular scale drift and thin support on `room_mono` without loop closure remain the largest gap versus stella."
+        "loss_hypothesis": "Monocular scale drift and thin support on `room_mono` without loop closure remain the largest gap versus stella. Post-relocalization emergency-KF cooldown (commit 0220ea7) dropped the SimpleVisualSLAM head-250 from 0.22049743 to 0.17650551 (-19.95%)."
       }
     }
   }

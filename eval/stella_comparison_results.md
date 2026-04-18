@@ -1,15 +1,15 @@
 # stella_vslam Comparison
 
-**Fair head-250 refresh (2026-04-15):** SimpleVisualSLAM rows were re-measured with `bash scripts/verify_comparison_benchmark.sh <preset>` and `BUILD=build_codex` (writes `build_codex/trajectory.txt` per run). Git `2ac7ffaa365e7a144802e7bcc325182c724cb375`, `SimpleVisualSLAM 0.2.0`. The **stella_vslam** head-250 baselines in the table are **unchanged** from the prior fair-window protocol (first `250` poses of each provided `stella_eval` trajectory). Machine-readable copy: `eval/stella_comparison.json`.
+**Fair head-250 refresh (2026-04-18):** SimpleVisualSLAM rows were re-measured with `bash scripts/verify_comparison_benchmark.sh <preset>` and `BUILD=build_codex` on HEAD `df644d2e6c8782cea22cd6ba7398a45825e1ab06`, `SimpleVisualSLAM 0.2.0`. The **stella_vslam** head-250 baselines in the table are **unchanged** from the prior fair-window protocol (first `250` poses of each provided `stella_eval` trajectory). Previous SimpleVisualSLAM measurements were taken at `2ac7ffaa365e7a144802e7bcc325182c724cb375` (2026-04-15); the major delta is `room_mono`, which dropped from `0.22049743` to `0.17650551` (-19.95%) after the post-relocalization emergency-KF cooldown landed in `0220ea7`. Machine-readable copy: `eval/stella_comparison.json`.
 
 ## Fair Head-250 Comparison
 
-| Scenario | Modality | SimpleVisualSLAM ATE (m) | stella_vslam ATE (m, head-250) | Delta (Simple - stella) (m) | Winner |
-| --- | --- | ---: | ---: | ---: | --- |
-| `xyz_depth` | RGB-D | 0.01104221 | 0.00889256 | 0.00314965 | `stella_vslam` |
-| `xyz_mono` | Mono | 0.02702567 | 0.01413570 | 0.01288997 | `stella_vslam` |
-| `room_depth` | RGB-D | 0.07991444 | 0.02110508 | 0.05880936 | `stella_vslam` |
-| `room_mono` | Mono | 0.22049743 | 0.02743546 | 0.19306197 | `stella_vslam` |
+| Scenario | Modality | SimpleVisualSLAM ATE (m) | stella_vslam ATE (m, head-250) | Delta (Simple - stella) (m) | Ratio vs stella | Winner |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `xyz_depth` | RGB-D | 0.01104221 | 0.00889256 | 0.00314965 | ~1.24x | `stella_vslam` |
+| `xyz_mono` | Mono | 0.02813558 | 0.01413570 | 0.01399988 | ~1.99x | `stella_vslam` |
+| `room_depth` | RGB-D | 0.07991444 | 0.02110508 | 0.05880936 | ~3.79x | `stella_vslam` |
+| `room_mono` | Mono | 0.17650551 | 0.02743546 | 0.14907005 | ~6.43x | `stella_vslam` |
 
 ## Protocol Details
 
