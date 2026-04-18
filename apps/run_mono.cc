@@ -409,6 +409,31 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (use_euroc) {
+        if (use_accel && euroc.hasImu()) {
+            // Mirror the IMU accel channel into accel_buffer_ so the existing
+            // gravity-alignment + stationary-detection paths work unchanged,
+            // and retain the full IMU (accel + gyro) for future VIO use.
+            tracker->imu_buffer_ = euroc.allImu();
+            tracker->accel_buffer_.clear();
+            tracker->accel_buffer_.reserve(tracker->imu_buffer_.size());
+            for (const auto& imu : tracker->imu_buffer_) {
+                AccelEntry accel;
+                accel.timestamp_sec = imu.timestamp_sec;
+                accel.ax = imu.accel.x();
+                accel.ay = imu.accel.y();
+                accel.az = imu.accel.z();
+                tracker->accel_buffer_.push_back(accel);
+            }
+            std::cout << "IMU integration: ENABLED (accel+gyro, "
+                      << tracker->imu_buffer_.size() << " samples)" << std::endl;
+        } else if (use_accel) {
+            std::cout << "IMU integration: requested but mav0/imu0/data.csv absent, DISABLED"
+                      << std::endl;
+            use_accel = false;
+        }
+    }
+
     // Deep learning depth estimator
     if (loop_closing && use_depth) {
         loop_closing->setMetricDepth(true);

@@ -12,6 +12,7 @@
 #include "tracking/initializer.h"
 #include "backend/local_mapping.h"
 #include "io/tum_dataset.h"
+#include "sensors/imu.h"
 #include <memory>
 #include <mutex>
 
@@ -88,6 +89,13 @@ public:
     // Accelerometer data for gravity alignment and stationary detection
     std::vector<AccelEntry> accel_buffer_;
     bool gravity_aligned_ = false;
+
+    // Full IMU (accel + gyro) buffer — populated when the dataset exposes
+    // imu0 (EuRoC). Stage 0b scaffolding: tracking still consults
+    // accel_buffer_ for gravity / stationary detection; imu_buffer_ is held
+    // here so a future VIO path (preintegration, velocity predict) can read
+    // it without threading more state through the call sites.
+    std::vector<ImuEntry> imu_buffer_;
 
 private:
     struct RecoveryState {
