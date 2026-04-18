@@ -519,11 +519,230 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         std::cout << "BA: Added " << gravity_residual_count << " gravity prior residuals" << std::endl;
     }
 
+    // Velocity priors between consecutive (in time) local keyframes. Two
+    // flavors: (1) a Forster preintegration residual whenever the successor
+    // KF carries an ImuPreintegrationSpan from its predecessor (Stage 0c.c);
+    // (2) the legacy loose "position delta ≈ v*dt" prior for any remaining
+    // pairs where a span is missing. Sigma tuning applies to both flavors.
+    double velocity_sigma_m = 0.3;
+    if (const char* env = std::getenv("SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M")) {
+        char* end = nullptr;
+        const double parsed = std::strtod(env, &end);
+        if (end != env && std::isfinite(parsed)) {
+            velocity_sigma_m = parsed;
+        }
+    }
+
+    // Separate velocity-residual sigma. Meaningful only with the preintegration
+    // residual; the loose fallback ignores it. Default matches position sigma.
+    double velocity_vel_sigma = 0.3;
+    if (const char* env = std::getenv("SVSLAM_BA_VELOCITY_PRIOR_VEL_SIGMA")) {
+        char* end = nullptr;
+        const double parsed = std::strtod(env, &end);
+        if (end != env && std::isfinite(parsed) && parsed > 0.0) {
+            velocity_vel_sigma = parsed;
+        }
+    }
+
+    std::map<unsigned long, double*> velocity_params;  // owned, freed below
+    std::map<unsigned long, double*> accel_bias_params;
+    std::map<unsigned long, double*> gyro_bias_params;
+    int velocity_residual_count = 0;
+    int preintegration_residual_count = 0;
+    int bias_random_walk_residual_count = 0;
+    int bias_anchor_residual_count = 0;
+
+    // Bias priors are loose by default — BA should absorb IMU scale errors
+    // slowly, not fight them. Env-tunable so experiments can dial them in.
+    double bias_accel_anchor_sigma = 0.5;   // m/s^2
+    double bias_gyro_anchor_sigma = 0.1;    // rad/s
+    double bias_accel_rw_sigma = 0.05;      // m/s^2 per KF-gap
+    double bias_gyro_rw_sigma = 0.005;      // rad/s per KF-gap
+    auto read_pos = [](const char* name, double& sink) {
+        if (const char* env = std::getenv(name)) {
+            char* end = nullptr;
+            const double parsed = std::strtod(env, &end);
+            if (end != env && std::isfinite(parsed) && parsed > 0.0) {
+                sink = parsed;
+            }
+        }
+    };
+    read_pos("SVSLAM_BA_BIAS_ACCEL_ANCHOR_SIGMA", bias_accel_anchor_sigma);
+    read_pos("SVSLAM_BA_BIAS_GYRO_ANCHOR_SIGMA", bias_gyro_anchor_sigma);
+    read_pos("SVSLAM_BA_BIAS_ACCEL_RW_SIGMA", bias_accel_rw_sigma);
+    read_pos("SVSLAM_BA_BIAS_GYRO_RW_SIGMA", bias_gyro_rw_sigma);
+    if (velocity_sigma_m > 0.0 && keyframes.size() >= 2) {
+        std::vector<Keyframe::Ptr> ordered_keyframes;
+        ordered_keyframes.reserve(keyframes.size());
+        for (const auto& kf : keyframes) {
+            if (kf) ordered_keyframes.push_back(kf);
+        }
+        std::sort(ordered_keyframes.begin(), ordered_keyframes.end(),
+                  [](const Keyframe::Ptr& a, const Keyframe::Ptr& b) {
+                      return a->id_ < b->id_;
+                  });
+
+        // Register a velocity parameter block for every local KF that has a
+        // usable estimate. The block is freshly allocated so BA solves write
+        // into scratch instead of mutating kf->velocity_ mid-solve.
+        auto addVelocityBlock = [&](const Keyframe::Ptr& kf) -> double* {
+            if (!kf || !kf->has_velocity_ || !kf->velocity_.allFinite()) return nullptr;
+            auto it = velocity_params.find(kf->id_);
+            if (it != velocity_params.end()) return it->second;
+            double* v = new double[3];
+            v[0] = kf->velocity_.x();
+            v[1] = kf->velocity_.y();
+            v[2] = kf->velocity_.z();
+            problem.AddParameterBlock(v, 3);
+            velocity_params[kf->id_] = v;
+            return v;
+        };
+
+        auto addBiasBlock = [&](std::map<unsigned long, double*>& sink,
+                                const Keyframe::Ptr& kf,
+                                const Vec3& init,
+                                double anchor_sigma) -> double* {
+            if (!kf || !init.allFinite()) return nullptr;
+            auto it = sink.find(kf->id_);
+            if (it != sink.end()) return it->second;
+            double* b = new double[3];
+            b[0] = init.x();
+            b[1] = init.y();
+            b[2] = init.z();
+            problem.AddParameterBlock(b, 3);
+            sink[kf->id_] = b;
+            if (anchor_sigma > 0.0) {
+                const double anchor_weight = 1.0 / anchor_sigma;
+                problem.AddResidualBlock(BiasAnchorError::Create(anchor_weight),
+                                         nullptr, b);
+                ++bias_anchor_residual_count;
+            }
+            return b;
+        };
+
+        const double velocity_weight = 1.0 / velocity_sigma_m;
+        const double preint_pos_weight = 1.0 / velocity_sigma_m;
+        const double preint_vel_weight = 1.0 / velocity_vel_sigma;
+        const Vec3 gravity_w(0.0, 0.0, -9.81);
+
+        for (std::size_t i = 0; i + 1 < ordered_keyframes.size(); ++i) {
+            const auto& kf_i = ordered_keyframes[i];
+            const auto& kf_j = ordered_keyframes[i + 1];
+            if (!kf_i || !kf_j) continue;
+            if (!kf_i->has_velocity_) continue;
+            if (!kf_i->velocity_.allFinite()) continue;
+
+            const double dt_pair = kf_j->timestamp_ - kf_i->timestamp_;
+            if (!(dt_pair > 0.0) || dt_pair > 1.0) continue;
+
+            auto it_i = pose_params.find(kf_i->id_);
+            auto it_j = pose_params.find(kf_j->id_);
+            if (it_i == pose_params.end() || it_j == pose_params.end()) continue;
+            if (problem.IsParameterBlockConstant(it_i->second) &&
+                problem.IsParameterBlockConstant(it_j->second)) {
+                continue;
+            }
+
+            const bool span_ok = kf_j->prev_imu_span_ && kf_j->prev_imu_span_->valid &&
+                                 kf_j->prev_imu_span_->from_kf_id == kf_i->id_ &&
+                                 kf_j->prev_imu_span_->dt > 0.0 &&
+                                 std::abs(kf_j->prev_imu_span_->dt - dt_pair) < 0.25 * dt_pair + 1e-3 &&
+                                 kf_j->has_velocity_ && kf_j->velocity_.allFinite();
+
+            if (span_ok) {
+                double* v_i_param = addVelocityBlock(kf_i);
+                double* v_j_param = addVelocityBlock(kf_j);
+                if (!v_i_param || !v_j_param) continue;
+                double* ba_i_param = addBiasBlock(accel_bias_params, kf_i,
+                                                  kf_i->accel_bias_,
+                                                  bias_accel_anchor_sigma);
+                double* ba_j_param = addBiasBlock(accel_bias_params, kf_j,
+                                                  kf_j->accel_bias_,
+                                                  bias_accel_anchor_sigma);
+                double* bg_i_param = addBiasBlock(gyro_bias_params, kf_i,
+                                                  kf_i->gyro_bias_,
+                                                  bias_gyro_anchor_sigma);
+                double* bg_j_param = addBiasBlock(gyro_bias_params, kf_j,
+                                                  kf_j->gyro_bias_,
+                                                  bias_gyro_anchor_sigma);
+                if (!ba_i_param || !ba_j_param || !bg_i_param || !bg_j_param) {
+                    continue;
+                }
+
+                const SE3& T_cb = kf_j->prev_imu_span_->T_cam_imu;
+                ceres::CostFunction* cost = VelocityPreintegrationError::Create(
+                    kf_j->prev_imu_span_->delta_p,
+                    kf_j->prev_imu_span_->delta_v,
+                    kf_j->prev_imu_span_->bias_accel,
+                    kf_j->prev_imu_span_->dt,
+                    gravity_w,
+                    T_cb.unit_quaternion(),
+                    T_cb.translation(),
+                    preint_pos_weight,
+                    preint_vel_weight);
+                problem.AddResidualBlock(cost, new ceres::HuberLoss(0.5),
+                                         it_i->second, it_j->second,
+                                         v_i_param, v_j_param,
+                                         ba_i_param);
+                ++preintegration_residual_count;
+
+                // Bias random-walk priors tie consecutive KFs. Without them
+                // the per-KF anchors would be the only coupling and biases
+                // could jerk between frames.
+                if (bias_accel_rw_sigma > 0.0) {
+                    const double rw_weight = 1.0 / bias_accel_rw_sigma;
+                    problem.AddResidualBlock(
+                        BiasRandomWalkError::Create(rw_weight), nullptr,
+                        ba_i_param, ba_j_param);
+                    ++bias_random_walk_residual_count;
+                }
+                if (bias_gyro_rw_sigma > 0.0) {
+                    const double rw_weight = 1.0 / bias_gyro_rw_sigma;
+                    problem.AddResidualBlock(
+                        BiasRandomWalkError::Create(rw_weight), nullptr,
+                        bg_i_param, bg_j_param);
+                    ++bias_random_walk_residual_count;
+                }
+            } else {
+                ceres::CostFunction* cost = VelocityDeltaPriorError::Create(
+                    kf_i->velocity_, dt_pair, velocity_weight);
+                problem.AddResidualBlock(cost, new ceres::HuberLoss(0.5),
+                                         it_i->second, it_j->second);
+                ++velocity_residual_count;
+            }
+        }
+    }
+
+    if (preintegration_residual_count > 0) {
+        std::cout << "BA: Added " << preintegration_residual_count
+                  << " IMU preintegration residuals (pos_sigma=" << velocity_sigma_m
+                  << " m, vel_sigma=" << velocity_vel_sigma << " m/s)" << std::endl;
+    }
+    if (velocity_residual_count > 0) {
+        std::cout << "BA: Added " << velocity_residual_count
+                  << " loose velocity prior residuals (sigma=" << velocity_sigma_m
+                  << " m)" << std::endl;
+    }
+    if (bias_anchor_residual_count > 0 || bias_random_walk_residual_count > 0) {
+        std::cout << "BA: Added " << bias_anchor_residual_count
+                  << " bias anchor + " << bias_random_walk_residual_count
+                  << " bias random-walk residuals" << std::endl;
+    }
+
     if (residual_count == 0 && depth_residual_count == 0) {
         for (auto& kv : pose_params) {
             delete[] kv.second;
         }
         for (auto& kv : point_params) {
+            delete[] kv.second;
+        }
+        for (auto& kv : velocity_params) {
+            delete[] kv.second;
+        }
+        for (auto& kv : accel_bias_params) {
+            delete[] kv.second;
+        }
+        for (auto& kv : gyro_bias_params) {
             delete[] kv.second;
         }
         return;
@@ -545,8 +764,26 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
     // Update State
     for (auto& kf : keyframes) {
         kf->T_cw_ = se3FromParameterBlock(pose_params[kf->id_]);
+        auto vel_it = velocity_params.find(kf->id_);
+        if (vel_it != velocity_params.end()) {
+            Vec3 v(vel_it->second[0], vel_it->second[1], vel_it->second[2]);
+            if (v.allFinite()) {
+                kf->velocity_ = v;
+                kf->has_velocity_ = true;
+            }
+        }
+        auto ba_it = accel_bias_params.find(kf->id_);
+        if (ba_it != accel_bias_params.end()) {
+            Vec3 b(ba_it->second[0], ba_it->second[1], ba_it->second[2]);
+            if (b.allFinite()) kf->accel_bias_ = b;
+        }
+        auto bg_it = gyro_bias_params.find(kf->id_);
+        if (bg_it != gyro_bias_params.end()) {
+            Vec3 b(bg_it->second[0], bg_it->second[1], bg_it->second[2]);
+            if (b.allFinite()) kf->gyro_bias_ = b;
+        }
     }
-    
+
     for (auto& lm : landmarks) {
         if (point_params.count(lm->id_)) {
             double* param = point_params[lm->id_];
@@ -568,6 +805,15 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         delete[] kv.second;
     }
     for (auto& kv : point_params) {
+        delete[] kv.second;
+    }
+    for (auto& kv : velocity_params) {
+        delete[] kv.second;
+    }
+    for (auto& kv : accel_bias_params) {
+        delete[] kv.second;
+    }
+    for (auto& kv : gyro_bias_params) {
         delete[] kv.second;
     }
 }

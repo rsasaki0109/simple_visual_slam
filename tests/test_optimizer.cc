@@ -129,6 +129,126 @@ TEST(OptimizerTest, DepthPriorCostMatchesObservedDepth) {
     EXPECT_NEAR(residuals[0], 10.0, 1e-9);
 }
 
+TEST(OptimizerTest, VelocityPreintegrationResidualZeroWhenPredictionMatches) {
+    // Zero-gravity setup: KF_i at world origin with v=0; KF_j at world (1,0,0)
+    // with v=(2,0,0). Preintegration says delta_p=(1,0,0), delta_v=(2,0,0)
+    // over dt=1 s. With accel bias matching the reference, the residual
+    // must vanish because the prediction is exact.
+    const double pose_i[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const double pose_j[7] = {-1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const double vel_i[3] = {0.0, 0.0, 0.0};
+    const double vel_j[3] = {2.0, 0.0, 0.0};
+    const double ba_i[3] = {0.0, 0.0, 0.0};  // equal to ba_ref → no correction
+    double residuals[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+    VelocityPreintegrationError error(
+        Vec3(1.0, 0.0, 0.0), Vec3(2.0, 0.0, 0.0),
+        Vec3::Zero(), 1.0, Vec3::Zero(),
+        Eigen::Quaterniond::Identity(), Vec3::Zero(),
+        /*pos_weight=*/10.0, /*vel_weight=*/5.0);
+    ASSERT_TRUE(error(pose_i, pose_j, vel_i, vel_j, ba_i, residuals));
+    for (int k = 0; k < 6; ++k) {
+        EXPECT_NEAR(residuals[k], 0.0, 1e-9) << "residual[" << k << "]";
+    }
+}
+
+TEST(OptimizerTest, VelocityPreintegrationResidualAccountsForGravity) {
+    // Free-fall: v=0 for both KFs, zero body-frame preintegration deltas,
+    // KF_j still at origin after 1 s → the residual should highlight the
+    // missing gravity drop.
+    const double pose_i[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const double pose_j[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const double vel_i[3] = {0.0, 0.0, 0.0};
+    const double vel_j[3] = {0.0, 0.0, 0.0};
+    const double ba_i[3] = {0.0, 0.0, 0.0};
+    double residuals[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+    VelocityPreintegrationError error(
+        Vec3::Zero(), Vec3::Zero(), Vec3::Zero(), 1.0,
+        Vec3(0.0, 0.0, -9.81), Eigen::Quaterniond::Identity(), Vec3::Zero(),
+        /*pos_weight=*/1.0, /*vel_weight=*/1.0);
+    ASSERT_TRUE(error(pose_i, pose_j, vel_i, vel_j, ba_i, residuals));
+    EXPECT_NEAR(residuals[2], 4.905, 1e-6);
+    EXPECT_NEAR(residuals[5], 9.81, 1e-6);
+}
+
+TEST(OptimizerTest, VelocityPreintegrationBiasAppliesFirstOrderCorrection) {
+    // Same stationary-poses setup as the gravity test but now the accel bias
+    // at KF_i differs from the reference bias used during preintegration. The
+    // first-order correction should show up as -(bias-ref)*dt in the velocity
+    // residual and -0.5*(bias-ref)*dt^2 in the position residual.
+    const double pose_i[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const double pose_j[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const double vel_i[3] = {0.0, 0.0, 0.0};
+    const double vel_j[3] = {0.0, 0.0, 0.0};
+    const double ba_i[3] = {0.1, 0.0, 0.0};
+    double residuals[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+    // Pre-integration stored deltas assuming bias = 0; no gravity.
+    VelocityPreintegrationError error(
+        Vec3::Zero(), Vec3::Zero(), Vec3::Zero(), /*dt=*/2.0,
+        Vec3::Zero(), Eigen::Quaterniond::Identity(), Vec3::Zero(),
+        /*pos_weight=*/1.0, /*vel_weight=*/1.0);
+    ASSERT_TRUE(error(pose_i, pose_j, vel_i, vel_j, ba_i, residuals));
+    // With positions fixed at origin the residual is -(−R*dp_corr) = R*dp_corr.
+    // R=I here, dp_corr = dp - 0.5*dba*dt^2 = -0.5 * 0.1 * 4 = -0.2 on x.
+    // residual_pos_x = (p_j-p_i) - 0 - 0 - R*dp_corr = 0 - (-0.2) = 0.2.
+    EXPECT_NEAR(residuals[0], 0.2, 1e-9);
+    // residual_vel_x = (v_j-v_i) - 0 - R*dv_corr. dv_corr = 0 - 0.1*2 = -0.2.
+    // residual_vel_x = 0 - (-0.2) = 0.2.
+    EXPECT_NEAR(residuals[3], 0.2, 1e-9);
+}
+
+TEST(OptimizerTest, BiasAnchorErrorPenalizesNonZeroBias) {
+    const double bias[3] = {0.1, -0.2, 0.3};
+    double residuals[3] = {0.0, 0.0, 0.0};
+
+    BiasAnchorError error(/*weight=*/2.0);
+    ASSERT_TRUE(error(bias, residuals));
+    EXPECT_NEAR(residuals[0], 0.2, 1e-12);
+    EXPECT_NEAR(residuals[1], -0.4, 1e-12);
+    EXPECT_NEAR(residuals[2], 0.6, 1e-12);
+}
+
+TEST(OptimizerTest, BiasRandomWalkErrorMeasuresDifference) {
+    const double bias_i[3] = {0.1, 0.0, 0.0};
+    const double bias_j[3] = {0.15, 0.0, 0.0};
+    double residuals[3] = {0.0, 0.0, 0.0};
+
+    BiasRandomWalkError error(/*weight=*/10.0);
+    ASSERT_TRUE(error(bias_i, bias_j, residuals));
+    EXPECT_NEAR(residuals[0], 0.5, 1e-9);
+    EXPECT_NEAR(residuals[1], 0.0, 1e-12);
+    EXPECT_NEAR(residuals[2], 0.0, 1e-12);
+}
+
+TEST(OptimizerTest, VelocityDeltaPriorZeroWhenPositionsMatchVelocityIntegral) {
+    // KF_i at world origin, KF_j at world (1, 0, 0), velocity 0.5 m/s over 2 s.
+    const double pose_i[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const double pose_j[7] = {-1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    double residuals[3] = {0.0, 0.0, 0.0};
+
+    VelocityDeltaPriorError error(Vec3(0.5, 0.0, 0.0), 2.0, /*weight=*/10.0);
+    ASSERT_TRUE(error(pose_i, pose_j, residuals));
+    EXPECT_NEAR(residuals[0], 0.0, 1e-9);
+    EXPECT_NEAR(residuals[1], 0.0, 1e-9);
+    EXPECT_NEAR(residuals[2], 0.0, 1e-9);
+}
+
+TEST(OptimizerTest, VelocityDeltaPriorPenalizesJumpBeyondExpectedDelta) {
+    // Same pair but velocity says we should have moved 2.0 m while we only
+    // moved 1.0 m — expect a 1.0 m residual on x scaled by weight.
+    const double pose_i[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const double pose_j[7] = {-1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    double residuals[3] = {0.0, 0.0, 0.0};
+
+    VelocityDeltaPriorError error(Vec3(1.0, 0.0, 0.0), 2.0, /*weight=*/5.0);
+    ASSERT_TRUE(error(pose_i, pose_j, residuals));
+    EXPECT_NEAR(residuals[0], 5.0 * (1.0 - 2.0), 1e-9);
+    EXPECT_NEAR(residuals[1], 0.0, 1e-9);
+    EXPECT_NEAR(residuals[2], 0.0, 1e-9);
+}
+
 TEST(OptimizerTest, GravityPriorCostPenalizesTiltError) {
     const double identity_pose[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
     double residuals[3] = {0.0, 0.0, 0.0};
