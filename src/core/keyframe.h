@@ -18,6 +18,13 @@ public:
     
     SE3 T_cw_;
 
+    // VIO state (scaffolding for Stage 0b). Copied from the source Frame at
+    // ctor time; future preintegration may update these during local BA.
+    Vec3 velocity_ = Vec3::Zero();
+    Vec3 accel_bias_ = Vec3::Zero();
+    Vec3 gyro_bias_ = Vec3::Zero();
+    bool has_velocity_ = false;
+
     // Depth image (copied from Frame)
     cv::Mat depth_image_;
     bool depth_is_metric_ = true;

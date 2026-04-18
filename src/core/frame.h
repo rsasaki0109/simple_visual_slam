@@ -27,7 +27,16 @@ public:
     
     // Pose: T_world_camera (Camera to World) or T_cw (World to Camera)
     // Let's use T_cw (World -> Camera) as is common in ORB-SLAM
-    SE3 T_cw_; 
+    SE3 T_cw_;
+
+    // VIO state (scaffolding for Stage 0b preintegration; not yet used in BA).
+    // velocity_ is in the world frame (m/s). accel_bias_ / gyro_bias_ are
+    // IMU biases in the sensor frame (m/s^2, rad/s). has_velocity_ is set
+    // once the tracking pipeline produces a usable velocity estimate.
+    Vec3 velocity_ = Vec3::Zero();
+    Vec3 accel_bias_ = Vec3::Zero();
+    Vec3 gyro_bias_ = Vec3::Zero();
+    bool has_velocity_ = false;
 
     // Depth image (CV_16UC1 in mm for sensor depth, or CV_32FC1 in meters for DL depth)
     cv::Mat depth_image_;
