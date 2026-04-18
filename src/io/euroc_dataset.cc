@@ -170,6 +170,15 @@ EurocDataset::EurocDataset(const std::string& seq_dir,
         error_ = stereo_enabled_ ? "no stereo entries in data.csv" : "no entries in data.csv";
         return;
     }
+
+    // IMU is optional — only fail on parse error, not on missing file.
+    const std::string imu_csv =
+        (std::filesystem::path(seq_dir_) / "mav0" / "imu0" / "data.csv").string();
+    if (std::filesystem::exists(imu_csv)) {
+        if (!loadImuCsv(imu_csv)) {
+            return;
+        }
+    }
 }
 
 bool EurocDataset::isValid() const { return error_.empty(); }
@@ -334,6 +343,68 @@ bool EurocDataset::loadDataCsv(const std::string& data_csv_path,
     }
 
     return true;
+}
+
+bool EurocDataset::loadImuCsv(const std::string& imu_csv_path) {
+    std::ifstream ifs(imu_csv_path);
+    if (!ifs.is_open()) {
+        error_ = "failed to open imu0 data.csv: " + imu_csv_path;
+        return false;
+    }
+
+    imu_entries_.clear();
+    std::string line;
+    bool first = true;
+    while (std::getline(ifs, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        if (line[0] == '#') continue;
+        if (first) {
+            first = false;
+            if (line.find("timestamp") != std::string::npos) continue;
+        }
+
+        std::stringstream ss(line);
+        std::string field;
+        std::vector<std::string> fields;
+        while (std::getline(ss, field, ',')) {
+            fields.push_back(trim(field));
+        }
+        // Expect: ts_ns, wx, wy, wz, ax, ay, az
+        if (fields.size() < 7) continue;
+
+        try {
+            const long long ts_ns = std::stoll(fields[0]);
+            ImuEntry e;
+            e.timestamp_sec = static_cast<double>(ts_ns) * 1e-9;
+            e.gyro  = Vec3(std::stod(fields[1]), std::stod(fields[2]), std::stod(fields[3]));
+            e.accel = Vec3(std::stod(fields[4]), std::stod(fields[5]), std::stod(fields[6]));
+            imu_entries_.push_back(e);
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+
+    std::sort(imu_entries_.begin(), imu_entries_.end(),
+              [](const ImuEntry& a, const ImuEntry& b) {
+                  return a.timestamp_sec < b.timestamp_sec;
+              });
+    return true;
+}
+
+std::vector<ImuEntry> EurocDataset::getImuBetween(double t0, double t1) const {
+    std::vector<ImuEntry> out;
+    if (imu_entries_.empty() || !(t1 > t0)) {
+        return out;
+    }
+    // Binary search for first sample with timestamp > t0.
+    auto lo = std::upper_bound(
+        imu_entries_.begin(), imu_entries_.end(), t0,
+        [](double v, const ImuEntry& e) { return v < e.timestamp_sec; });
+    for (auto it = lo; it != imu_entries_.end() && it->timestamp_sec <= t1; ++it) {
+        out.push_back(*it);
+    }
+    return out;
 }
 
 bool EurocDataset::buildStereoEntries(const std::vector<CsvEntry>& left_entries,

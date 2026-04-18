@@ -122,3 +122,64 @@ TEST(EurocDatasetTest, LoadsStereoImagePairs) {
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
 }
+
+TEST(EurocDatasetTest, LoadsImuDataWhenPresent) {
+    const auto root = make_temp_path("");
+    const auto cam0_data_dir = root / "mav0" / "cam0" / "data";
+    const auto imu_dir = root / "mav0" / "imu0";
+    std::filesystem::create_directories(cam0_data_dir);
+    std::filesystem::create_directories(imu_dir);
+
+    write_text_file(root / "mav0" / "cam0" / "sensor.yaml",
+                    "intrinsics: [50.0, 50.0, 4.0, 3.0]\n"
+                    "resolution: [8, 6]\n");
+    write_text_file(root / "mav0" / "cam0" / "data.csv",
+                    "#timestamp [ns],filename\n"
+                    "1000000000,1000000000.png\n");
+    write_gray_png(cam0_data_dir / "1000000000.png", 8, 6, 17);
+
+    write_text_file(imu_dir / "data.csv",
+                    "#timestamp [ns],w_x,w_y,w_z,a_x,a_y,a_z\n"
+                    "500000000,0.1,0.2,0.3,1.0,2.0,9.81\n"
+                    "1500000000,0.11,0.21,0.31,1.01,2.01,9.82\n"
+                    "2500000000,0.12,0.22,0.32,1.02,2.02,9.83\n");
+
+    EurocDataset dataset(root.string());
+    ASSERT_TRUE(dataset.isValid()) << dataset.error();
+    ASSERT_TRUE(dataset.hasImu());
+    ASSERT_EQ(dataset.allImu().size(), 3u);
+
+    const auto& first = dataset.allImu().front();
+    EXPECT_DOUBLE_EQ(first.timestamp_sec, 0.5);
+    EXPECT_DOUBLE_EQ(first.gyro.x(), 0.1);
+    EXPECT_DOUBLE_EQ(first.accel.z(), 9.81);
+
+    const auto between = dataset.getImuBetween(1.0, 2.0);
+    ASSERT_EQ(between.size(), 1u);
+    EXPECT_DOUBLE_EQ(between.front().timestamp_sec, 1.5);
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST(EurocDatasetTest, SilentlySkipsMissingImu) {
+    const auto root = make_temp_path("");
+    const auto cam0_data_dir = root / "mav0" / "cam0" / "data";
+    std::filesystem::create_directories(cam0_data_dir);
+
+    write_text_file(root / "mav0" / "cam0" / "sensor.yaml",
+                    "intrinsics: [50.0, 50.0, 4.0, 3.0]\n"
+                    "resolution: [8, 6]\n");
+    write_text_file(root / "mav0" / "cam0" / "data.csv",
+                    "#timestamp [ns],filename\n"
+                    "1000000000,1000000000.png\n");
+    write_gray_png(cam0_data_dir / "1000000000.png", 8, 6, 17);
+
+    EurocDataset dataset(root.string());
+    ASSERT_TRUE(dataset.isValid()) << dataset.error();
+    EXPECT_FALSE(dataset.hasImu());
+    EXPECT_TRUE(dataset.allImu().empty());
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
