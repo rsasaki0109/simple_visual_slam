@@ -266,6 +266,7 @@ if(BUILD_TESTS)
         tests/test_tum_pinhole_calibration.cc
         tests/test_tracking_pose_recompute.cc
         tests/test_tracking_run_statistics.cc
+        tests/test_imu_preintegrator.cc
     )
     if(USE_DEPTH_DL)
         target_sources(svslam_tests PRIVATE tests/test_metric_depth_estimator.cc)
