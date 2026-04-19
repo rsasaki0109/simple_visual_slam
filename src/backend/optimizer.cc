@@ -623,6 +623,19 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         const double velocity_weight = 1.0 / velocity_sigma_m;
         const double preint_pos_weight = 1.0 / velocity_sigma_m;
         const double preint_vel_weight = 1.0 / velocity_vel_sigma;
+        // Rotation residual sigma in radians. Default ~0.05 rad (~3°) over a
+        // KF-gap is within a gyro-only prediction's short-interval noise.
+        // Tuneable via env; <=0 disables the rotation residual only.
+        double rot_sigma_rad = 0.05;
+        if (const char* env = std::getenv("SVSLAM_BA_PREINT_ROT_SIGMA_RAD")) {
+            char* end = nullptr;
+            const double parsed = std::strtod(env, &end);
+            if (end != env && std::isfinite(parsed)) {
+                rot_sigma_rad = parsed;
+            }
+        }
+        const double preint_rot_weight =
+            (rot_sigma_rad > 0.0) ? 1.0 / rot_sigma_rad : 0.0;
         const Vec3 gravity_w(0.0, 0.0, -9.81);
 
         for (std::size_t i = 0; i + 1 < ordered_keyframes.size(); ++i) {
@@ -670,16 +683,20 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
                 }
 
                 const SE3& T_cb = kf_j->prev_imu_span_->T_cam_imu;
+                const Eigen::Quaterniond delta_R_q =
+                    kf_j->prev_imu_span_->delta_R.unit_quaternion();
                 ceres::CostFunction* cost = VelocityPreintegrationError::Create(
                     kf_j->prev_imu_span_->delta_p,
                     kf_j->prev_imu_span_->delta_v,
+                    delta_R_q,
                     kf_j->prev_imu_span_->bias_accel,
                     kf_j->prev_imu_span_->dt,
                     gravity_w,
                     T_cb.unit_quaternion(),
                     T_cb.translation(),
                     preint_pos_weight,
-                    preint_vel_weight);
+                    preint_vel_weight,
+                    preint_rot_weight);
                 problem.AddResidualBlock(cost, new ceres::HuberLoss(0.5),
                                          it_i->second, it_j->second,
                                          v_i_param, v_j_param,

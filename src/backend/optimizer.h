@@ -59,25 +59,36 @@ struct DepthPriorError {
 //   J_v_ba = -dt * I
 // Gyro-bias effects on delta_p/delta_v are dropped (they require rotation
 // Jacobians); the gyro bias is instead shaped by anchor and random-walk
-// priors. Rotation alignment between camera and IMU is approximated as
-// identity for scaffolding.
+// priors. Rotation is coupled by a 3-DoF residual on the log of the
+// rotation error between the predicted q_wb_j and the observed one, so
+// the full residual has 9 dimensions (pos + vel + rot).
 struct VelocityPreintegrationError {
     VelocityPreintegrationError(const Vec3& delta_p,
                                 const Vec3& delta_v,
+                                const Eigen::Quaterniond& delta_R,
                                 const Vec3& bias_accel_ref,
                                 double dt,
                                 const Vec3& gravity_w,
                                 const Eigen::Quaterniond& q_cam_imu,
                                 const Vec3& t_cam_imu,
                                 double pos_weight,
-                                double vel_weight)
-        : dt_(dt), pos_weight_(pos_weight), vel_weight_(vel_weight) {
+                                double vel_weight,
+                                double rot_weight)
+        : dt_(dt),
+          pos_weight_(pos_weight),
+          vel_weight_(vel_weight),
+          rot_weight_(rot_weight) {
         dp_[0] = delta_p.x(); dp_[1] = delta_p.y(); dp_[2] = delta_p.z();
         dv_[0] = delta_v.x(); dv_[1] = delta_v.y(); dv_[2] = delta_v.z();
         g_[0] = gravity_w.x(); g_[1] = gravity_w.y(); g_[2] = gravity_w.z();
         ba_ref_[0] = bias_accel_ref.x();
         ba_ref_[1] = bias_accel_ref.y();
         ba_ref_[2] = bias_accel_ref.z();
+        const Eigen::Quaterniond dR = delta_R.normalized();
+        q_dR_[0] = dR.w();
+        q_dR_[1] = dR.x();
+        q_dR_[2] = dR.y();
+        q_dR_[3] = dR.z();
         // T_cam_imu rotation: q_cb s.t. p_cam = q_cb * p_body. For the
         // preintegration residual we need q_wb = q_wc * q_cb, which is the
         // body's world rotation — body-frame deltas then rotate into world
@@ -171,22 +182,42 @@ struct VelocityPreintegrationError {
                        (vel_j[1] - vel_i[1] - T(g_[1]) * dt - R_dv[1]);
         residuals[5] = T(vel_weight_) *
                        (vel_j[2] - vel_i[2] - T(g_[2]) * dt - R_dv[2]);
+
+        // Rotation residual: q_wb_j_pred = q_wb_i * delta_R; compare to q_wb_j.
+        // error = q_wb_j_pred_inv * q_wb_j. For small errors, 2 * vector part
+        // ≈ log(error) (the so(3) tangent vector). No gyro-bias correction is
+        // applied yet; gyro bias stays under anchor + random-walk priors only.
+        const T q_dR[4] = {T(q_dR_[0]), T(q_dR_[1]), T(q_dR_[2]), T(q_dR_[3])};
+        T q_wb_j_pred[4];
+        ceres::QuaternionProduct(q_wb_i, q_dR, q_wb_j_pred);
+        const T q_pred_inv[4] = {q_wb_j_pred[0], -q_wb_j_pred[1],
+                                 -q_wb_j_pred[2], -q_wb_j_pred[3]};
+        T q_err[4];
+        ceres::QuaternionProduct(q_pred_inv, q_wb_j, q_err);
+        // Keep the linearized form so a perfect match gives exactly zero
+        // (the first-order expansion coincides with log for small errors).
+        residuals[6] = T(rot_weight_) * T(2.0) * q_err[1];
+        residuals[7] = T(rot_weight_) * T(2.0) * q_err[2];
+        residuals[8] = T(rot_weight_) * T(2.0) * q_err[3];
         return true;
     }
 
     static ceres::CostFunction* Create(const Vec3& delta_p,
                                        const Vec3& delta_v,
+                                       const Eigen::Quaterniond& delta_R,
                                        const Vec3& bias_accel_ref,
                                        double dt,
                                        const Vec3& gravity_w,
                                        const Eigen::Quaterniond& q_cam_imu,
                                        const Vec3& t_cam_imu,
                                        double pos_weight,
-                                       double vel_weight) {
-        return new ceres::AutoDiffCostFunction<VelocityPreintegrationError, 6, 7, 7, 3, 3, 3>(
-            new VelocityPreintegrationError(delta_p, delta_v, bias_accel_ref, dt,
+                                       double vel_weight,
+                                       double rot_weight) {
+        return new ceres::AutoDiffCostFunction<VelocityPreintegrationError, 9, 7, 7, 3, 3, 3>(
+            new VelocityPreintegrationError(delta_p, delta_v, delta_R,
+                                            bias_accel_ref, dt,
                                             gravity_w, q_cam_imu, t_cam_imu,
-                                            pos_weight, vel_weight));
+                                            pos_weight, vel_weight, rot_weight));
     }
 
     double dp_[3];
@@ -194,10 +225,12 @@ struct VelocityPreintegrationError {
     double g_[3];
     double ba_ref_[3];
     double q_cb_[4];  // w, x, y, z
+    double q_dR_[4];  // w, x, y, z (body-frame preintegrated rotation)
     double t_bc_[3];
     double dt_;
     double pos_weight_;
     double vel_weight_;
+    double rot_weight_;
 };
 
 // Zero-anchor prior on an IMU bias (accel or gyro). Keeps the bias near

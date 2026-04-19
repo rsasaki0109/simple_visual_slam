@@ -139,15 +139,16 @@ TEST(OptimizerTest, VelocityPreintegrationResidualZeroWhenPredictionMatches) {
     const double vel_i[3] = {0.0, 0.0, 0.0};
     const double vel_j[3] = {2.0, 0.0, 0.0};
     const double ba_i[3] = {0.0, 0.0, 0.0};  // equal to ba_ref → no correction
-    double residuals[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double residuals[9] = {0.0};
 
     VelocityPreintegrationError error(
         Vec3(1.0, 0.0, 0.0), Vec3(2.0, 0.0, 0.0),
+        Eigen::Quaterniond::Identity(),
         Vec3::Zero(), 1.0, Vec3::Zero(),
         Eigen::Quaterniond::Identity(), Vec3::Zero(),
-        /*pos_weight=*/10.0, /*vel_weight=*/5.0);
+        /*pos_weight=*/10.0, /*vel_weight=*/5.0, /*rot_weight=*/4.0);
     ASSERT_TRUE(error(pose_i, pose_j, vel_i, vel_j, ba_i, residuals));
-    for (int k = 0; k < 6; ++k) {
+    for (int k = 0; k < 9; ++k) {
         EXPECT_NEAR(residuals[k], 0.0, 1e-9) << "residual[" << k << "]";
     }
 }
@@ -161,15 +162,21 @@ TEST(OptimizerTest, VelocityPreintegrationResidualAccountsForGravity) {
     const double vel_i[3] = {0.0, 0.0, 0.0};
     const double vel_j[3] = {0.0, 0.0, 0.0};
     const double ba_i[3] = {0.0, 0.0, 0.0};
-    double residuals[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double residuals[9] = {0.0};
 
     VelocityPreintegrationError error(
-        Vec3::Zero(), Vec3::Zero(), Vec3::Zero(), 1.0,
+        Vec3::Zero(), Vec3::Zero(),
+        Eigen::Quaterniond::Identity(),
+        Vec3::Zero(), 1.0,
         Vec3(0.0, 0.0, -9.81), Eigen::Quaterniond::Identity(), Vec3::Zero(),
-        /*pos_weight=*/1.0, /*vel_weight=*/1.0);
+        /*pos_weight=*/1.0, /*vel_weight=*/1.0, /*rot_weight=*/1.0);
     ASSERT_TRUE(error(pose_i, pose_j, vel_i, vel_j, ba_i, residuals));
     EXPECT_NEAR(residuals[2], 4.905, 1e-6);
     EXPECT_NEAR(residuals[5], 9.81, 1e-6);
+    // No rotation motion, identity delta_R → rotation residuals are zero.
+    EXPECT_NEAR(residuals[6], 0.0, 1e-9);
+    EXPECT_NEAR(residuals[7], 0.0, 1e-9);
+    EXPECT_NEAR(residuals[8], 0.0, 1e-9);
 }
 
 TEST(OptimizerTest, VelocityPreintegrationBiasAppliesFirstOrderCorrection) {
@@ -182,13 +189,15 @@ TEST(OptimizerTest, VelocityPreintegrationBiasAppliesFirstOrderCorrection) {
     const double vel_i[3] = {0.0, 0.0, 0.0};
     const double vel_j[3] = {0.0, 0.0, 0.0};
     const double ba_i[3] = {0.1, 0.0, 0.0};
-    double residuals[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double residuals[9] = {0.0};
 
     // Pre-integration stored deltas assuming bias = 0; no gravity.
     VelocityPreintegrationError error(
-        Vec3::Zero(), Vec3::Zero(), Vec3::Zero(), /*dt=*/2.0,
+        Vec3::Zero(), Vec3::Zero(),
+        Eigen::Quaterniond::Identity(),
+        Vec3::Zero(), /*dt=*/2.0,
         Vec3::Zero(), Eigen::Quaterniond::Identity(), Vec3::Zero(),
-        /*pos_weight=*/1.0, /*vel_weight=*/1.0);
+        /*pos_weight=*/1.0, /*vel_weight=*/1.0, /*rot_weight=*/1.0);
     ASSERT_TRUE(error(pose_i, pose_j, vel_i, vel_j, ba_i, residuals));
     // With positions fixed at origin the residual is -(−R*dp_corr) = R*dp_corr.
     // R=I here, dp_corr = dp - 0.5*dba*dt^2 = -0.5 * 0.1 * 4 = -0.2 on x.
@@ -197,6 +206,72 @@ TEST(OptimizerTest, VelocityPreintegrationBiasAppliesFirstOrderCorrection) {
     // residual_vel_x = (v_j-v_i) - 0 - R*dv_corr. dv_corr = 0 - 0.1*2 = -0.2.
     // residual_vel_x = 0 - (-0.2) = 0.2.
     EXPECT_NEAR(residuals[3], 0.2, 1e-9);
+}
+
+TEST(OptimizerTest, VelocityPreintegrationResidualZeroWhenRotationMatches) {
+    // Both KFs at the world origin. KF_j is rotated 30° about Z vs KF_i. The
+    // preintegrated delta_R encodes the same 30° rotation, so the rotation
+    // residual should be zero. Position + velocity residuals are set up to
+    // match as well (no motion, no gravity, zero bias).
+    const double pose_i[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const Eigen::Quaterniond q_wb_j(
+        Eigen::AngleAxisd(30.0 * M_PI / 180.0, Eigen::Vector3d::UnitZ()));
+    // pose_j stores T_cw_j, and we want R_wb_j = q_wb_j with T_cam_imu = I
+    // (so q_wb == q_wc). Thus q_cw_j = q_wc_j^T = q_wb_j^T.
+    const Eigen::Quaterniond q_cw_j = q_wb_j.conjugate();
+    const double pose_j[7] = {0.0, 0.0, 0.0,
+                              q_cw_j.w(), q_cw_j.x(), q_cw_j.y(), q_cw_j.z()};
+    const double vel_i[3] = {0.0, 0.0, 0.0};
+    const double vel_j[3] = {0.0, 0.0, 0.0};
+    const double ba_i[3] = {0.0, 0.0, 0.0};
+    double residuals[9] = {0.0};
+
+    VelocityPreintegrationError error(
+        Vec3::Zero(), Vec3::Zero(),
+        q_wb_j,  // delta_R matches the rotation from i to j
+        Vec3::Zero(), /*dt=*/1.0, Vec3::Zero(),
+        Eigen::Quaterniond::Identity(), Vec3::Zero(),
+        /*pos_weight=*/1.0, /*vel_weight=*/1.0, /*rot_weight=*/10.0);
+    ASSERT_TRUE(error(pose_i, pose_j, vel_i, vel_j, ba_i, residuals));
+    for (int k = 0; k < 9; ++k) {
+        EXPECT_NEAR(residuals[k], 0.0, 1e-9) << "residual[" << k << "]";
+    }
+}
+
+TEST(OptimizerTest, VelocityPreintegrationResidualPenalizesRotationMismatch) {
+    // Predicted 30° rotation but actual is 40° — residual should fire with
+    // magnitude ≈ weight * 10° in radians = weight * 0.1745.
+    const double pose_i[7] = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    const Eigen::Quaterniond q_actual(
+        Eigen::AngleAxisd(40.0 * M_PI / 180.0, Eigen::Vector3d::UnitZ()));
+    const Eigen::Quaterniond q_predicted(
+        Eigen::AngleAxisd(30.0 * M_PI / 180.0, Eigen::Vector3d::UnitZ()));
+    const Eigen::Quaterniond q_cw_j = q_actual.conjugate();
+    const double pose_j[7] = {0.0, 0.0, 0.0,
+                              q_cw_j.w(), q_cw_j.x(), q_cw_j.y(), q_cw_j.z()};
+    const double vel_i[3] = {0.0, 0.0, 0.0};
+    const double vel_j[3] = {0.0, 0.0, 0.0};
+    const double ba_i[3] = {0.0, 0.0, 0.0};
+    double residuals[9] = {0.0};
+
+    const double rot_weight = 5.0;
+    VelocityPreintegrationError error(
+        Vec3::Zero(), Vec3::Zero(),
+        q_predicted,
+        Vec3::Zero(), /*dt=*/1.0, Vec3::Zero(),
+        Eigen::Quaterniond::Identity(), Vec3::Zero(),
+        /*pos_weight=*/1.0, /*vel_weight=*/1.0, rot_weight);
+    ASSERT_TRUE(error(pose_i, pose_j, vel_i, vel_j, ba_i, residuals));
+    // pos and vel components are unaffected by the rotation mismatch here.
+    for (int k = 0; k < 6; ++k) {
+        EXPECT_NEAR(residuals[k], 0.0, 1e-6);
+    }
+    // The error rotation is 10° about Z; its log (half-angle sin) gives
+    // 2 * sin(5°) ≈ 0.1745 on the z residual (x, y stay 0).
+    EXPECT_NEAR(residuals[6], 0.0, 1e-6);
+    EXPECT_NEAR(residuals[7], 0.0, 1e-6);
+    EXPECT_NEAR(residuals[8],
+                rot_weight * 2.0 * std::sin(5.0 * M_PI / 180.0), 1e-6);
 }
 
 TEST(OptimizerTest, BiasAnchorErrorPenalizesNonZeroBias) {
