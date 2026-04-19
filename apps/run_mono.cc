@@ -19,6 +19,7 @@
 #include "io/tum_dataset.h"
 #include "io/tum_pinhole_calibration.h"
 #include "io/map_io.h"
+#include "backend/optimizer.h"
 #include "core/heuristic_reference_keyframe_policy.h"
 #include "tracking/tracking.h"
 #include "backend/local_mapping.h"
@@ -427,6 +428,18 @@ int main(int argc, char** argv) {
             }
             if (euroc.hasCam0FromImuExtrinsic()) {
                 tracker->setImuToCameraExtrinsic(euroc.cam0FromImuExtrinsic());
+            }
+            // VIO Stage 0c.e: keep the IMU preintegration residual on by
+            // default so sequences where VI init rejects (e.g. MH_01 with
+            // noisy early-mono rotations) still benefit from the 9-DoF
+            // residual + BA bias blocks — the regression we feared from
+            // "preint on with bias=0" never materialises on MH/V1 runs in
+            // practice (loose anchor + RW priors soak up the initial
+            // mis-estimate). Set SVSLAM_VIO_GATE_PREINT=1 to opt back in to
+            // gating preint until VI init succeeds (useful when diagnosing
+            // scale-sensitive sequences).
+            if (std::getenv("SVSLAM_VIO_GATE_PREINT")) {
+                Optimizer::setPreintegrationResidualEnabled(false);
             }
             std::cout << "IMU integration: ENABLED (accel+gyro, "
                       << tracker->imu_buffer_.size() << " samples)" << std::endl;

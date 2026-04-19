@@ -10,6 +10,7 @@
 #include "core/map.h"
 #include "core/reference_keyframe_policy.h"
 #include "tracking/initializer.h"
+#include "tracking/visual_inertial_initializer.h"
 #include "backend/local_mapping.h"
 #include "io/tum_dataset.h"
 #include "sensors/imu.h"
@@ -109,6 +110,11 @@ public:
         has_cam_imu_extrinsic_ = true;
     }
 
+    // Snapshot of the VI init state for monitoring / automation.
+    bool visualInertialInitCompleted() const { return vi_init_done_; }
+    double visualInertialInitScale() const { return vi_init_scale_; }
+    const Vec3& visualInertialInitGravity() const { return vi_init_gravity_w_; }
+
 private:
     struct RecoveryState {
         int lost_frame_count = 0;
@@ -155,6 +161,13 @@ private:
     // attach the resulting span to kf->prev_imu_span_ for BA consumption.
     void populateKeyframeImuSpan(const std::shared_ptr<Keyframe>& kf,
                                  const std::shared_ptr<Keyframe>& prev_kf);
+    // Try to bootstrap the VIO estimate (scale, gravity, biases, velocities)
+    // by running VisualInertialInitializer on the first N KFs. On success
+    // the map is re-scaled + rotated so gravity aligns with world Z-up,
+    // biases and velocities are written back to the KFs, and
+    // vi_init_done_ flips to true so the BA preintegration residual is
+    // unblocked. No-op on TUM / datasets without an IMU stream.
+    void tryVisualInertialInit();
     static std::size_t countValidFrameLandmarks(const Frame::Ptr& frame);
 
     cv::Ptr<cv::DescriptorMatcher> matcher_;
@@ -179,6 +192,17 @@ private:
     static constexpr int reinit_trigger_frames_ = 20;  // Start re-init after this many lost frames
 
     TrackingRunStatistics run_stats_;
+
+    // Visual-Inertial Initialization (VIO Stage 0c.e). Once complete, the
+    // map is in metric scale with gravity along world -Z, per-KF biases +
+    // velocities are seeded, and downstream BA can tightly couple the
+    // preintegration residual. Before completion, BA should suppress the
+    // preintegration residual and fall back to the loose velocity prior.
+    bool vi_init_done_ = false;
+    int vi_init_attempts_ = 0;
+    double vi_init_scale_ = 1.0;
+    Vec3 vi_init_gravity_w_ = Vec3(0.0, 0.0, -9.81);
+    static int readVioMinInitKeyframes();
 };
 
 }

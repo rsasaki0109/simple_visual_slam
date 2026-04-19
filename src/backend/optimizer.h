@@ -367,6 +367,19 @@ struct GravityPriorError {
 
 class Optimizer {
 public:
+    // Gate for the IMU preintegration residual in local BA. Set to true by
+    // Tracking once Visual-Inertial Initialization has estimated scale /
+    // gravity / biases / velocities; before that point BA falls back to
+    // the loose VelocityDeltaPriorError, because the preintegration
+    // residual built on uncalibrated biases can destabilize the solve on
+    // short / rotation-heavy sequences (e.g. EuRoC V1_01).
+    //
+    // The flag is a static toggle rather than a parameter so the existing
+    // Optimizer::bundleAdjustment call sites don't need plumbing changes.
+    // Thread-safety: set once on the tracking thread, read from BA on the
+    // local-mapping thread — a relaxed atomic is enough.
+    static void setPreintegrationResidualEnabled(bool on);
+    static bool preintegrationResidualEnabled();
     struct PoseGraphEdge {
         Keyframe::Ptr from;
         Keyframe::Ptr to;

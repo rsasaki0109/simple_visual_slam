@@ -5,12 +5,31 @@
 #include <ceres/product_manifold.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <set>
 #include <vector>
 
 namespace svslam {
+
+namespace {
+
+// Gate shared with Tracking. Default true matches the Stage 0c behaviour
+// (preintegration residual always on) so datasets that do VI init still
+// see identical results, while Tracking can opt out for the pre-init
+// window by calling setPreintegrationResidualEnabled(false).
+std::atomic<bool> g_preintegration_residual_enabled{true};
+
+}  // namespace
+
+void Optimizer::setPreintegrationResidualEnabled(bool on) {
+    g_preintegration_residual_enabled.store(on, std::memory_order_relaxed);
+}
+
+bool Optimizer::preintegrationResidualEnabled() {
+    return g_preintegration_residual_enabled.load(std::memory_order_relaxed);
+}
 
 namespace {
 
@@ -660,7 +679,8 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
                                  kf_j->prev_imu_span_->from_kf_id == kf_i->id_ &&
                                  kf_j->prev_imu_span_->dt > 0.0 &&
                                  std::abs(kf_j->prev_imu_span_->dt - dt_pair) < 0.25 * dt_pair + 1e-3 &&
-                                 kf_j->has_velocity_ && kf_j->velocity_.allFinite();
+                                 kf_j->has_velocity_ && kf_j->velocity_.allFinite() &&
+                                 g_preintegration_residual_enabled.load(std::memory_order_relaxed);
 
             if (span_ok) {
                 double* v_i_param = addVelocityBlock(kf_i);

@@ -15,6 +15,7 @@
 #include "core/landmark.h"
 #include "sensors/accelerometer.h"
 #include "sensors/imu_preintegrator.h"
+#include "backend/optimizer.h"
 
 namespace svslam {
 
@@ -855,6 +856,11 @@ bool Tracking::track() {
         }
 
         loop_correction_state_.force_keyframe_insertion_once = false;
+
+        // After each new KF, try to bootstrap VI init. Once it succeeds
+        // the call is a no-op and the BA preintegration residual becomes
+        // active (see gating in backend/optimizer.cc).
+        tryVisualInertialInit();
     }
 
     return state_ == TrackingState::OK;
@@ -2795,6 +2801,249 @@ void Tracking::reconcileVelocityWithVisual() {
         current_frame_->velocity_ = v_visual;
         current_frame_->has_velocity_ = true;
     }
+}
+
+int Tracking::readVioMinInitKeyframes() {
+    // Env knob to control when Tracking attempts VI init. Default matches
+    // the ORB-SLAM3 "first ~1–2 s of KFs" heuristic and leaves enough
+    // dynamics for the linear solve to stay well-conditioned.
+    int min_kfs = 15;
+    if (const char* env = std::getenv("SVSLAM_VIO_MIN_INIT_KEYFRAMES")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end != env && parsed >= 4 && parsed <= 500) {
+            min_kfs = static_cast<int>(parsed);
+        }
+    }
+    return min_kfs;
+}
+
+void Tracking::tryVisualInertialInit() {
+    if (vi_init_done_) return;
+    if (!map_) return;
+    if (imu_buffer_.empty()) return;  // TUM / non-IMU runs: hard no-op
+
+    const int min_kfs = readVioMinInitKeyframes();
+
+    // Collect keyframes in temporal order. We intentionally ignore the
+    // re-init edge cases (their KFs get published in a fresh window) and
+    // only proceed when the raw KF count has reached the threshold.
+    std::vector<Keyframe::Ptr> ordered;
+    {
+        // Snapshot under the map mutex; the main path already holds it
+        // briefly elsewhere. Local BA runs on its own thread and may mutate
+        // kf->T_cw_ during this snapshot, but SE3 copies are safe (trivial
+        // Eigen types) and we only need a stable *view* for the solve.
+        const auto& kfs = map_->getAllKeyframes();
+        ordered.reserve(kfs.size());
+        for (const auto& kv : kfs) {
+            if (kv.second) ordered.push_back(kv.second);
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const Keyframe::Ptr& a, const Keyframe::Ptr& b) {
+                  return a->id_ < b->id_;
+              });
+
+    if (static_cast<int>(ordered.size()) < min_kfs) return;
+
+    // The first one or two KFs in a mono session come from the Initializer
+    // and don't carry a preintegration span (there's no predecessor at
+    // map bootstrap). Skip them so the window starts from the first KF
+    // that DOES have a span whose from_kf_id matches its predecessor.
+    std::size_t window_start = 0;
+    for (std::size_t i = 1; i < ordered.size(); ++i) {
+        const auto& span = ordered[i]->prev_imu_span_;
+        if (!span || !span->valid) continue;
+        if (span->from_kf_id != ordered[i - 1]->id_) continue;
+        window_start = i - 1;
+        break;
+    }
+
+    if (window_start + static_cast<std::size_t>(min_kfs) > ordered.size()) {
+        // not yet enough usable KFs
+        return;
+    }
+
+    std::vector<Keyframe::Ptr> window(ordered.begin() + window_start,
+                                      ordered.begin() + window_start + min_kfs);
+
+    // Every KF past the first one in the window must have a valid span
+    // linked to its immediate predecessor; skip the attempt otherwise.
+    for (std::size_t i = 1; i < window.size(); ++i) {
+        const auto& span = window[i]->prev_imu_span_;
+        if (!span || !span->valid) return;
+        if (span->from_kf_id != window[i - 1]->id_) return;
+    }
+    ordered = std::move(window);
+
+    ++vi_init_attempts_;
+    VisualInertialInitializer::Options opts;
+    // EuRoC mono: initializer ran a 1 / median_depth rescale during
+    // bootstrap, so the map scale is unitless. RGB-D / stereo runs would
+    // already be metric and should set metric_scale=true — but for the
+    // current Stage 0c.e scope only the mono+IMU path reaches here.
+    opts.metric_scale = false;
+    // The existing accel-alignment at init time doesn't set the world
+    // frame up strictly-z-up (see the bug noted in
+    // visual_inertial_initializer.cc): let the LSQ solve for gravity in
+    // the post-init world frame, then we'll rotate so gravity ends up
+    // along world -Z.
+    opts.assume_gravity_w = Vec3::Zero();
+    VisualInertialInitializer vi(opts);
+    const auto result = vi.initialize(ordered);
+
+    if (!result.converged) {
+        if (vi_init_attempts_ <= 3 ||
+            (vi_init_attempts_ % 5) == 0) {
+            std::cout << "Tracking: VI init not converged (attempt "
+                      << vi_init_attempts_ << "): " << result.message
+                      << " scale=" << result.scale
+                      << " rot_rms=" << result.rotation_residual_rms
+                      << " lin_rms=" << result.linear_residual_rms
+                      << std::endl;
+        }
+        return;
+    }
+
+    // Compute the 3×3 rotation R_wn_w that maps the current visual world
+    // frame into the VI-calibrated world frame (gravity → (0,0,-9.81)).
+    // Using the cross-product form keeps it numerically stable when the
+    // two vectors are close to parallel.
+    const Vec3 g_target(0.0, 0.0, -opts.gravity_magnitude);
+    const Vec3 g_est_unit = result.gravity_w.normalized();
+    const Vec3 g_tgt_unit = g_target.normalized();
+    const Vec3 cross = g_est_unit.cross(g_tgt_unit);
+    const double dot = g_est_unit.dot(g_tgt_unit);
+    Eigen::Matrix3d R_wn_w = Eigen::Matrix3d::Identity();
+    if (cross.norm() > 1e-8) {
+        Eigen::Matrix3d K;
+        K << 0.0, -cross.z(), cross.y(),
+             cross.z(), 0.0, -cross.x(),
+             -cross.y(), cross.x(), 0.0;
+        const double s = cross.norm();
+        R_wn_w = Eigen::Matrix3d::Identity() + K + K * K * ((1.0 - dot) / (s * s));
+    } else if (dot < 0.0) {
+        // Anti-parallel: flip about any axis orthogonal to g_est_unit.
+        Eigen::Vector3d axis = g_est_unit.unitOrthogonal();
+        R_wn_w = Eigen::AngleAxisd(M_PI, axis).toRotationMatrix();
+    }
+
+    const Sophus::SO3d R_wn_w_so3(Eigen::Quaterniond(R_wn_w).normalized());
+    const SE3 T_wn_w(R_wn_w_so3, Vec3::Zero());
+
+    const double s = result.scale;
+    if (!(std::isfinite(s) && s > 0.0)) {
+        std::cout << "Tracking: VI init returned invalid scale, skipping" << std::endl;
+        return;
+    }
+
+    // Rescale + rotate every KF pose and every landmark in the map.
+    // We rewrite the entire map (local BA may have already injected
+    // corrections for early KFs, but rotate+scale commutes with BA — we
+    // just apply the transform consistently). This block must run BEFORE
+    // the preintegration residual is enabled so the gravity vector we
+    // plug into VelocityPreintegrationError matches the new frame.
+    //
+    // Re-use the loop_correcting_ flag so the LocalMapping thread skips
+    // its BA step while we rewrite the map. The flag is checked inside
+    // LocalMapping::processPendingWork() (see backend/local_mapping.cc).
+    map_->loop_correcting_.store(true);
+    {
+        std::lock_guard<std::mutex> map_lock(map_->mutex_);
+        for (const auto& kv : map_->getAllKeyframes()) {
+            auto& kf = kv.second;
+            if (!kf) continue;
+            // T_cw' = T_cw * T_w_wn with w_wn = (T_wn_w * diag(s))^{-1}.
+            // For a uniform rescale + rotation in world, the closed-form
+            // update for a camera pose T_cw (world→cam) is:
+            //   p_wc' = s * R_wn_w * p_wc
+            //   R_cw' = R_cw * R_wn_w^T
+            // which gives a new T_cw' = [R_cw', -R_cw' * p_wc'].
+            const SE3 T_wc = kf->T_cw_.inverse();
+            const Vec3 p_wc = T_wc.translation();
+            const Sophus::SO3d R_wc = T_wc.so3();
+            const Vec3 p_wc_new = s * (R_wn_w_so3 * p_wc);
+            const Sophus::SO3d R_wc_new = R_wn_w_so3 * R_wc;
+            const SE3 T_wc_new(R_wc_new, p_wc_new);
+            kf->T_cw_ = T_wc_new.inverse();
+        }
+        for (const auto& kv : map_->getAllLandmarks()) {
+            auto& lm = kv.second;
+            if (!lm) continue;
+            const Vec3 p = lm->getPos();
+            if (!p.allFinite()) continue;
+            lm->setPos(s * (R_wn_w_so3 * p));
+        }
+    }
+    map_->loop_correcting_.store(false);
+
+    // Also fold the transform into current/last frames so the next call
+    // to track() uses pose references consistent with the re-scaled map.
+    auto rotate_frame_state = [&](Frame::Ptr& frame) {
+        if (!frame) return;
+        const SE3 T_wc = frame->getPose().inverse();
+        const SE3 T_wc_new(R_wn_w_so3 * T_wc.so3(), s * (R_wn_w_so3 * T_wc.translation()));
+        frame->setPose(T_wc_new.inverse());
+        if (frame->has_velocity_ && frame->velocity_.allFinite()) {
+            frame->velocity_ = R_wn_w_so3 * frame->velocity_;
+        }
+    };
+    rotate_frame_state(current_frame_);
+    if (last_frame_ && last_frame_ != current_frame_) {
+        rotate_frame_state(last_frame_);
+    }
+
+    // Motion model translation also scales. Rotation component rotates by
+    // R_wn_w (a similarity transform on the velocity SE3).
+    {
+        const Sophus::SO3d R_new = R_wn_w_so3 * velocity_.so3() * R_wn_w_so3.inverse();
+        const Vec3 t_new = s * (R_wn_w_so3 * velocity_.translation());
+        velocity_ = SE3(R_new, t_new);
+    }
+
+    // Write biases + velocities into the window KFs. Velocities rotate
+    // into the new world frame (they do not scale — already in m/s).
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+        auto& kf = ordered[i];
+        if (!kf) continue;
+        const Vec3 v_new = R_wn_w_so3 * result.velocities[i];
+        if (v_new.allFinite()) {
+            kf->velocity_ = v_new;
+            kf->has_velocity_ = true;
+        }
+        kf->accel_bias_ = result.accel_bias;
+        kf->gyro_bias_ = result.gyro_bias;
+    }
+
+    // Propagate the newly-estimated gyro bias into every span's delta_R
+    // via the first-order Forster correction. Without this, the BA
+    // rotation residual (Stage 0c.d) keeps enforcing the uncorrected
+    // delta_R path while poses adopt the new bias, and the mismatch
+    // amplifies the ATE — exactly the combined regression we measured
+    // on MH_01 (1.41 → 2.28 m) before this fix landed.
+    vi.applyGyroBiasCorrectionToSpans(ordered, result);
+
+    // For KFs beyond the init window we leave biases and velocities at
+    // their last values — the BA random-walk prior and reconcileVelocityWithVisual
+    // will pull them in quickly now that gravity + scale are metric.
+
+    vi_init_done_ = true;
+    vi_init_scale_ = s;
+    vi_init_gravity_w_ = g_target;  // canonical after rotation
+    gravity_aligned_ = true;        // future KFs skip the ad-hoc accel alignment
+
+    // Unblock the IMU preintegration residual in local BA. The loose
+    // velocity prior is kept as a fallback for pairs without a valid span.
+    Optimizer::setPreintegrationResidualEnabled(true);
+
+    std::cout << "Tracking: VI init SUCCESS (scale=" << s
+              << ", rot_rms=" << result.rotation_residual_rms
+              << ", lin_rms=" << result.linear_residual_rms
+              << ", |g|=" << opts.gravity_magnitude
+              << ", gyro_bias=[" << result.gyro_bias.transpose() << "]"
+              << ", window=" << ordered.size() << " KFs)"
+              << std::endl;
 }
 
 }
