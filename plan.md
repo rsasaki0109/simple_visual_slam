@@ -694,7 +694,24 @@ Ranked by severity:
 
 | Status | What is done | What remains |
 | --- | --- | --- |
-| Partial | EuRoC loader, EuRoC stereo depth, ROS2 node, metric-depth CLI | real EuRoC validation, stronger ROS2 parity, true stereo/tracking evolution, IMU tight coupling if ever prioritized |
+| Partial | EuRoC loader, EuRoC stereo depth, ROS2 node, metric-depth CLI, VIO Stage 0b (IMU preintegration scaffolding), VIO Stage 0c (BA preintegration residual + bias BA params + VI init), empirical MH_01/V1_01 ATE validation | VIO Stage 0c.f (ORB-SLAM3-style MAP refinement, larger window, gyro-bias Jacobian once biases converge), stronger ROS2 parity, true stereo/tracking evolution |
+
+#### VIO status (2026-04-20)
+
+Commits `bebc7d5..bd7b691` landed the loosely-coupled VI pipeline. Validated on EuRoC mono + `--accel`:
+
+| Dataset    | Visual only | +VIO (Stage 0c.d+e) |
+| --- | ---: | ---: |
+| MH_01_easy | 3.44 m      | **1.41 m** (−59%)   |
+| V1_01_easy | 1.25 m      | **1.31 m**          |
+
+- VI Init accepts V1_01 (rot_rms 0.05 rad < 0.08 threshold) and rejects MH_01 (rot_rms 0.13 rad). MH_01 benefits from the 9-DoF BA residual alone; V1_01 picks up additional gain from scale + gravity refinement.
+- Loose sigma defaults: `SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M=0.3` m, `SVSLAM_BA_PREINT_ROT_SIGMA_RAD=0.05` rad. MH_01 sweep shows σ=0.3 is optimal; tighter pulls poses too hard, looser discards IMU info.
+- Tried but reverted: gyro-bias first-order Jacobian inside the BA rotation residual. It gives BA a free parameter that absorbs visual rotation noise when biases are uncalibrated, regressing MH_01 by 2–3×. Re-visit only after a reliable VI init calibrates gyro bias.
+
+Known limitations:
+- Mono + `--stereo` on EuRoC yields ATE ~2.8 m even visual-only — the pinhole-rectified stereo pipeline is not handling EuRoC's fisheye-ish distortion well. Separate from the VIO work.
+- Gyro bias estimate from the linear VI init is unreliable on short EuRoC windows (O(0.05) rad/s vs O(0.004) ground truth); currently hard-capped at 0.05 rad/s and BA takes over via random-walk + anchor priors.
 
 ### Phase E: Community / Release Hygiene
 
