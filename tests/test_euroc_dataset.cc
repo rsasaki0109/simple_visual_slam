@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unistd.h>
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -14,9 +17,21 @@ using namespace svslam;
 
 namespace {
 
+// Build a temp path that is unique across concurrent ctest workers. Previously
+// relied on std::rand() (deterministic, seed-1 in every new process), which
+// caused intermittent collisions when ctest -j launched the same binary in
+// parallel. The PID + a process-local counter + a nanosecond timestamp slice
+// is more than sufficient for gtest's handful of fixture paths.
 std::filesystem::path make_temp_path(const std::string& suffix) {
-    return std::filesystem::temp_directory_path() /
-           ("svslam_euroc_test_" + std::to_string(std::rand()) + suffix);
+    static std::atomic<uint64_t> counter{0};
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    const auto id = counter.fetch_add(1);
+    std::string name = "svslam_euroc_test_" + std::to_string(getpid()) + "_" +
+                       std::to_string(id) + "_" + std::to_string(now_ns) +
+                       suffix;
+    return std::filesystem::temp_directory_path() / name;
 }
 
 void write_text_file(const std::filesystem::path& path, const std::string& content) {
