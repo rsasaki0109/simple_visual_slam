@@ -516,22 +516,34 @@ void Optimizer::bundleAdjustment(const std::vector<Keyframe::Ptr>& keyframes,
         std::cout << "BA: Added " << depth_residual_count << " depth prior residuals" << std::endl;
     }
 
-    // Add gravity prior residuals for keyframes with accelerometer data
+    // Add gravity prior residuals for keyframes with accelerometer data.
+    // Weight tunable via SVSLAM_BA_GRAVITY_PRIOR_WEIGHT (default 2.0); <=0
+    // disables the prior entirely, useful on aggressive-motion sequences
+    // where the ±50 ms accel window is dominated by motion rather than
+    // gravity (e.g. EuRoC MH_03_medium).
+    double gravity_weight = 2.0;
+    if (const char* env = std::getenv("SVSLAM_BA_GRAVITY_PRIOR_WEIGHT")) {
+        char* end = nullptr;
+        const double parsed = std::strtod(env, &end);
+        if (end != env && std::isfinite(parsed)) {
+            gravity_weight = parsed;
+        }
+    }
     int gravity_residual_count = 0;
-    for (auto& kf : keyframes) {
-        if (!kf || !kf->has_gravity_) continue;
-        if (pose_params.find(kf->id_) == pose_params.end()) continue;
-        if (problem.IsParameterBlockConstant(pose_params[kf->id_])) continue;
+    if (gravity_weight > 0.0) {
+        for (auto& kf : keyframes) {
+            if (!kf || !kf->has_gravity_) continue;
+            if (pose_params.find(kf->id_) == pose_params.end()) continue;
+            if (problem.IsParameterBlockConstant(pose_params[kf->id_])) continue;
 
-        // Gravity is only approximately camera-aligned on TUM, so keep this prior soft.
-        double gravity_weight = 2.0;
-        ceres::CostFunction* gravity_cost = GravityPriorError::Create(
-            kf->gravity_in_camera_.x(), kf->gravity_in_camera_.y(), kf->gravity_in_camera_.z(),
-            gravity_weight);
+            ceres::CostFunction* gravity_cost = GravityPriorError::Create(
+                kf->gravity_in_camera_.x(), kf->gravity_in_camera_.y(), kf->gravity_in_camera_.z(),
+                gravity_weight);
 
-        problem.AddResidualBlock(gravity_cost, new ceres::HuberLoss(0.3),
-                                 pose_params[kf->id_]);
-        gravity_residual_count++;
+            problem.AddResidualBlock(gravity_cost, new ceres::HuberLoss(0.3),
+                                     pose_params[kf->id_]);
+            gravity_residual_count++;
+        }
     }
 
     if (gravity_residual_count > 0) {
