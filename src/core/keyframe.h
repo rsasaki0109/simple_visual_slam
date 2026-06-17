@@ -1,7 +1,10 @@
 #pragma once
 
+#include <memory>
+
 #include "core/common.h"
 #include "core/frame.h"
+#include "sensors/imu_preintegration_span.h"
 
 namespace svslam {
 
@@ -17,6 +20,18 @@ public:
     Camera::Ptr camera_;
     
     SE3 T_cw_;
+
+    // VIO state (scaffolding for Stage 0b). Copied from the source Frame at
+    // ctor time; future preintegration may update these during local BA.
+    Vec3 velocity_ = Vec3::Zero();
+    Vec3 accel_bias_ = Vec3::Zero();
+    Vec3 gyro_bias_ = Vec3::Zero();
+    bool has_velocity_ = false;
+
+    // Preintegration FROM the previous keyframe TO this one (Stage 0c). Null
+    // until the VIO path populates it — e.g. EuRoC mono with imu_buffer_
+    // filled. Consumers must check valid == true before reading deltas.
+    std::unique_ptr<ImuPreintegrationSpan> prev_imu_span_;
 
     // Depth image (copied from Frame)
     cv::Mat depth_image_;

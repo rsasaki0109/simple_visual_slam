@@ -19,6 +19,7 @@
 #include "io/tum_dataset.h"
 #include "io/tum_pinhole_calibration.h"
 #include "io/map_io.h"
+#include "backend/optimizer.h"
 #include "core/heuristic_reference_keyframe_policy.h"
 #include "tracking/tracking.h"
 #include "backend/local_mapping.h"
@@ -405,6 +406,46 @@ int main(int argc, char** argv) {
             tracker->accel_buffer_ = tum.allAccel();
         } else if (use_accel) {
             std::cout << "Accelerometer integration: requested but no accelerometer.txt found, DISABLED" << std::endl;
+            use_accel = false;
+        }
+    }
+
+    if (use_euroc) {
+        if (use_accel && euroc.hasImu()) {
+            // Mirror the IMU accel channel into accel_buffer_ so the existing
+            // gravity-alignment + stationary-detection paths work unchanged,
+            // and retain the full IMU (accel + gyro) for future VIO use.
+            tracker->imu_buffer_ = euroc.allImu();
+            tracker->accel_buffer_.clear();
+            tracker->accel_buffer_.reserve(tracker->imu_buffer_.size());
+            for (const auto& imu : tracker->imu_buffer_) {
+                AccelEntry accel;
+                accel.timestamp_sec = imu.timestamp_sec;
+                accel.ax = imu.accel.x();
+                accel.ay = imu.accel.y();
+                accel.az = imu.accel.z();
+                tracker->accel_buffer_.push_back(accel);
+            }
+            if (euroc.hasCam0FromImuExtrinsic()) {
+                tracker->setImuToCameraExtrinsic(euroc.cam0FromImuExtrinsic());
+            }
+            // VIO Stage 0c.e: keep the IMU preintegration residual on by
+            // default so sequences where VI init rejects (e.g. MH_01 with
+            // noisy early-mono rotations) still benefit from the 9-DoF
+            // residual + BA bias blocks — the regression we feared from
+            // "preint on with bias=0" never materialises on MH/V1 runs in
+            // practice (loose anchor + RW priors soak up the initial
+            // mis-estimate). Set SVSLAM_VIO_GATE_PREINT=1 to opt back in to
+            // gating preint until VI init succeeds (useful when diagnosing
+            // scale-sensitive sequences).
+            if (std::getenv("SVSLAM_VIO_GATE_PREINT")) {
+                Optimizer::setPreintegrationResidualEnabled(false);
+            }
+            std::cout << "IMU integration: ENABLED (accel+gyro, "
+                      << tracker->imu_buffer_.size() << " samples)" << std::endl;
+        } else if (use_accel) {
+            std::cout << "IMU integration: requested but mav0/imu0/data.csv absent, DISABLED"
+                      << std::endl;
             use_accel = false;
         }
     }

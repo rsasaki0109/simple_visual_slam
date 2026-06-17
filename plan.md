@@ -1,19 +1,23 @@
 # SimpleVisualSLAM Agent Handoff
 
-This file is the authoritative handoff for Codex / Claude / Cursor as of **2026-04-15**.
-It was rewritten from scratch using current command output from this workspace:
+This file is the authoritative handoff for Codex / Claude / Cursor as of **2026-04-21**.
 
-- `git log --oneline -20`
-- `git diff --stat HEAD~16..HEAD`
-- `ctest --test-dir build_codex --output-on-failure`
+Major update on this revision: **VIO Stage 0b + 0c landed.** A loosely-coupled visual-inertial pipeline (IMU preintegration in local BA, per-KF velocity + accel/gyro bias BA parameters, Forster 9-DoF preintegration residual, linear Visual-Inertial Initialization) is live on `master` and empirically validated on five EuRoC mono `--accel` sequences. See §16 for the VIO-specific handoff.
+
+Reconnaissance commands used for this revision:
+
+- `git log --oneline -25`
+- `git diff --stat 3f9bc71..HEAD` (span since the last merged PR)
+- `ctest --test-dir build --output-on-failure` (77/77 PASS)
+- `python3 scripts/check_regression_gate.py --build build --all-gates --quiet` (7/7 PASS)
+- `cat eval/regression_baselines.json`
 - `cat eval/stella_comparison_results.md`
 - `cat eval/metric_depth_test_results.md`
 - `cat eval/euroc_test_results.md`
-- `wc -l src/**/*.cc src/**/*.h apps/*.cc`
-- `ls tests/test_*.cc`
-- `cat eval/regression_baselines.json`
-- `./build_codex/run_mono --version`
-- `./build_codex/run_mono --help`
+- `wc -l apps/*.cc src/*/*.cc src/*/*.h` → 12 090 lines
+- `ls tests/test_*.cc` → 18 files
+- `./build/run_mono --version` / `--help`
+- EuRoC mono + `--accel` 5-sequence ATE sweep: MH_01/02/03, V1_01, V2_01 (Sim3 evo_ape)
 
 If this document and the code disagree, the code is correct and this file should be updated.
 
@@ -41,21 +45,24 @@ What the project is trying to become:
 
 ---
 
-## 2. Current State (2026-04-16)
+## 2. Current State (2026-04-21)
 
 ### 2.1 Snapshot
 
 | Item | Current value |
 | --- | --- |
-| HEAD | run `git rev-parse --short HEAD` |
-| HEAD subject | `Improve mono room ATE; pose graph backbone; diagnostics` |
+| `master` HEAD | `46a726d` |
+| `master` HEAD subject | `plan.md: record VIO Stage 0b/0c progress and validated ATE numbers` |
+| Open PR branch | `vio-integration` (`8e6f4e7`), **PR #3** on GitHub, not yet merged |
 | Version | `SimpleVisualSLAM 0.2.0` |
-| Build used for this snapshot | `build_codex` |
-| Recent change volume | `73 files changed, 7646 insertions(+), 1269 deletions(-)` in `HEAD~16..HEAD` |
-| Unit tests | `58/58` passed |
-| `ctest` wall time | `6.94 sec` |
-| Core app/source LOC | `9715` lines across `apps/*.cc` + requested `src/**/*.cc` + `src/**/*.h` |
-| Test source files | `16` `tests/test_*.cc` files |
+| Build used for this snapshot | `build` (no suffix — the Ninja-style build dirs `build_codex*` are legacy) |
+| Recent change volume | `22 files changed, 2 820 insertions(+), 65 deletions(-)` in `3f9bc71..HEAD` (the span that introduced the whole VIO pipeline) |
+| Unit tests | **77 / 77** passed |
+| `ctest` wall time | `~10 sec` |
+| Core app/source LOC | **12 090** lines across `apps/*.cc` + `src/*/*.cc` + `src/*/*.h` |
+| Test source files | **18** `tests/test_*.cc` files |
+| TUM regression gates | **7 / 7** PASS with bitwise-reproducible trajectories |
+| EuRoC mono `--accel` sweep (5 sequences, 2026-04-20) | average ATE **2.10 m → 1.60 m (−24 %)** vs visual-only |
 
 ### 2.2 Supported Feature Matrix
 
@@ -63,10 +70,11 @@ What the project is trying to become:
 | --- | --- | --- |
 | Monocular SLAM | Implemented | `run_mono --tum ...` and default video path |
 | RGB-D SLAM | Implemented | `--depth` |
-| Accelerometer prior | Implemented | `--accel`; gravity prior in BA |
-| EuRoC mono loader | Implemented | `--euroc <sequence_dir>` |
-| EuRoC stereo depth | Implemented | `--euroc ... --stereo` |
-| Stereo tracking mode | Partial | stereo depth is computed from `cam0+cam1`, but tracking still runs on `cam0` |
+| Accelerometer prior (BA gravity) | Implemented | `--accel`; per-KF gravity prior, weight env-tunable via `SVSLAM_BA_GRAVITY_PRIOR_WEIGHT` |
+| **Loosely-coupled VIO (Stage 0b + 0c)** | **Implemented** | IMU preintegration (`sensors/imu_preintegrator.h`), BA preintegration residual (`VelocityPreintegrationError`, 9-DoF) with accel/gyro bias blocks, Forster rotation residual, Visual-Inertial Initialization (`tracking/visual_inertial_initializer.{h,cc}`). Active whenever `--accel` is paired with an IMU dataset (EuRoC) |
+| EuRoC mono + IMU loader | Implemented | `--euroc <sequence_dir> --accel`; loads `cam0 T_BS` multi-line YAML, parses `imu0/data.csv`, plumbs extrinsic into Tracking |
+| EuRoC stereo depth | Implemented, known-degraded | `--euroc ... --stereo`; stereo-only ATE on MH_01 is ~2.77 m vs 3.44 m mono — rectification pipeline does not handle EuRoC's fisheye-ish distortion well. Separate from the VIO work, see §8 |
+| Stereo tracking mode | Partial | stereo depth is computed from `cam0+cam1`, tracking still runs on `cam0` |
 | Relative DL depth | Implemented | `--depth-model <model.onnx>` with `-DUSE_DEPTH_DL=ON` |
 | Metric DL depth | Implemented | `--metric-depth-model <model.onnx>` with `-DUSE_DEPTH_DL=ON` |
 | Loop closing | Implemented | enabled in async runs when ORB vocabulary exists |
@@ -74,7 +82,7 @@ What the project is trying to become:
 | Map persistence | Implemented | writes `map.bin`, `trajectory.txt`, `trajectory_online.txt`, `trajectory_keyframes.txt` |
 | Run summary JSON | Implemented | `--run-summary-json <path>` |
 | Strict failure exit | Implemented | `--strict-exit` |
-| ROS2 Jazzy node | Implemented, basic | `ros2/src/slam_node.cc`; currently no loop-closing parity |
+| ROS2 Jazzy node | Implemented, basic | `ros2/src/slam_node.cc`; currently no loop-closing parity, no VIO hookup |
 
 ### 2.3 CLI Surface
 
@@ -103,22 +111,24 @@ The ORB vocabulary is the last positional argument, otherwise the app searches `
 
 ### 2.4 Regression Gates
 
-These are the **current measured values** from this workspace on **2026-04-16** (`python3 -u scripts/check_regression_gate.py --build build_codex --all-gates --quiet`).
+Measured on **2026-04-21** (`python3 scripts/check_regression_gate.py --build $PWD/build --data-tum $PWD/data/tum --all-gates --quiet`).
 
 | Gate | Mode | Mean ATE (m) | Ceiling (m) | Status |
 | --- | --- | ---: | ---: | --- |
-| `room_depth_accel_head_repro` | RGB-D + accel | `0.057702` | `0.145000` | PASS |
-| `room_depth_head_repro` | RGB-D | `0.079914` | `0.165000` | PASS |
-| `room_mono_head_repro` | Mono | `0.197374` | `0.340000` | PASS |
 | `xyz_depth_head_repro` | RGB-D | `0.011042` | `0.016000` | PASS |
 | `xyz_mono_head_repro` | Mono | `0.028136` | `0.030000` | PASS |
+| `xyz_mono_accel_head_repro` | Mono + accel | `0.024931` | `0.027000` | PASS |
+| `room_depth_head_repro` | RGB-D | `0.079914` | `0.165000` | PASS |
+| `room_depth_accel_head_repro` | RGB-D + accel | `0.057702` | `0.145000` | PASS |
+| `room_mono_head_repro` | Mono | `0.176506` | `0.340000` | PASS |
+| `room_mono_accel_head_repro` | Mono + accel | `0.164001` | `0.170000` | PASS (thin margin) |
 
-Current gate summary on `build_codex`:
+**7 / 7 gates passing** with bitwise-identical trajectories on two back-to-back runs per gate.
 
-- **5/5 gates passing**
-- **Current mono focus:** `room_mono_head_repro` is still the weakest head-250 gate by a wide margin
-
-This is the most important delta versus older planning notes. The earlier `xyz_mono_head_repro` blocker has been recovered on the current build, but the pass margin is still thin and `room_mono` remains far from the external baseline.
+Notes:
+- VIO's preintegration residual is dormant on TUM runs (no `has_velocity_`) so these gates measure the non-VIO front-end/back-end behaviour — VIO work did not regress any gate.
+- `room_mono_accel_head_repro` has the smallest pass margin (6 mm). Any mono front-end change must re-run this gate before and after.
+- `room_mono_head_repro` is still the widest gap to `stella_vslam` (§2.5 / §10.4).
 
 ### 2.5 `stella_vslam` Comparison Status
 
@@ -180,29 +190,72 @@ Interpretation:
 - `xyz` looks promising
 - `room` at `250` frames is still poor, and loop candidates were rejected by `computeSim3()`
 
-### 2.7 EuRoC Stereo Verification Status
+### 2.7 EuRoC Real-Dataset Verification (Updated 2026-04-20)
 
-From `eval/euroc_test_results.md`:
+Real EuRoC sequences are now on disk under `datasets/euroc/` — downloaded via the **Wayback Machine** because the ETH ASL origin (`robotics.ethz.ch/~asl-datasets/...`) is unreachable from this environment. The working recipe:
 
-- The legacy per-sequence EuRoC download did **not** succeed from this environment on 2026-04-14
-- The current official distribution path points to an ETH Research Collection DOI and a large combined Machine Hall bundle rather than a direct `MH_01_easy.zip`
-- The repo therefore used a **synthetic EuRoC-style fallback dataset** under `data/euroc/test_seq`
+```
+curl -L --fail --retry 3 -o datasets/euroc/<SEQ>.zip \
+  "https://web.archive.org/web/<TS>if_/http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/<path>/<SEQ>.zip"
+```
 
-Verification results:
+The `if_` modifier on the Wayback URL returns the raw ZIP rather than the framed viewer. Find a valid `<TS>` with `curl -sSI "https://web.archive.org/web/2023/..."` and follow the 302 redirect. Typical capture size ≈ original (1–1.6 GB), download ≈ 4 min at ~6 MB/s.
 
-| Mode | Frames | Final state | Keyframes | Landmarks | Status |
-| --- | ---: | ---: | ---: | ---: | --- |
-| EuRoC mono | `10` | `2` (`OK`) | `3` | `277` | PASS |
-| EuRoC stereo | `10` | `2` (`OK`) | `4` | `1223` | PASS |
+Sequences available on disk:
 
-Extra facts worth keeping in mind:
+| Sequence       | ZIP (GB) | Cam frames | IMU samples | GT poses | Ground truth file |
+| ---            | ---:     | ---:       | ---:        | ---:     | ---               |
+| `MH_01_easy`   | 1.57     | 3 683      | 36 820      | 36 382   | `datasets/euroc/MH_01_easy/gt_tum.txt` |
+| `MH_02_easy`   | 1.29     | 3 041      | 30 400      | 29 993   | `datasets/euroc/MH_02_easy/gt_tum.txt` |
+| `MH_03_medium` | 1.11     | 2 701      | 27 008      | 26 302   | `datasets/euroc/MH_03_medium/gt_tum.txt` |
+| `V1_01_easy`   | 1.15     | 2 912      | 29 120      | 28 711   | `datasets/euroc/V1_01_easy/gt_tum.txt` |
+| `V2_01_easy`   | 0.88     | 2 281      | 22 800      | 22 401   | `datasets/euroc/V2_01_easy/gt_tum.txt` |
 
-- stereo baseline loaded: `0.110074 m`
-- successful command uses the **sequence root**:
-  - `build_codex/run_mono --euroc data/euroc/test_seq ...`
-- passing the inner `mav0` directory is wrong for this loader and fails because `EurocDataset` already appends `/mav0/...`
+GT → TUM conversion (one-liner, EuRoC ns + `[qw,qx,qy,qz]` → TUM s + `[qx,qy,qz,qw]`):
 
-### 2.8 600-Frame Loop Stability
+```
+awk -F',' 'NR>1 { printf "%.9f %s %s %s %s %s %s %s\n", $1/1e9, $2, $3, $4, $6, $7, $8, $5 }' \
+  <SEQ>/mav0/state_groundtruth_estimate0/data.csv > <SEQ>/gt_tum.txt
+```
+
+ATE evaluation uses Sim(3) alignment (mono scale is unobservable without explicit VIO metric output):
+
+```
+evo_ape tum <SEQ>/gt_tum.txt build/trajectory.txt --align --correct_scale --t_max_diff 0.05 --no_warnings
+```
+
+Run flags that worked:
+
+- Mono VIO: `./build/run_mono --euroc datasets/euroc/<SEQ> --accel --reference-policy heuristic --skip-frames 0 --no-viz --repro-eval`
+- Visual-only baseline: same command minus `--accel`.
+
+stereo baseline auto-loaded from sensor.yaml: `0.110074 m` on MH_01.
+Passing the inner `mav0` directory is wrong for this loader (`EurocDataset` already appends `/mav0/...`).
+
+### 2.8 EuRoC Mono `--accel` VIO Sweep (2026-04-20)
+
+Measured on the five sequences above, full length (no `--max-frames`), Sim(3) alignment via `evo_ape`.
+
+| Sequence       | Frames | Visual only | +VIO      | Δ mean | Δ max  | VI init |
+| ---            | ---:   | ---:        | ---:      | ---:   | ---:   | ---     |
+| `MH_01_easy`   | 3 683  | 3.44 m      | **1.41 m** | **−59 %** | −43 % | rejected (rot_rms 0.13) |
+| `MH_02_easy`   | 3 041  | 2.64 m      | **1.72 m** | **−35 %** | −42 % | rejected |
+| `MH_03_medium` | 2 701  | **2.48 m**  | 2.91 m    | **+17 %** | +59 % | rejected |
+| `V1_01_easy`   | 2 912  | 1.25 m      | **1.31 m** | +5 %   | **−59 %** | **succeeded** (scale 0.98) |
+| `V2_01_easy`   | 2 281  | 0.69 m      | **0.63 m** | **−9 %**  | **−53 %** | rejected (scale outside tolerance) |
+| **Average**    |        | **2.10 m**  | **1.60 m** | **−24 %** | —     | 1 / 5 accept |
+
+Read these numbers as:
+
+- **Machine Hall (long flight, translation-dominant):** IMU wins decisively on MH_01/02 because visual drift accumulates over distance and IMU anchors orientation. MH_03 is the open regression (§8.11).
+- **Vicon Room (short, rotation-heavy):** the mean barely moves but the worst-case excursion (`max`) drops 50–60 %, i.e. IMU kills the occasional tracking runaway.
+- **VI init acceptance is the second-order story, not the first.** The 9-DoF preintegration residual alone delivers the bulk of the gain. VI init just adds a small scale + gravity refinement on the one sequence (V1_01) whose early-mono rotations are clean enough to pass the 0.08 rad residual threshold.
+
+Machine-readable artifact: none yet — the numbers above came from ad-hoc runs during the 0c.e validation. A proper `eval/euroc_vio_sweep.md` / `.json` is a pending artifact (§11).
+
+Knob sweep finding (MH_01 only): `SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M` ∈ {0.1, 0.3, 0.5, 1.0}, σ=0.3 is optimal (1.73 m vs 3.70 / 2.02 / 2.05 m). Tighter over-constrains; looser wastes IMU signal. σ=0.3 is the default.
+
+### 2.9 600-Frame Loop Stability (historical)
 
 There are two different pieces of evidence in the repo, and they should not be conflated:
 
@@ -232,7 +285,31 @@ Current truth:
 
 ## 3. Commit History
 
-`git diff --stat HEAD~16..HEAD` spans the last 16 commits and shows the overall churn. The handoff history below starts at the requested anchor `d3c81a7` and covers the 15 commits from there to current HEAD.
+Two spans matter for this handoff.
+
+**Span A — since last merged PR (`3f9bc71` → `master` HEAD `46a726d`):** 10 commits introducing VIO Stage 0b + 0c. Subsequent cleanup commits (`688f748`, `8e6f4e7`) live on the `vio-integration` branch / PR #3.
+
+| Commit     | Stage  | What changed |
+| ---        | ---    | --- |
+| `38073b6`  | 0b.b   | `core/` velocity + IMU-bias scaffolding on `Frame` / `Keyframe` |
+| `2f9bbf7`  | 0b.a   | `sensors/imu_preintegrator.h` (Forster-style skeleton) |
+| `3b90a77`  | 0b.d   | `ImuEntry` type + EuRoC `imu0` loader |
+| `03bd424`  | 0b.c   | Plumb EuRoC IMU into Tracking via `imu_buffer_` |
+| `06868c5`  | pre-0c | Guard `Frame::landmarks_` and `Keyframe::landmarks_` container races |
+| `bebc7d5`  | 0b.e / 0b.f / 0c.b | Tracking-side IMU path (`predictVelocityFromImu`, `reconcileVelocityWithVisual`), EuRoC `cam0 T_BS` extrinsic, mono/depth init gravity transform into camera frame |
+| `f9303ac`  | 0c.c / 0c.a | `VelocityPreintegrationError` (Forster 6-DoF pos + vel), per-KF velocity + accel/gyro bias BA parameter blocks, `BiasAnchorError` + `BiasRandomWalkError` |
+| `935a33c`  | 0c.d   | 3-DoF rotation residual added (9-DoF total), `delta_R` kept frozen (no gyro Jacobian yet) |
+| `bd7b691`  | 0c.e   | `VisualInertialInitializer` (linear 2-stage solve), `tryVisualInertialInit` in Tracking, `applyGyroBiasCorrectionToSpans`, acceptance thresholds (rot_rms ≤ 0.08 rad, gyro-bias cap 0.05 rad/s) |
+| `46a726d`  | docs   | `plan.md`: record Stage 0b/0c progress (this file was the previous update) |
+
+On `vio-integration` branch (PR #3):
+
+| Commit    | What changed |
+| ---       | --- |
+| `688f748` | `tests/test_euroc_dataset.cc`: unique temp paths across `ctest -j` workers (PID + atomic counter + nanosecond timestamp) |
+| `8e6f4e7` | `backend/optimizer.cc`: env-tunable gravity prior weight (`SVSLAM_BA_GRAVITY_PRIOR_WEIGHT`, default 2.0) |
+
+**Span B — earlier context preserved for archaeology:**
 
 | Commit | What changed |
 | --- | --- |
@@ -303,15 +380,17 @@ These are outside the directory inventory requested below but matter immediately
 
 - `initializer.cc` (`557`): monocular two-view initialization, H/F model selection, triangulation
 - `initializer.h` (`42`): initializer API and result containers
-- `tracking.cc` (`2116`): front-end tracking, motion model, keyframe decision, local-map tracking, relocalization, reinitialization, loop-correction handoff
-- `tracking.h` (`149`): tracking state, recovery state, loop-correction state, run statistics, thresholds
+- `tracking.cc` (`~2720`): front-end tracking, motion model, keyframe decision, local-map tracking, relocalization, reinitialization, loop-correction handoff, **IMU velocity prediction (`predictVelocityFromImu`), visual-velocity reconciliation (`reconcileVelocityWithVisual`), preintegration span attachment (`populateKeyframeImuSpan`), VI init entry (`tryVisualInertialInit`)**
+- `tracking.h` (`~200`): tracking state, recovery state, loop-correction state, run statistics, thresholds, **`T_cam_imu_` extrinsic, VI init bookkeeping**
+- **`visual_inertial_initializer.cc` (`~400`):** linear two-stage VI init (closed-form gyro bias with cap, LSQ for scale + gravity + velocities, span delta_R first-order correction via `applyGyroBiasCorrectionToSpans`)
+- **`visual_inertial_initializer.h` (`~165`):** `Options` / `Result` structs, acceptance thresholds
 
 #### `src/backend/`
 
 - `local_mapping.cc` (`449`): local-mapping queue, new-point creation, map-point culling, local BA
 - `local_mapping.h` (`62`): local-mapping API, queue, callback hook
-- `optimizer.cc` (`980`): pose-only PnP refinement, local BA, depth prior, gravity prior, pose graph, IRLS
-- `optimizer.h` (`113`): Ceres residual definitions and optimizer API
+- `optimizer.cc` (`~1250`): pose-only PnP refinement, local BA, depth prior, gravity prior (env-tunable weight), pose graph, IRLS, **VIO preintegration residual wiring (velocity + accel/gyro bias blocks, bias anchor + random-walk priors, preint-residual gate for VI-init-aware datasets)**
+- `optimizer.h` (`~390`): Ceres residual definitions and optimizer API, **`VelocityPreintegrationError` (Forster 9-DoF pos + vel + rot with first-order accel-bias Jacobian), `VelocityDeltaPriorError` (loose fallback), `BiasAnchorError`, `BiasRandomWalkError`**
 
 #### `src/loop_closing/`
 
@@ -331,11 +410,14 @@ These are outside the directory inventory requested below but matter immediately
 #### `src/sensors/`
 
 - `accelerometer.h` (`80`): accelerometer entry type and simple processing helpers
+- `imu.h` (`15`): `ImuEntry` (accel + gyro + timestamp) value type
+- `imu_preintegrator.h` (`~110`): Forster-style IMU preintegration (`deltaR/deltaV/deltaP/dt`, bias reset, `integrate`, `predict` with gravity)
+- `imu_preintegration_span.h` (`~40`): frozen per-KF-pair preintegration span (deltas, reference biases, `T_cam_imu` snapshot, `from_kf_id`, validity)
 
 #### `src/io/`
 
-- `euroc_dataset.cc` (`427`): EuRoC dataset loader, stereo pairing, calibration setup, baseline extraction
-- `euroc_dataset.h` (`78`): EuRoC dataset API
+- `euroc_dataset.cc` (`~495`): EuRoC dataset loader, stereo pairing, calibration setup, baseline extraction, **`imu0/data.csv` loader, multi-line `T_BS` YAML folding, `cam0FromImuExtrinsic` SE3 publishing with SVD re-orthonormalization**
+- `euroc_dataset.h` (`~100`): EuRoC dataset API, **`allImu()` / `getImuBetween()` / `hasCam0FromImuExtrinsic()`**
 - `euroc_pinhole_calibration.cc` (`188`): EuRoC JSON calibration parser
 - `euroc_pinhole_calibration.h` (`34`): EuRoC calibration structs/API
 - `map_io.cc` (`269`): map save/load
@@ -354,8 +436,10 @@ These are outside the directory inventory requested below but matter immediately
 
 #### `tests/`
 
+- 18 files total, `ctest -j4` reports 77 / 77 PASS
 - `test_camera.cc` (`59`): camera projection/unprojection tests
-- `test_euroc_dataset.cc` (`124`): EuRoC dataset and stereo-calibration tests
+- `test_euroc_dataset.cc` (`~260`): EuRoC dataset and stereo-calibration tests, **`cam0 T_BS` single-line and multi-line YAML, IMU CSV**, PID + nanosecond-unique temp paths
+- `test_imu_preintegrator.cc` (`~90`): zero-motion identity, constant-accel `deltaV`/`deltaP`, `predict` with gravity, bias subtraction, reset
 - `test_frame.cc` (`90`): frame depth and backprojection tests
 - `test_initializer.cc` (`29`): initializer smoke/regression tests
 - `test_keyframe.cc` (`74`): covisibility ranking and connection tests
@@ -363,7 +447,8 @@ These are outside the directory inventory requested below but matter immediately
 - `test_loop_closing.cc` (`83`): loop weighting and stale-edge decay tests
 - `test_map.cc` (`96`): map add/remove/concurrency tests
 - `test_metric_depth_estimator.cc` (`40`): metric-depth tensor-shape/model tests
-- `test_optimizer.cc` (`149`): BA, pose graph, depth prior, gravity prior tests
+- `test_optimizer.cc` (`~345`): BA, pose graph, depth prior, gravity prior tests, **VelocityDelta prior, 9-DoF preintegration residual (match, gravity, accel-bias first-order, rotation match, rotation mismatch), bias anchor, bias random-walk**
+- `test_visual_inertial_initializer.cc` (`~255`): scale + gravity recovery on synthetic EuRoC-like scene, capped closed-form gyro-bias recovery, metric-scale mode, missing-span rejection
 - `test_reference_keyframe_policy.cc` (`88`): heuristic/score/pipeline policy tests
 - `test_stereo_depth_estimator.cc` (`87`): stereo-depth correctness tests
 - `test_synthetic_scene.h` (`79`): shared synthetic-scene helper for tests
@@ -625,26 +710,48 @@ These are the hard-coded runtime knobs that matter most. They are the first plac
 | `src/depth/stereo_depth_estimator.cc:98-109` | StereoSGBM params | block `5`, uniqueness `10`, speckle `50`, range `2`, `disp12=1` | current stereo matcher setup |
 | `src/depth/metric_depth_estimator.cc:84` | ONNX intra-op threads | `4` | metric-depth inference thread count |
 
+### 7.8 VIO Env Knobs (all optional — defaults preserve the Stage 0c empirical state)
+
+| Env variable | Default | Meaning |
+| --- | ---: | --- |
+| `SVSLAM_VIO_VELOCITY_IMU_ALPHA` | `0.3` | Blend weight for the IMU prediction vs the post-track visual pose delta inside `reconcileVelocityWithVisual`. 0 = pure visual, 1 = pure IMU open-loop |
+| `SVSLAM_VIO_ENABLE_VISUAL_VELOCITY` | unset | Opt-in: populate `Frame::velocity_` on non-IMU runs (TUM) so BA's velocity prior acts as a motion-smoothness regularizer |
+| `SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M` | `0.3` (m) | Position-side sigma for the preintegration + loose-delta residuals. MH_01 sweep says this is optimal; `<=0` disables the velocity-related residuals entirely |
+| `SVSLAM_BA_VELOCITY_PRIOR_VEL_SIGMA` | `0.3` (m/s) | Velocity-side sigma for the preintegration residual |
+| `SVSLAM_BA_PREINT_ROT_SIGMA_RAD` | `0.05` (≈ 2.9°) | Rotation residual sigma per KF-gap. `<=0` zeros the rotation weight, restoring 6-DoF behavior |
+| `SVSLAM_BA_BIAS_ACCEL_ANCHOR_SIGMA` | `0.5` (m/s²) | Accel-bias anchor sigma |
+| `SVSLAM_BA_BIAS_GYRO_ANCHOR_SIGMA` | `0.1` (rad/s) | Gyro-bias anchor sigma |
+| `SVSLAM_BA_BIAS_ACCEL_RW_SIGMA` | `0.05` (m/s² per pair) | Accel-bias random-walk sigma between consecutive KFs |
+| `SVSLAM_BA_BIAS_GYRO_RW_SIGMA` | `0.005` (rad/s per pair) | Gyro-bias random-walk sigma |
+| `SVSLAM_BA_GRAVITY_PRIOR_WEIGHT` | `2.0` | Per-KF gravity prior weight. `<=0` disables; useful on aggressive-motion sequences where the ±50 ms accel window is dominated by motion rather than gravity |
+| `SVSLAM_VIO_MIN_INIT_KEYFRAMES` | `15` | Minimum KFs before `tryVisualInertialInit` attempts the linear solve |
+| `SVSLAM_VIO_GATE_PREINT` | unset | Opt-in: restore the original "gate preintegration until VI init succeeds" behavior. Default is preint always on — safer on sequences where VI init never converges (e.g. MH_01) |
+| `SVSLAM_VIO_FORCE_PREINT_BA` | unset | Legacy inverse of `SVSLAM_VIO_GATE_PREINT`, kept for backwards-compatibility with pre-2026-04-20 benchmark reruns |
+
+Tuning philosophy: the defaults above were arrived at on EuRoC MH_01 with a four-point σ sweep; they leave the residuals noticeably *loose* so visual BA wins ties. Do not tighten `SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M` below `0.2` without fresh evidence — MH_01 regressed 2× at σ=0.1.
+
 ---
 
 ## 8. Known Issues
 
-Ranked by severity:
+Ranked by severity for **2026-04-21**:
 
 1. **`room_mono` remains far behind `stella_vslam` and still lacks early loop detections.**
-   - Current gate: `0.197374 m`
+   - Current gate: `0.176506 m` (improved from `0.197374 m` after the pre-VIO work, 2026-04-16)
    - `stella_vslam`: `0.02743546 m`
    - Published loop-enabled comparison recorded `0/0/0` loop detections inside the first 250 frames.
+   - **plan.md §10.4's ordered experiment #1 (ORB 2000 → 3000) was re-tested on 2026-04-20 and regresses both mono room gates — see §8.12.**
 
-2. **`xyz_mono_head_repro` is passing again, but the margin is thin.**
-   - Current value: `0.028136 m`
-   - Ceiling: `0.030000 m`
-   - Any further mono changes should rerun `xyz_mono_head_repro` immediately.
+2. **`xyz_mono_*` gates pass with thin margins.**
+   - `xyz_mono_head_repro`: `0.028136 m` / ceiling `0.030000 m` (7 % slack)
+   - `xyz_mono_accel_head_repro`: `0.024931 m` / ceiling `0.027000 m` (7 % slack)
+   - `room_mono_accel_head_repro`: `0.164001 m` / ceiling `0.170000 m` (4 % slack — thinnest)
+   - Any further mono front-end change must run these three gates before and after.
 
 3. **`room_depth` is still materially behind `stella_vslam`.**
-   - Best retained number: `0.0695 m`
    - Current strict repro gate: `0.079914 m`
-   - `stella_vslam`: `0.02110508 m`
+   - `stella_vslam`: `0.02110508 m` (≈ 3.8× gap)
+   - ORB 3000 experiment incidentally improved this to `0.068392 m` but was reverted because it broke room_mono — suggests there is room to move if mono damage can be avoided.
 
 4. **600-frame loop documentation:** see **`eval/room_depth_600frame_report.md`** (2026-04-15). The older `~0.618 m` median in `eval/stella_comparison_results.md` remains historical context only.
 
@@ -652,21 +759,44 @@ Ranked by severity:
    - Code mostly snapshots immediately, but the API is still easy to misuse
    - See `src/core/map.cc:27-33`
 
-6. **Real EuRoC verification is still missing.**
-   - The code path was verified only on the synthetic fallback dataset
-   - Loader semantics and stereo baseline path are good, but real-sequence performance is unverified
-
-7. **Metric depth works on `xyz` but is poor on `room` at 250 frames.**
+6. **Metric depth works on `xyz` but is poor on `room` at 250 frames.**
    - `room 250`: `0.38429766 m`
    - Sensor depth on the same scenario is much better
 
-8. **The ROS2 node is functional but not feature-parity with the CLI.**
-   - It currently wraps `Tracking` + `LocalMapping`
+7. **The ROS2 node is functional but not feature-parity with the CLI.**
    - No loop-closing thread is started in `ros2/src/slam_node.cc`
+   - **No VIO hookup either** — `Tracking::imu_buffer_` / `Tracking::setImuToCameraExtrinsic` are unused in the ROS2 path
 
-9. **The README "6k lines" claim is now stale.**
-   - Current measured app+core count is `9715`
-   - This is a documentation issue, not an algorithmic blocker
+8. **The README "6k lines" claim is now stale.**
+   - Current measured app+core count is `12 090`
+   - Documentation issue, not an algorithmic blocker
+
+9. **VI init rejects noisy-mono sequences without falling through to ORB-SLAM3-style MAP refinement.**
+   - MH_01 and MH_03 both have rot_rms ≈ 0.13 rad during the first 15 KFs, above the 0.08 rad threshold
+   - V2_01 rejects with "scale outside tolerance" (scale ≈ 0.007 — degenerate visual window)
+   - Only V1_01 accepts; gain is modest (scale correction ≈ 2 %)
+   - Follow-up: §16.5
+
+10. **Gyro-bias first-order Jacobian inside the BA rotation residual was tried and reverted (2026-04-20).**
+    - Adds a free parameter that absorbs visual rotation noise when biases are not pre-calibrated
+    - Regressed MH_01 from `1.41 m` to `2.68–3.56 m` at any gyro-anchor σ in `[0.01, 0.1]`
+    - **Do not re-enable without a VI-init stage that delivers gyro bias to O(0.01 rad/s) first**
+
+11. **MH_03_medium is the open VIO regression.**
+    - Visual-only `2.48 m` → +VIO `2.91 m` (+17 %)
+    - Disabling preintegration residual (`SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M=0`): `3.04 m` — still worse than visual-only
+    - Disabling gravity prior (`SVSLAM_BA_GRAVITY_PRIOR_WEIGHT=0`): `2.90 m` — essentially no change
+    - Hypothesis: MH_03's aggressive motion makes every IMU-path contribution noisy. The 126 `Lost` events vs 82 in the visual-only run suggest the first `predictVelocityFromImu` result or the per-KF gravity alignment from a ±50 ms aggressive-motion window is destabilizing Tracking. Not yet root-caused; see §16.4 for the next bisection to try.
+
+12. **`plan.md` §10 ordered experiments are partially stale.**
+    - §10.4 #1 ORB 2000 → 3000 regresses both mono room gates (`0.177 m` → `0.227 m`; `0.164 m` → `0.236 m`, above the `0.170 m` ceiling) despite plan.md predicting "strongest immediate increase in mono match density"
+    - §10.4 #4 / §10.2 #1 (initializer H/F ratio `0.50 → 0.60`) is already in the code
+    - Remaining items should be probed one-by-one on the narrowest relevant gate. See §12 for the recommended workflow
+
+13. **EuRoC stereo-only depth is degraded (pre-existing, not a VIO regression).**
+    - MH_01 `--stereo` no-IMU ATE ≈ `2.77 m` vs `3.44 m` visual mono (worse than mono on the long-distance flight)
+    - Pinhole stereo rectification is not handling EuRoC's fisheye-ish distortion well
+    - Unblocks the stereo tracking mode (Feature Matrix "Partial" row). Orthogonal to VIO work.
 
 ---
 
@@ -694,7 +824,24 @@ Ranked by severity:
 
 | Status | What is done | What remains |
 | --- | --- | --- |
-| Partial | EuRoC loader, EuRoC stereo depth, ROS2 node, metric-depth CLI | real EuRoC validation, stronger ROS2 parity, true stereo/tracking evolution, IMU tight coupling if ever prioritized |
+| Partial | EuRoC loader, EuRoC stereo depth, ROS2 node, metric-depth CLI, VIO Stage 0b (IMU preintegration scaffolding), VIO Stage 0c (BA preintegration residual + bias BA params + VI init), empirical MH_01/V1_01 ATE validation | VIO Stage 0c.f (ORB-SLAM3-style MAP refinement, larger window, gyro-bias Jacobian once biases converge), stronger ROS2 parity, true stereo/tracking evolution |
+
+#### VIO status (2026-04-20)
+
+Commits `bebc7d5..bd7b691` landed the loosely-coupled VI pipeline. Validated on EuRoC mono + `--accel`:
+
+| Dataset    | Visual only | +VIO (Stage 0c.d+e) |
+| --- | ---: | ---: |
+| MH_01_easy | 3.44 m      | **1.41 m** (−59%)   |
+| V1_01_easy | 1.25 m      | **1.31 m**          |
+
+- VI Init accepts V1_01 (rot_rms 0.05 rad < 0.08 threshold) and rejects MH_01 (rot_rms 0.13 rad). MH_01 benefits from the 9-DoF BA residual alone; V1_01 picks up additional gain from scale + gravity refinement.
+- Loose sigma defaults: `SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M=0.3` m, `SVSLAM_BA_PREINT_ROT_SIGMA_RAD=0.05` rad. MH_01 sweep shows σ=0.3 is optimal; tighter pulls poses too hard, looser discards IMU info.
+- Tried but reverted: gyro-bias first-order Jacobian inside the BA rotation residual. It gives BA a free parameter that absorbs visual rotation noise when biases are uncalibrated, regressing MH_01 by 2–3×. Re-visit only after a reliable VI init calibrates gyro bias.
+
+Known limitations:
+- Mono + `--stereo` on EuRoC yields ATE ~2.8 m even visual-only — the pinhole-rectified stereo pipeline is not handling EuRoC's fisheye-ish distortion well. Separate from the VIO work.
+- Gyro bias estimate from the linear VI init is unreliable on short EuRoC windows (O(0.05) rad/s vs O(0.004) ground truth); currently hard-capped at 0.05 rad/s and BA takes over via random-walk + anchor priors.
 
 ### Phase E: Community / Release Hygiene
 
@@ -858,9 +1005,9 @@ Ordered experiments:
    - Risk:
      - can increase false positives, so do this only after checking logs for candidate starvation
 
-### 10.4 `room_mono` gap: about `7.2x`
+### 10.4 `room_mono` gap: about `6.5x`
 
-- SimpleVisualSLAM current gate: `0.197374 m`
+- SimpleVisualSLAM current gate: `0.176506 m` (improved from `0.197374 m` after the pre-VIO mono-room work)
 - `stella_vslam`: `0.02743546 m`
 - Published loop-enabled comparison saw **no loop detections inside the first 250 frames**
 
@@ -872,12 +1019,11 @@ Most likely causes:
 
 Ordered experiments:
 
-1. `apps/run_mono.cc:311`
-   - Change:
-     - `cv::ORB::create(2000)` -> `3000`
-   - Expected effect:
-     - strongest immediate increase in mono match density
-     - helps both relocalization and loop detection
+1. ~~`apps/run_mono.cc`: `cv::ORB::create(2000)` → `3000`~~ **TESTED 2026-04-20 — REGRESSED, reverted.** Predicted "strongest immediate increase in mono match density" but:
+   - `room_mono_head_repro`: `0.177 m` → `0.227 m` (worse)
+   - `room_mono_accel_head_repro`: `0.164 m` → `0.236 m` (above `0.170 m` ceiling)
+   - `room_depth_head_repro`: `0.080 m` → `0.068 m` (actually improved)
+   - Mono is more sensitive to feature count at the 250-frame boundary than plan.md anticipated — more keypoints = more outlier BA candidates when the map is still thin. Do not re-try without pairing it with a depth-detecting gate bypass.
 
 2. `src/tracking/tracking.cc:775-824`
    - Change for mono only:
@@ -963,36 +1109,59 @@ If threshold changes plateau, these are the next non-trivial algorithmic moves:
 
 ## 11. Priority
 
-Work on these in order:
+Ordered for **2026-04-21 → next session**. Do the practical items first, then deep-dive:
 
-1. **Close the `room_mono` gap enough to get below `0.20 m`, then below `0.15 m`, while keeping `xyz_mono_head_repro <= 0.030000 m`.**
-   - Start with selective mono reference refresh / keyframe rules, not broad global threshold changes.
+1. **Land PR #3.**
+   - Branch: `vio-integration`, head `8e6f4e7`, not yet merged. 77/77 tests, 7/7 gates, EuRoC cross-seq validated.
+   - After merge, bump local `master`, rerun `ctest` + `scripts/check_regression_gate.py --all-gates` as a smoke check, delete the local branch.
 
-2. ~~**Strengthen `room_depth` pose graph.**~~ **Done (2026-04-15):** sequential edges between time-adjacent keyframes in `Optimizer::poseGraphOptimization` (`src/backend/optimizer.cc`); `room_depth_head_repro` measured `~0.080 m` on `build_codex`.
+2. **Diagnose MH_03 regression (§8.11 / §16.4).**
+   - 5-way IMU-path bisection: (a) accel_buffer_ population only, (b) gravity alignment only, (c) gravity prior only, (d) `predictVelocityFromImu` only, (e) `reconcileVelocityWithVisual` only. Binary-search which sub-path introduces the +0.4 m vs visual-only.
+   - Success criterion: MH_03 mean ATE at or below visual-only `2.48 m` with `--accel` on.
 
-3. ~~**Refresh `eval/stella_comparison_results.md` (fair head-250).**~~ **Done (2026-04-15):** top table + `eval/stella_comparison.json`; deeper sections in the markdown remain historical.
+3. **Commit a proper `eval/` artifact for the EuRoC cross-seq sweep.**
+   - Mirror `eval/room_depth_600frame_report.md`. Include sequence, frames, mean/median/max ATE, the exact `run_mono` command, the `evo_ape` command, and the commit hash.
+   - Same-day follow-up: a machine-readable `eval/euroc_vio_sweep.json` that `scripts/build_leaderboard.py` can ingest.
 
-4. ~~**Write a fresh current-HEAD 600-frame room-depth report into `eval/`.**~~ **Done:** `eval/room_depth_600frame_report.md`.
+4. **Probe `plan.md` §10 experiments one at a time.**
+   - §10.1 (xyz_depth) is the smallest gap and the lowest risk — start there.
+   - Rule: narrowest gate first, all-gates second, revert on any ceiling breach.
+   - Update the §10 table entry (✅ kept / ❌ reverted + measured numbers) inside the same commit.
 
-5. **Replace the synthetic EuRoC fallback with a real-sequence validation once dataset access is solved.**
+5. **Phase D deep-dives.** Choose one; do not stack.
+   - **ORB-SLAM3-style MAP VI init (§16.5):** non-linear joint optimization over {scale, gravity, velocities, accel_bias, gyro_bias} on the first ~30 KFs. Goal: make MH_01 accept VI init with rot_rms ≤ 0.08 rad.
+   - **EuRoC stereo rectification fix (§8.13):** proper fisheye / radtan support so `--stereo` on EuRoC isn't a regression vs mono.
+   - **ROS2 VIO hookup:** wire `Tracking::imu_buffer_` / `setImuToCameraExtrinsic` through `ros2/src/slam_node.cc`.
+
+Previously-priority items now complete:
+
+- ~~`xyz_mono` recovery~~ (done, `0.028 m` gate passing)
+- ~~`room_depth` pose graph~~ (done 2026-04-15)
+- ~~`eval/stella_comparison_results.md` fair head-250 refresh~~ (done)
+- ~~600-frame loop report~~ (`eval/room_depth_600frame_report.md`)
+- ~~Real EuRoC verification~~ (done 2026-04-19 / 2026-04-20 via Wayback; 5 sequences on disk, see §2.7–§2.8)
+- ~~VIO Stage 0b / 0c~~ (landed on `master`; PR #3 pending)
 
 ---
 
 ## 12. AI Agent Instructions
 
 1. Read in this order:
-   - this file
+   - **this file** (especially §2.1, §2.4, §2.7, §2.8, §8, §11, §16)
    - `apps/run_mono.cc`
-   - `src/tracking/tracking.cc`
+   - `src/tracking/tracking.cc` + `tracking.h`
    - `src/tracking/initializer.cc`
+   - `src/tracking/visual_inertial_initializer.{h,cc}` (if touching the VIO path)
    - `src/backend/local_mapping.cc`
-   - `src/backend/optimizer.cc`
+   - `src/backend/optimizer.{h,cc}` (the residual definitions live in the header)
+   - `src/sensors/imu_preintegrator.h` + `imu_preintegration_span.h`
    - `src/loop_closing/loop_closing.cc`
 
 2. Use the narrowest benchmark that can validate your change:
-   - mono front-end changes: `xyz_mono_head_repro`, then `room_mono_head_repro`
-   - pose-graph / loop changes: `room_depth_head_repro`, then loop-enabled comparison preset
-   - metric-depth changes: rerun the metric-depth scripts on `xyz` before touching `room`
+   - **mono front-end**: `xyz_mono_head_repro` *first* (thin margin), then `room_mono_head_repro`, then `room_mono_accel_head_repro` (thinnest margin — 4 %). Only after all three pass, run `--all-gates`.
+   - **pose-graph / loop**: `room_depth_head_repro`, then the loop-enabled comparison preset
+   - **metric-depth**: rerun the metric-depth scripts on `xyz` before touching `room`
+   - **VIO**: EuRoC mono `--accel` on MH_01 *first* (best-behaved, biggest gain), then cross-check on V1_01 (VI init accepts) and MH_03 (open regression; at least should not regress more). Visual-only baseline on the same sequence is a pre-requisite: run it too.
 
 3. For threaded changes, test both modes:
    - `--repro-eval`
@@ -1003,11 +1172,22 @@ Work on these in order:
    - do not propagate retained-note numbers into public docs without a fresh rerun
 
 5. Do not silently change protocol:
-   - keep `evo_ape` flags aligned with `eval/regression_baselines.json`
+   - keep `evo_ape` flags aligned with `eval/regression_baselines.json` for TUM gates (`--align --correct_scale --t_max_diff 0.05`)
+   - use the same flags for EuRoC mono (Sim3 is mandatory — mono scale is unobservable)
    - do not redefine what a regression gate means without updating the harness/docs together
 
 6. Do not commit unless explicitly asked.
    - If a human later asks for a commit, keep one logical change per commit and include the exact validation command(s).
+   - **Never add AI-generated markers** ("Generated with ...", "Co-Authored-By: Claude", etc.) to commit messages or PR descriptions — this project forbids them.
+
+7. When probing `plan.md` §10 experiments, trust the *direction* but not the *numbers*:
+   - The §10 lists were written against an earlier codebase state. Predicted gains have flipped sign at least once (ORB 3000 — see §8.12).
+   - Rule: narrowest gate first, all-gates second, revert on any ceiling breach, update the §10 table entry in the same commit with the measured delta and the date.
+
+8. When touching VIO:
+   - Default sigmas (§7.8) were tuned empirically on EuRoC. Do not tighten `SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M` below `0.2` without fresh evidence on MH_01.
+   - The gyro-bias first-order Jacobian inside the BA rotation residual was tried and reverted (§8.10). Do not re-enable without a working VI init first.
+   - `plan.md` §16 is the VIO-specific handoff; read it before making any change that touches `ImuPreintegrationSpan`, `VelocityPreintegrationError`, or the `VisualInertialInitializer`.
 
 ---
 
@@ -1149,7 +1329,9 @@ Best achieved: **0.01104** — still 1.24x behind stella (0.00889). The gap is l
 - Don't claim stella_vslam is beaten until reproduced 3x with identical protocol
 - Don't modify regression gate semantics without updating baselines
 
-## 15. Mono Room Handoff (2026-04-15)
+## 15. Mono Room Handoff (2026-04-15) — historical
+
+> **Historical note (2026-04-21):** this section was written when `room_mono_head_repro` was the single active frontier and VIO work had not started. The §15.1 safe-state number (`0.197374 m`) has since moved to `0.176506 m` on the current master. The guidance inside this section (favor ranking/selection over threshold widening; frame-199 diagnostic; trace-only diffs before behavior changes) is still valid for any mono-front-end change. Treat everything below as design context, not a current TODO — §16 supersedes it for the VIO frontier, and §11 / §10.4 carry the current mono TODO.
 
 This section is the immediate handoff for the next agent. It is intentionally more concrete than the older battle log above because the active frontier is now very narrow: `room_mono_head_repro` is the only materially weak gate left in the head-250 harness, and repeated broad threshold sweeps have already been ruled out.
 
@@ -1388,7 +1570,130 @@ sed -n '3928,3955p' log/room_mono_trace_next.log
 rg -n "BootstrapStats|Relocalize: Candidate KF|Relocalize: Matched with KF" log/room_mono_trace_next.log
 ```
 
-## 16. Non-Goals
+## 16. VIO Handoff (2026-04-21)
+
+This section supersedes §15 for any change that touches the IMU path. §15 remains the right handoff for mono-only front-end work.
+
+### 16.1 Current Safe State
+
+Master: `46a726d`. PR #3 (branch `vio-integration`, head `8e6f4e7`) adds a flaky-test fix and a gravity-prior env knob.
+
+Build + tests:
+
+```bash
+cmake -S . -B build -G Ninja -DBUILD_TESTS=ON
+cmake --build build -j$(nproc) --target svslam_core svslam_tests run_mono
+ctest --test-dir build --output-on-failure   # 77 / 77 PASS
+python3 scripts/check_regression_gate.py --build $PWD/build --data-tum $PWD/data/tum --all-gates --quiet
+# → 7 / 7 PASS, bitwise-identical trajectories
+```
+
+EuRoC mono `--accel` baselines (reproduce before changing anything):
+
+```bash
+./build/run_mono --euroc datasets/euroc/MH_01_easy --accel --reference-policy heuristic \
+  --skip-frames 0 --no-viz --repro-eval
+evo_ape tum datasets/euroc/MH_01_easy/gt_tum.txt build/trajectory.txt \
+  --align --correct_scale --t_max_diff 0.05 --no_warnings
+# → mean ~1.41 m
+```
+
+Matching visual-only baseline (same command without `--accel`) → `3.44 m`.
+
+### 16.2 Pipeline Diagram
+
+```
+Frame N (mono image) ───┐
+                        │
+                        ▼
+              Tracking::addFrame
+                        │
+                        ▼
+             Tracking::track
+              ├─ motion-model pose predict
+              ├─ stationary detection (accel_buffer_)
+              ├─ predictVelocityFromImu    ──► Frame::velocity_  (IMU body, world)
+              ├─ trackReferenceKeyframe  (reprojection / PnP)
+              ├─ trackLocalMap
+              ├─ reconcileVelocityWithVisual ──► blended Frame::velocity_
+              └─ if needNewKeyframe:
+                   Keyframe::Keyframe(Frame)        ─► copies velocity_, biases
+                   setKeyframeGravity                (gravity in camera frame)
+                   populateKeyframeImuSpan           ─► ImuPreintegrationSpan (delta_R/v/p, dt, T_cam_imu, from_kf_id)
+                   tryVisualInertialInit             (if enough KFs and vi_init_done_ == false)
+                        └─ VisualInertialInitializer::initialize
+                             ├─ Stage 1: closed-form gyro bias (capped at 0.05 rad/s)
+                             └─ Stage 2: LSQ for {scale, gravity, velocities}
+                        └─ on success: rescale map, rotate world to gravity-Z,
+                                        applyGyroBiasCorrectionToSpans (first-order Forster),
+                                        Optimizer::setPreintegrationResidualEnabled(true)
+
+LocalMapping::optimization    ─► Optimizer::bundleAdjustment
+   ├─ ReprojectionError (per landmark observation)
+   ├─ DepthPriorError        (if depth available)
+   ├─ GravityPriorError      (per KF with has_gravity_, env-tunable weight)
+   ├─ VelocityPreintegrationError  (9-DoF, when prev_imu_span_ valid)
+   ├─ VelocityDeltaPriorError       (loose fallback)
+   ├─ BiasAnchorError * 2            (accel + gyro anchors)
+   └─ BiasRandomWalkError * 2       (between consecutive KFs)
+```
+
+### 16.3 Key Invariants
+
+- `Frame::velocity_` is world-frame velocity of the **IMU body**, not the camera. The lever-arm term `t_bc` is baked into `VelocityPreintegrationError` so BA reconciles properly.
+- `ImuPreintegrationSpan::T_cam_imu` is captured at span-creation time, not looked up at BA time. If the EuRoC extrinsic ever becomes dynamic, revisit this.
+- Rotation alignment matters: the `initializeWithDepth` / `initialize` paths now rotate the gravity estimate from the IMU frame into the camera frame before building `T_align`. This was a silent bug for TUM (IMU ≈ camera) but catastrophic on EuRoC before the fix landed in `bebc7d5`.
+- Default: preintegration residual is **always on** when `has_velocity_` is set. VI init's role is to refine scale / gravity / velocities + apply the first-order gyro correction to spans, *not* to gate the residual. The old gated behavior is available via `SVSLAM_VIO_GATE_PREINT=1` but has been shown to regress MH_01 catastrophically when VI init rejects (1.41 → 3.46 m).
+
+### 16.4 Open Regression — MH_03_medium
+
+Visual-only `2.48 m`, +VIO `2.91 m` (+17 %). The `--accel` path clearly hurts, but none of the individual components fully explains it:
+
+| Config                                                 | Mean ATE |
+| ---                                                    | ---:     |
+| Visual-only                                            | `2.48 m` |
+| +IMU (full default config)                             | `2.91 m` |
+| +IMU, `SVSLAM_BA_VELOCITY_PRIOR_SIGMA_M=0` (preint off) | `3.04 m` |
+| +IMU, `SVSLAM_BA_GRAVITY_PRIOR_WEIGHT=0` (gravity off) | `2.90 m` |
+
+Lost-tracking events: 82 visual-only, 103–126 with `--accel`. Something in the IMU path is destabilizing Tracking itself, not just adding bad BA residuals.
+
+Next bisection to try (one at a time, commit env knobs as needed):
+
+1. Run with `--accel` but short-circuit `predictVelocityFromImu` to a no-op. If MH_03 recovers, the initial velocity estimate is the culprit.
+2. Short-circuit `setKeyframeGravity` (skip per-KF gravity direction). Eliminates noisy per-KF gravity propagation without touching the init-time alignment.
+3. Short-circuit `reconcileVelocityWithVisual`'s IMU path. Isolates the blended-velocity path from the raw-IMU path.
+4. As a last step, keep only `accel_buffer_` populated (so gravity init fires once, but no per-frame IMU work). If MH_03 still regresses, the init-time `T_align` on MH_03's accel window is miscomputed.
+
+Likely culprit on prior: short-circuit (1) or the init-time gravity alignment (4). MH_03 has aggressive flight, so a ±50 ms accel mean can drift noticeably from true gravity.
+
+### 16.5 Stage 0c.f — Follow-ups (not in this PR)
+
+Three candidate directions, ranked by expected payoff per hour:
+
+1. **ORB-SLAM3-style MAP-based VI init refinement.** After the current linear two-stage solve, run a Ceres problem over the first ~30 KFs with fixed visual poses and free {scale, gravity, per-KF velocities, accel_bias, gyro_bias}. Preintegration residuals + soft bias priors. Should make MH_01 and MH_03 accept VI init by reducing the rot_rms below `0.08 rad` — the current linear gyro-bias solve is too short-window-dependent.
+2. **Gyro-bias first-order Jacobian in the BA rotation residual** (re-tried after #1). The current reverted attempt regressed MH_01 2–3× because BA absorbed visual rotation noise into `bg`. Once the MAP init above delivers `bg` ≈ O(0.01 rad/s), the Jacobian becomes a refinement, not an over-fit. Gate behind `SVSLAM_BA_PREINT_ENABLE_GYRO_JACOBIAN=1` to avoid default surprises.
+3. **Longer VI-init window + source ranking.** Today `SVSLAM_VIO_MIN_INIT_KEYFRAMES=15`. Accepting at 25–30 should help V1_01-class windows where the first few mono rotations are noisier. Must be paired with a `max_init_attempts` cap so we stop retrying after the window stabilizes.
+
+### 16.6 Reference Files For Any VIO Change
+
+Minimum set to read and understand before changing anything VIO-side:
+
+- `src/sensors/imu.h` (ImuEntry value type)
+- `src/sensors/imu_preintegrator.h` (math)
+- `src/sensors/imu_preintegration_span.h` (per-KF-pair state)
+- `src/core/frame.h` and `core/keyframe.h` (where velocity / biases / spans live)
+- `src/tracking/tracking.h` + the VIO-named methods in `tracking.cc` (`predictVelocityFromImu`, `reconcileVelocityWithVisual`, `populateKeyframeImuSpan`, `tryVisualInertialInit`, plus the `gravity_aligned_` init paths)
+- `src/tracking/visual_inertial_initializer.{h,cc}` (linear 2-stage solve)
+- `src/backend/optimizer.h` — **all VIO residuals are defined here**: `VelocityPreintegrationError`, `VelocityDeltaPriorError`, `BiasAnchorError`, `BiasRandomWalkError`
+- `src/backend/optimizer.cc` — the `bundleAdjustment` function plumbs them; search for "preintegration" in that file
+- `apps/run_mono.cc` — EuRoC setup path, especially `setImuToCameraExtrinsic` and the preint-gate opt-in
+
+Minimum reproducing commands are in §16.1. Once you have new numbers, update §2.8, §8, §11 in the same commit.
+
+---
+
+## 17. Non-Goals
 
 Do **not** spend time on these unless a human explicitly reprioritizes them:
 

@@ -7,11 +7,17 @@ namespace svslam {
 Keyframe::Keyframe(Frame::Ptr frame)
     : id_(frame->id_), timestamp_(frame->timestamp_), camera_(frame->camera_),
       T_cw_(frame->getPose()),
+      velocity_(frame->velocity_),
+      accel_bias_(frame->accel_bias_),
+      gyro_bias_(frame->gyro_bias_),
+      has_velocity_(frame->has_velocity_),
       depth_image_(frame->depth_image_.empty() ? cv::Mat() : frame->depth_image_.clone()),
       depth_is_metric_(frame->depth_is_metric_),
       depth_is_learned_(frame->depth_is_learned_),
       keypoints_(frame->keypoints_), descriptors_(frame->descriptors_.clone()),
-      landmarks_(frame->landmarks_)
+      // Snapshot under frame->mutex_ so we don't copy from landmarks_ while
+      // onBACompleted on the LocalMapping thread holds the same mutex_.
+      landmarks_(frame->snapshotLandmarks())
 {
 }
 

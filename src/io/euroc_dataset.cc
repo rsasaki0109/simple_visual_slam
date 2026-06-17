@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 
+#include <Eigen/SVD>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -146,6 +147,30 @@ EurocDataset::EurocDataset(const std::string& seq_dir,
         return;
     }
 
+    // Cache cam0's T_BS (body=IMU → cam0) as a Sophus SE3 for downstream
+    // preintegration consumers. EuRoC matrices are stored row-major.
+    if (cam0_calib.T_BS.size() == 16) {
+        Eigen::Matrix4d T_cam_imu_mat;
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                T_cam_imu_mat(r, c) = cam0_calib.T_BS[static_cast<size_t>(r * 4 + c)];
+            }
+        }
+        // Renormalize the rotation block so SE3's internal quaternion stays
+        // unit-length despite the YAML's 6-digit truncation.
+        Eigen::Matrix3d R = T_cam_imu_mat.block<3, 3>(0, 0);
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+            R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d R_ortho = svd.matrixU() * svd.matrixV().transpose();
+        if (R_ortho.determinant() < 0.0) {
+            Eigen::Matrix3d V = svd.matrixV();
+            V.col(2) *= -1.0;
+            R_ortho = svd.matrixU() * V.transpose();
+        }
+        cam0_from_imu_ = SE3(R_ortho, T_cam_imu_mat.block<3, 1>(0, 3));
+        has_cam0_from_imu_ = true;
+    }
+
     initCalibration(cam0_calib, K_, dist_coeffs_, new_K_, undist_map1_, undist_map2_);
     if (stereo_enabled_) {
         initCalibration(cam1_calib, right_K_, right_dist_coeffs_, right_new_K_, right_undist_map1_,
@@ -169,6 +194,15 @@ EurocDataset::EurocDataset(const std::string& seq_dir,
     if (entries_.empty()) {
         error_ = stereo_enabled_ ? "no stereo entries in data.csv" : "no entries in data.csv";
         return;
+    }
+
+    // IMU is optional — only fail on parse error, not on missing file.
+    const std::string imu_csv =
+        (std::filesystem::path(seq_dir_) / "mav0" / "imu0" / "data.csv").string();
+    if (std::filesystem::exists(imu_csv)) {
+        if (!loadImuCsv(imu_csv)) {
+            return;
+        }
     }
 }
 
@@ -220,6 +254,32 @@ bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path, EurocPinh
         return false;
     }
 
+    // Slurp the whole file so we can fold multi-line YAML arrays (EuRoC
+    // stores T_BS's 16 values wrapped across 4 lines) into a single virtual
+    // line before handing it to parseArrayLine.
+    std::string raw((std::istreambuf_iterator<char>(ifs)),
+                     std::istreambuf_iterator<char>());
+
+    // Collapse any '[' ... ']' block into one line. Safe here because
+    // sensor.yaml only uses bracket arrays for numeric sequences.
+    std::string flat;
+    flat.reserve(raw.size());
+    int bracket_depth = 0;
+    for (char c : raw) {
+        if (c == '[') {
+            ++bracket_depth;
+            flat.push_back(c);
+        } else if (c == ']') {
+            --bracket_depth;
+            flat.push_back(c);
+        } else if (bracket_depth > 0 && (c == '\n' || c == '\r')) {
+            flat.push_back(' ');
+        } else {
+            flat.push_back(c);
+        }
+    }
+
+    std::stringstream folded(flat);
     bool got_intrinsics = false;
     bool got_resolution = false;
     std::vector<double> values;
@@ -227,7 +287,7 @@ bool EurocDataset::loadSensorYaml(const std::string& sensor_yaml_path, EurocPinh
     bool in_t_bs_block = false;
 
     std::string line;
-    while (std::getline(ifs, line)) {
+    while (std::getline(folded, line)) {
         line = trim(line);
         if (line.empty()) continue;
         if (line[0] == '#') continue;
@@ -334,6 +394,68 @@ bool EurocDataset::loadDataCsv(const std::string& data_csv_path,
     }
 
     return true;
+}
+
+bool EurocDataset::loadImuCsv(const std::string& imu_csv_path) {
+    std::ifstream ifs(imu_csv_path);
+    if (!ifs.is_open()) {
+        error_ = "failed to open imu0 data.csv: " + imu_csv_path;
+        return false;
+    }
+
+    imu_entries_.clear();
+    std::string line;
+    bool first = true;
+    while (std::getline(ifs, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        if (line[0] == '#') continue;
+        if (first) {
+            first = false;
+            if (line.find("timestamp") != std::string::npos) continue;
+        }
+
+        std::stringstream ss(line);
+        std::string field;
+        std::vector<std::string> fields;
+        while (std::getline(ss, field, ',')) {
+            fields.push_back(trim(field));
+        }
+        // Expect: ts_ns, wx, wy, wz, ax, ay, az
+        if (fields.size() < 7) continue;
+
+        try {
+            const long long ts_ns = std::stoll(fields[0]);
+            ImuEntry e;
+            e.timestamp_sec = static_cast<double>(ts_ns) * 1e-9;
+            e.gyro  = Vec3(std::stod(fields[1]), std::stod(fields[2]), std::stod(fields[3]));
+            e.accel = Vec3(std::stod(fields[4]), std::stod(fields[5]), std::stod(fields[6]));
+            imu_entries_.push_back(e);
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+
+    std::sort(imu_entries_.begin(), imu_entries_.end(),
+              [](const ImuEntry& a, const ImuEntry& b) {
+                  return a.timestamp_sec < b.timestamp_sec;
+              });
+    return true;
+}
+
+std::vector<ImuEntry> EurocDataset::getImuBetween(double t0, double t1) const {
+    std::vector<ImuEntry> out;
+    if (imu_entries_.empty() || !(t1 > t0)) {
+        return out;
+    }
+    // Binary search for first sample with timestamp > t0.
+    auto lo = std::upper_bound(
+        imu_entries_.begin(), imu_entries_.end(), t0,
+        [](double v, const ImuEntry& e) { return v < e.timestamp_sec; });
+    for (auto it = lo; it != imu_entries_.end() && it->timestamp_sec <= t1; ++it) {
+        out.push_back(*it);
+    }
+    return out;
 }
 
 bool EurocDataset::buildStereoEntries(const std::vector<CsvEntry>& left_entries,

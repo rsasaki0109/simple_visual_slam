@@ -14,6 +14,8 @@
 #include "core/keyframe.h"
 #include "core/landmark.h"
 #include "sensors/accelerometer.h"
+#include "sensors/imu_preintegrator.h"
+#include "backend/optimizer.h"
 
 namespace svslam {
 
@@ -238,6 +240,10 @@ void assignFrameLandmarksFromInliers(const Frame::Ptr& frame,
         return;
     }
 
+    // Hold frame->mutex_ around the assign + writes: onBACompleted may be
+    // snapshotting frame->landmarks_ on the LocalMapping thread at the same
+    // time.
+    std::lock_guard<std::mutex> lock(frame->mutex_);
     frame->landmarks_.assign(frame->keypoints_.size(), nullptr);
     for (const int index : inliers) {
         if (index < 0 || index >= static_cast<int>(keypoint_indices.size()) ||
@@ -316,6 +322,15 @@ bool Tracking::initializeWithDepth() {
     if (!gravity_aligned_ && !accel_buffer_.empty()) {
         Vec3 gravity = AccelerometerProcessor::estimateGravity(accel_buffer_);
         if (gravity.norm() > 0.5) {
+            // Accelerometer samples live in the IMU body frame; if T_cam_imu
+            // is set (EuRoC), rotate into the camera frame before building
+            // the align transform so the computed R_align lives in the
+            // camera-from-world sense that setPose(T_cw) expects. On
+            // sensors where IMU ≈ camera (TUM freiburg1), T_cam_imu_ is
+            // identity and this is a no-op.
+            if (has_cam_imu_extrinsic_) {
+                gravity = T_cam_imu_.so3() * gravity;
+            }
             Mat33 R_align = AccelerometerProcessor::computeGravityAlignment(gravity);
             SE3 T_aligned(R_align, Vec3(0, 0, 0));
             current_frame_->setPose(T_aligned);
@@ -330,6 +345,10 @@ bool Tracking::initializeWithDepth() {
     int created = 0;
     static unsigned long depth_lm_id = 200000;
 
+    // kf is not yet published to the map, so kf->landmarks_ writes are
+    // single-threaded. current_frame_ is published; hold its mutex_ across
+    // the loop to avoid racing with onBACompleted reads.
+    std::lock_guard<std::mutex> frame_lock(current_frame_->mutex_);
     for (size_t i = 0; i < kf->keypoints_.size(); ++i) {
         auto lm = createDepthLandmark(kf, i, depth_lm_id);
         if (!lm) {
@@ -460,6 +479,9 @@ bool Tracking::initialize() {
             if (!gravity_aligned_ && !accel_buffer_.empty()) {
                 Vec3 gravity = AccelerometerProcessor::estimateGravity(accel_buffer_);
                 if (gravity.norm() > 0.5) {
+                    if (has_cam_imu_extrinsic_) {
+                        gravity = T_cam_imu_.so3() * gravity;
+                    }
                     Mat33 R_align = AccelerometerProcessor::computeGravityAlignment(gravity);
                     T_align = SE3(R_align, Vec3(0, 0, 0));
                     gravity_aligned_ = true;
@@ -540,10 +562,19 @@ bool Tracking::initialize() {
                     // Add landmarks to keyframes
                     kf_init->landmarks_[idx_ref] = lm;
                     kf_cur->landmarks_[idx_cur] = lm;
-                    
-                    // Update Frames as well so they are tracked
-                    initial_frame_->landmarks_[idx_ref] = lm;
-                    current_frame_->landmarks_[idx_cur] = lm;
+
+                    // Update Frames as well so they are tracked. Both frames
+                    // are published (initial_frame_ may still be the target
+                    // of an onBACompleted snapshot path), so take each
+                    // mutex_ around the single-slot write.
+                    {
+                        std::lock_guard<std::mutex> lock(initial_frame_->mutex_);
+                        initial_frame_->landmarks_[idx_ref] = lm;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(current_frame_->mutex_);
+                        current_frame_->landmarks_[idx_cur] = lm;
+                    }
                     
                     // Add to map
                     if (map_) {
@@ -643,6 +674,11 @@ bool Tracking::track() {
             SE3 T_cw_pred = velocity_ * last_frame_->getPose();
             current_frame_->setPose(T_cw_pred);
         }
+
+        // IMU preintegration -> world-frame velocity estimate on current_frame_.
+        // Pose uses the visual motion model above; IMU only seeds Frame::velocity_
+        // so BA can apply a loose velocity prior. See predictVelocityFromImu().
+        predictVelocityFromImu();
     }
 
     // 2. Track Reference Keyframe (Frame-to-Frame matching for now)
@@ -683,6 +719,7 @@ bool Tracking::track() {
             loop_correction_state_.skip_velocity_update_once = false;
         } else if (last_frame_) {
             velocity_ = current_frame_->getPose() * last_frame_->getPose().inverse();
+            reconcileVelocityWithVisual();
         }
     } else {
         std::cout << "Tracking: Lost, attempting relocalization..." << std::endl;
@@ -755,6 +792,11 @@ bool Tracking::track() {
         // Create new Keyframe
         auto kf = std::make_shared<Keyframe>(current_frame_);
         setKeyframeGravity(kf);
+        // Capture IMU preintegration from the previous reference KF. BA reads
+        // kf->prev_imu_span_ when the span is valid; otherwise it falls back
+        // to the loose velocity prior. reference_keyframe_ has not yet been
+        // updated to this kf, so it points at the correct predecessor.
+        populateKeyframeImuSpan(kf, reference_keyframe_);
         for (size_t i = 0; i < kf->landmarks_.size(); ++i) {
             auto& lm = kf->landmarks_[i];
             if (!lm || lm->isBad()) continue;
@@ -814,6 +856,11 @@ bool Tracking::track() {
         }
 
         loop_correction_state_.force_keyframe_insertion_once = false;
+
+        // After each new KF, try to bootstrap VI init. Once it succeeds
+        // the call is a no-op and the BA preintegration residual becomes
+        // active (see gating in backend/optimizer.cc).
+        tryVisualInertialInit();
     }
 
     return state_ == TrackingState::OK;
@@ -826,8 +873,15 @@ bool Tracking::needNewKeyframe() {
     const int frames_since_reference =
         static_cast<int>(current_frame_->id_ - reference_keyframe_->id_);
 
+    // Snapshot reference_keyframe_->landmarks_ under kf->mutex_ —
+    // LocalMapping::createNewMapPoints writes the same container.
+    std::vector<Landmark::Ptr> ref_landmarks_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(reference_keyframe_->mutex_);
+        ref_landmarks_snapshot = reference_keyframe_->landmarks_;
+    }
     int ref_landmarks = 0;
-    for (auto& lm : reference_keyframe_->landmarks_) {
+    for (auto& lm : ref_landmarks_snapshot) {
         if (lm && !lm->isBad()) {
             ref_landmarks++;
         }
@@ -1648,7 +1702,9 @@ bool Tracking::trackReferenceKeyframe() {
     
     // Propagate landmark associations from last frame via feature matches.
     // This is critical for bootstrapping 3D-2D PnP in subsequent frames.
-    current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
+    // Hold current_frame_->mutex_ across assign + inner writes: onBACompleted
+    // may snapshot landmarks_ concurrently. last_frame_ is only read and
+    // only the tracking thread writes it, so reads below are safe.
     int propagated = 0;
 
     // Optimization: Pose from 3D-2D
@@ -1656,37 +1712,42 @@ bool Tracking::trackReferenceKeyframe() {
     std::vector<cv::Point2f> image_points;
     std::vector<int> current_kp_indices;
     std::vector<Landmark::Ptr> propagated_landmarks;
-    
-    for (const auto& m : good_matches) {
-        // Query is current, Train is last
-        int idx_last = m.trainIdx;
-        int idx_curr = m.queryIdx;
-        
-        if (idx_last >= 0 && idx_last < static_cast<int>(last_frame_->landmarks_.size()) &&
-            last_frame_->landmarks_[idx_last]) {
-            // Found a map point
-            Vec3 pos = last_frame_->landmarks_[idx_last]->getPos();
-            if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) continue;
 
-            Vec3 p_c = current_frame_->getPose() * pos;
-            if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) continue;
-            if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) continue;
+    {
+        std::lock_guard<std::mutex> lock(current_frame_->mutex_);
+        current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
 
-            const int octave = current_frame_->keypoints_[idx_curr].octave;
-            const double gate_px = 48.0 * (1.0 + 0.12 * static_cast<double>(std::max(0, octave)));
-            Vec2 proj = current_frame_->camera_->project(p_c);
-            const auto& uv = current_frame_->keypoints_[idx_curr].pt;
-            const double dx = uv.x - proj[0];
-            const double dy = uv.y - proj[1];
-            if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+        for (const auto& m : good_matches) {
+            // Query is current, Train is last
+            int idx_last = m.trainIdx;
+            int idx_curr = m.queryIdx;
 
-            object_points.push_back(cv::Point3f(pos.x(), pos.y(), pos.z()));
-            image_points.push_back(uv);
+            if (idx_last >= 0 && idx_last < static_cast<int>(last_frame_->landmarks_.size()) &&
+                last_frame_->landmarks_[idx_last]) {
+                // Found a map point
+                Vec3 pos = last_frame_->landmarks_[idx_last]->getPos();
+                if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) continue;
 
-            current_frame_->landmarks_[idx_curr] = last_frame_->landmarks_[idx_last];
-            current_kp_indices.push_back(idx_curr);
-            propagated_landmarks.push_back(last_frame_->landmarks_[idx_last]);
-            propagated++;
+                Vec3 p_c = current_frame_->getPose() * pos;
+                if (!std::isfinite(p_c.x()) || !std::isfinite(p_c.y()) || !std::isfinite(p_c.z())) continue;
+                if (p_c[2] <= kMinTrackedDepthMeters || p_c[2] > kMaxTrackedDepthMeters) continue;
+
+                const int octave = current_frame_->keypoints_[idx_curr].octave;
+                const double gate_px = 48.0 * (1.0 + 0.12 * static_cast<double>(std::max(0, octave)));
+                Vec2 proj = current_frame_->camera_->project(p_c);
+                const auto& uv = current_frame_->keypoints_[idx_curr].pt;
+                const double dx = uv.x - proj[0];
+                const double dy = uv.y - proj[1];
+                if ((dx * dx + dy * dy) > gate_px * gate_px) continue;
+
+                object_points.push_back(cv::Point3f(pos.x(), pos.y(), pos.z()));
+                image_points.push_back(uv);
+
+                current_frame_->landmarks_[idx_curr] = last_frame_->landmarks_[idx_last];
+                current_kp_indices.push_back(idx_curr);
+                propagated_landmarks.push_back(last_frame_->landmarks_[idx_last]);
+                propagated++;
+            }
         }
     }
 
@@ -1844,8 +1905,12 @@ std::size_t Tracking::countValidFrameLandmarks(const Frame::Ptr& frame) {
         return 0;
     }
 
+    // Snapshot under frame->mutex_ — this path is reached from onBACompleted
+    // on the LocalMapping thread while the tracking thread may concurrently
+    // write frame->landmarks_[i].
+    const auto snapshot = frame->snapshotLandmarks();
     std::size_t correspondences = 0;
-    for (const auto& lm : frame->landmarks_) {
+    for (const auto& lm : snapshot) {
         if (!lm || lm->isBad()) continue;
         const Vec3 pos = lm->getPos();
         if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z())) {
@@ -1925,13 +1990,16 @@ bool Tracking::recomputeCurrentPose() {
         return false;
     }
 
-    // Collect 3D-2D correspondences from current frame's landmark associations
+    // Collect 3D-2D correspondences from current frame's landmark associations.
+    // Snapshot landmarks_ under current_frame_->mutex_ — this runs on the
+    // LocalMapping thread via onBACompleted while tracking may be writing.
+    const auto landmarks_snapshot = current_frame_->snapshotLandmarks();
     std::vector<cv::Point3f> pts3d;
     std::vector<cv::Point2f> pts2d;
     std::vector<int> indices;
 
-    for (size_t i = 0; i < current_frame_->landmarks_.size(); i++) {
-        auto lm = current_frame_->landmarks_[i];
+    for (size_t i = 0; i < landmarks_snapshot.size(); i++) {
+        auto lm = landmarks_snapshot[i];
         if (!lm || lm->isBad()) continue;
 
         Vec3 pos = lm->getPos();  // BA-updated position
@@ -2063,11 +2131,19 @@ bool Tracking::relocalize() {
             }
         }
 
+        // Snapshot kf->landmarks_ under kf->mutex_ to avoid racing with
+        // LocalMapping::createNewMapPoints writes on the same container.
+        std::vector<Landmark::Ptr> kf_landmarks_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(kf->mutex_);
+            kf_landmarks_snapshot = kf->landmarks_;
+        }
+
         int valid_3d_matches = 0;
         for (const auto& m : good) {
             const int kf_idx = m.trainIdx;
-            if (kf_idx < 0 || kf_idx >= static_cast<int>(kf->landmarks_.size())) continue;
-            const auto& lm = kf->landmarks_[kf_idx];
+            if (kf_idx < 0 || kf_idx >= static_cast<int>(kf_landmarks_snapshot.size())) continue;
+            const auto& lm = kf_landmarks_snapshot[kf_idx];
             if (!lm || lm->isBad()) continue;
 
             const Vec3 pos = lm->getPos();
@@ -2237,14 +2313,23 @@ bool Tracking::relocalize() {
         std::vector<cv::Point2f> pts2d;
         std::vector<int> match_indices;
 
+        // Snapshot cand.kf->landmarks_ under kf->mutex_ — LocalMapping's
+        // createNewMapPoints writes kf->landmarks_[idx] concurrently and TSan
+        // flagged the unprotected read here.
+        std::vector<Landmark::Ptr> kf_landmarks;
+        {
+            std::lock_guard<std::mutex> lock(cand.kf->mutex_);
+            kf_landmarks = cand.kf->landmarks_;
+        }
+
         for (size_t m_idx = 0; m_idx < cand.matches.size(); m_idx++) {
             auto& m = cand.matches[m_idx];
             int kf_idx = m.trainIdx;
             int curr_idx = m.queryIdx;
 
-            if (kf_idx >= 0 && kf_idx < static_cast<int>(cand.kf->landmarks_.size()) &&
-                cand.kf->landmarks_[kf_idx]) {
-                auto lm = cand.kf->landmarks_[kf_idx];
+            if (kf_idx >= 0 && kf_idx < static_cast<int>(kf_landmarks.size()) &&
+                kf_landmarks[kf_idx]) {
+                auto lm = kf_landmarks[kf_idx];
                 if (lm->isBad()) continue;
 
                 Vec3 pos = lm->getPos();
@@ -2356,20 +2441,35 @@ bool Tracking::relocalize() {
         const auto& best_candidate = candidates[best_success.candidate_index];
         current_frame_->setPose(best_success.pose);
 
-        current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
-        for (int idx : best_success.inlier_indices) {
-            if (idx < 0 || idx >= static_cast<int>(best_success.match_indices.size())) {
-                continue;
-            }
-            const int orig_match_idx = best_success.match_indices[idx];
-            if (orig_match_idx < 0 || orig_match_idx >= static_cast<int>(best_candidate.matches.size())) {
-                continue;
-            }
-            const int kf_idx = best_candidate.matches[orig_match_idx].trainIdx;
-            const int curr_idx = best_candidate.matches[orig_match_idx].queryIdx;
-            if (kf_idx >= 0 && kf_idx < static_cast<int>(best_candidate.kf->landmarks_.size()) &&
-                curr_idx >= 0 && curr_idx < static_cast<int>(current_frame_->landmarks_.size())) {
-                current_frame_->landmarks_[curr_idx] = best_candidate.kf->landmarks_[kf_idx];
+        // Snapshot best_candidate.kf->landmarks_ first (separate lock) so we
+        // don't hold two container mutexes at once — LocalMapping only takes
+        // one KF mutex at a time, and the existing race-fix convention avoids
+        // lock-order inversion.
+        std::vector<Landmark::Ptr> best_kf_landmarks;
+        {
+            std::lock_guard<std::mutex> lock(best_candidate.kf->mutex_);
+            best_kf_landmarks = best_candidate.kf->landmarks_;
+        }
+
+        // Lock current_frame_->mutex_ around assign + inner writes to avoid
+        // racing with onBACompleted snapshot on the LocalMapping thread.
+        {
+            std::lock_guard<std::mutex> lock(current_frame_->mutex_);
+            current_frame_->landmarks_.assign(current_frame_->keypoints_.size(), nullptr);
+            for (int idx : best_success.inlier_indices) {
+                if (idx < 0 || idx >= static_cast<int>(best_success.match_indices.size())) {
+                    continue;
+                }
+                const int orig_match_idx = best_success.match_indices[idx];
+                if (orig_match_idx < 0 || orig_match_idx >= static_cast<int>(best_candidate.matches.size())) {
+                    continue;
+                }
+                const int kf_idx = best_candidate.matches[orig_match_idx].trainIdx;
+                const int curr_idx = best_candidate.matches[orig_match_idx].queryIdx;
+                if (kf_idx >= 0 && kf_idx < static_cast<int>(best_kf_landmarks.size()) &&
+                    curr_idx >= 0 && curr_idx < static_cast<int>(current_frame_->landmarks_.size())) {
+                    current_frame_->landmarks_[curr_idx] = best_kf_landmarks[kf_idx];
+                }
             }
         }
 
@@ -2498,8 +2598,14 @@ bool Tracking::reinitialize() {
 
         kf_ref->landmarks_[tp.idx_ref] = lm;
         kf_cur->landmarks_[tp.idx_cur] = lm;
-        reinitialization_state_.reference_frame->landmarks_[tp.idx_ref] = lm;
-        current_frame_->landmarks_[tp.idx_cur] = lm;
+        {
+            std::lock_guard<std::mutex> lock(reinitialization_state_.reference_frame->mutex_);
+            reinitialization_state_.reference_frame->landmarks_[tp.idx_ref] = lm;
+        }
+        {
+            std::lock_guard<std::mutex> lock(current_frame_->mutex_);
+            current_frame_->landmarks_[tp.idx_cur] = lm;
+        }
 
         if (map_) {
             map_->addLandmark(lm);
@@ -2551,6 +2657,393 @@ void Tracking::setKeyframeGravity(Keyframe::Ptr kf) {
     // For TUM datasets, accelerometer frame ≈ camera frame (close enough for prior)
     kf->gravity_in_camera_ = g_sensor.normalized();
     kf->has_gravity_ = true;
+}
+
+void Tracking::predictVelocityFromImu() {
+    if (!last_frame_ || !current_frame_) return;
+    if (imu_buffer_.empty()) return;
+    if (!gravity_aligned_) return;
+
+    const double t_i = last_frame_->timestamp_;
+    const double t_j = current_frame_->timestamp_;
+    if (!(t_j > t_i) || (t_j - t_i) > 1.0) return;
+
+    // Pick IMU samples whose timestamp falls in [t_i, t_j]. imu_buffer_ is
+    // already sorted ascending at load time (EuRoC imu0 CSV order).
+    auto begin_it = std::lower_bound(
+        imu_buffer_.begin(), imu_buffer_.end(), t_i,
+        [](const ImuEntry& e, double t) { return e.timestamp_sec < t; });
+    auto end_it = std::upper_bound(
+        imu_buffer_.begin(), imu_buffer_.end(), t_j,
+        [](double t, const ImuEntry& e) { return t < e.timestamp_sec; });
+    if (std::distance(begin_it, end_it) < 2) return;
+
+    // Biases are zero in Stage 0b until a VIO backend estimates them; keep the
+    // last-frame copy so upstream code can refine them later without touching
+    // this call site.
+    ImuPreintegrator preint(last_frame_->accel_bias_, last_frame_->gyro_bias_);
+    auto prev_it = begin_it;
+    auto next_it = prev_it + 1;
+    while (next_it != end_it) {
+        const double dt_step = next_it->timestamp_sec - prev_it->timestamp_sec;
+        if (dt_step > 0.0 && dt_step < 0.5) {
+            // Midpoint-free: integrate using the earlier sample; fine for a
+            // loose prior at EuRoC's 200 Hz IMU rate.
+            preint.integrate(prev_it->accel, prev_it->gyro, dt_step);
+        }
+        prev_it = next_it;
+        ++next_it;
+    }
+    if (preint.deltaT() <= 0.0) return;
+
+    // Convert the camera pose T_cw to an IMU-body pose T_wb so the Forster
+    // integrator runs in the frame it measures in. With T_cam_imu_ unset the
+    // formula collapses to the camera-is-body approximation.
+    const SE3 T_cw_last = last_frame_->getPose();
+    const SE3 T_wc_last = T_cw_last.inverse();
+    const SE3 T_wb_last = T_wc_last * T_cam_imu_;
+    const Sophus::SO3d R_wb_last = T_wb_last.so3();
+    const Vec3 p_wb_last = T_wb_last.translation();
+
+    // Lever-arm between IMU and camera is small on EuRoC (<= ~5 cm) so we
+    // treat body and camera world-frame velocities as equal to keep the BA
+    // prior consumer simple. The residual's loose sigma absorbs the error.
+    const Vec3 v_wb_last = last_frame_->has_velocity_
+        ? last_frame_->velocity_
+        : Vec3::Zero();
+    const Vec3 gravity_w(0.0, 0.0, -9.81);
+
+    Sophus::SO3d R_wb_new;
+    Vec3 v_wb_new;
+    Vec3 p_wb_new;
+    preint.predict(R_wb_last, v_wb_last, p_wb_last, gravity_w,
+                   R_wb_new, v_wb_new, p_wb_new);
+    if (!v_wb_new.allFinite()) return;
+
+    current_frame_->velocity_ = v_wb_new;
+    current_frame_->has_velocity_ = true;
+    current_frame_->accel_bias_ = last_frame_->accel_bias_;
+    current_frame_->gyro_bias_ = last_frame_->gyro_bias_;
+}
+
+void Tracking::populateKeyframeImuSpan(const Keyframe::Ptr& kf,
+                                       const Keyframe::Ptr& prev_kf) {
+    if (!kf || !prev_kf || imu_buffer_.empty()) return;
+    const double t_i = prev_kf->timestamp_;
+    const double t_j = kf->timestamp_;
+    if (!(t_j > t_i) || (t_j - t_i) > 5.0) return;
+
+    auto begin_it = std::lower_bound(
+        imu_buffer_.begin(), imu_buffer_.end(), t_i,
+        [](const ImuEntry& e, double t) { return e.timestamp_sec < t; });
+    auto end_it = std::upper_bound(
+        imu_buffer_.begin(), imu_buffer_.end(), t_j,
+        [](double t, const ImuEntry& e) { return t < e.timestamp_sec; });
+    if (std::distance(begin_it, end_it) < 2) return;
+
+    ImuPreintegrator preint(prev_kf->accel_bias_, prev_kf->gyro_bias_);
+    auto prev_it = begin_it;
+    auto next_it = prev_it + 1;
+    while (next_it != end_it) {
+        const double dt_step = next_it->timestamp_sec - prev_it->timestamp_sec;
+        if (dt_step > 0.0 && dt_step < 0.5) {
+            preint.integrate(prev_it->accel, prev_it->gyro, dt_step);
+        }
+        prev_it = next_it;
+        ++next_it;
+    }
+    if (preint.deltaT() <= 0.0) return;
+
+    auto span = std::make_unique<ImuPreintegrationSpan>();
+    span->delta_R = preint.deltaR();
+    span->delta_v = preint.deltaV();
+    span->delta_p = preint.deltaP();
+    span->dt = preint.deltaT();
+    span->bias_accel = prev_kf->accel_bias_;
+    span->bias_gyro = prev_kf->gyro_bias_;
+    span->from_kf_id = prev_kf->id_;
+    span->T_cam_imu = T_cam_imu_;
+    span->valid = span->delta_v.allFinite() && span->delta_p.allFinite();
+    if (span->valid) {
+        kf->prev_imu_span_ = std::move(span);
+    }
+}
+
+void Tracking::reconcileVelocityWithVisual() {
+    if (!last_frame_ || !current_frame_) return;
+    const double dt = current_frame_->timestamp_ - last_frame_->timestamp_;
+    if (!(dt > 0.0) || dt > 1.0) return;
+
+    const Vec3 p_wc_curr = current_frame_->getPose().inverse().translation();
+    const Vec3 p_wc_last = last_frame_->getPose().inverse().translation();
+    const Vec3 v_visual = (p_wc_curr - p_wc_last) / dt;
+    if (!v_visual.allFinite()) return;
+
+    // IMU prediction weight for the blend. 0 = trust visual fully (default);
+    // 1 = keep raw IMU estimate untouched. Biases are uncalibrated in Stage
+    // 0b so a low alpha is usually best.
+    double alpha_imu = 0.3;
+    if (const char* env = std::getenv("SVSLAM_VIO_VELOCITY_IMU_ALPHA")) {
+        char* end = nullptr;
+        const double parsed = std::strtod(env, &end);
+        if (end != env && std::isfinite(parsed) && parsed >= 0.0 && parsed <= 1.0) {
+            alpha_imu = parsed;
+        }
+    }
+
+    if (current_frame_->has_velocity_) {
+        current_frame_->velocity_ =
+            alpha_imu * current_frame_->velocity_ + (1.0 - alpha_imu) * v_visual;
+    } else if (std::getenv("SVSLAM_VIO_ENABLE_VISUAL_VELOCITY")) {
+        // Opt-in: also populate velocity on non-IMU runs so the BA prior acts
+        // as a trajectory-smoothness regularizer. Default behavior preserves
+        // existing TUM gates untouched.
+        current_frame_->velocity_ = v_visual;
+        current_frame_->has_velocity_ = true;
+    }
+}
+
+int Tracking::readVioMinInitKeyframes() {
+    // Env knob to control when Tracking attempts VI init. Default matches
+    // the ORB-SLAM3 "first ~1–2 s of KFs" heuristic and leaves enough
+    // dynamics for the linear solve to stay well-conditioned.
+    int min_kfs = 15;
+    if (const char* env = std::getenv("SVSLAM_VIO_MIN_INIT_KEYFRAMES")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end != env && parsed >= 4 && parsed <= 500) {
+            min_kfs = static_cast<int>(parsed);
+        }
+    }
+    return min_kfs;
+}
+
+void Tracking::tryVisualInertialInit() {
+    if (vi_init_done_) return;
+    if (!map_) return;
+    if (imu_buffer_.empty()) return;  // TUM / non-IMU runs: hard no-op
+
+    const int min_kfs = readVioMinInitKeyframes();
+
+    // Collect keyframes in temporal order. We intentionally ignore the
+    // re-init edge cases (their KFs get published in a fresh window) and
+    // only proceed when the raw KF count has reached the threshold.
+    std::vector<Keyframe::Ptr> ordered;
+    {
+        // Snapshot under the map mutex; the main path already holds it
+        // briefly elsewhere. Local BA runs on its own thread and may mutate
+        // kf->T_cw_ during this snapshot, but SE3 copies are safe (trivial
+        // Eigen types) and we only need a stable *view* for the solve.
+        const auto& kfs = map_->getAllKeyframes();
+        ordered.reserve(kfs.size());
+        for (const auto& kv : kfs) {
+            if (kv.second) ordered.push_back(kv.second);
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const Keyframe::Ptr& a, const Keyframe::Ptr& b) {
+                  return a->id_ < b->id_;
+              });
+
+    if (static_cast<int>(ordered.size()) < min_kfs) return;
+
+    // The first one or two KFs in a mono session come from the Initializer
+    // and don't carry a preintegration span (there's no predecessor at
+    // map bootstrap). Skip them so the window starts from the first KF
+    // that DOES have a span whose from_kf_id matches its predecessor.
+    std::size_t window_start = 0;
+    for (std::size_t i = 1; i < ordered.size(); ++i) {
+        const auto& span = ordered[i]->prev_imu_span_;
+        if (!span || !span->valid) continue;
+        if (span->from_kf_id != ordered[i - 1]->id_) continue;
+        window_start = i - 1;
+        break;
+    }
+
+    if (window_start + static_cast<std::size_t>(min_kfs) > ordered.size()) {
+        // not yet enough usable KFs
+        return;
+    }
+
+    std::vector<Keyframe::Ptr> window(ordered.begin() + window_start,
+                                      ordered.begin() + window_start + min_kfs);
+
+    // Every KF past the first one in the window must have a valid span
+    // linked to its immediate predecessor; skip the attempt otherwise.
+    for (std::size_t i = 1; i < window.size(); ++i) {
+        const auto& span = window[i]->prev_imu_span_;
+        if (!span || !span->valid) return;
+        if (span->from_kf_id != window[i - 1]->id_) return;
+    }
+    ordered = std::move(window);
+
+    ++vi_init_attempts_;
+    VisualInertialInitializer::Options opts;
+    // EuRoC mono: initializer ran a 1 / median_depth rescale during
+    // bootstrap, so the map scale is unitless. RGB-D / stereo runs would
+    // already be metric and should set metric_scale=true — but for the
+    // current Stage 0c.e scope only the mono+IMU path reaches here.
+    opts.metric_scale = false;
+    // The existing accel-alignment at init time doesn't set the world
+    // frame up strictly-z-up (see the bug noted in
+    // visual_inertial_initializer.cc): let the LSQ solve for gravity in
+    // the post-init world frame, then we'll rotate so gravity ends up
+    // along world -Z.
+    opts.assume_gravity_w = Vec3::Zero();
+    VisualInertialInitializer vi(opts);
+    const auto result = vi.initialize(ordered);
+
+    if (!result.converged) {
+        if (vi_init_attempts_ <= 3 ||
+            (vi_init_attempts_ % 5) == 0) {
+            std::cout << "Tracking: VI init not converged (attempt "
+                      << vi_init_attempts_ << "): " << result.message
+                      << " scale=" << result.scale
+                      << " rot_rms=" << result.rotation_residual_rms
+                      << " lin_rms=" << result.linear_residual_rms
+                      << std::endl;
+        }
+        return;
+    }
+
+    // Compute the 3×3 rotation R_wn_w that maps the current visual world
+    // frame into the VI-calibrated world frame (gravity → (0,0,-9.81)).
+    // Using the cross-product form keeps it numerically stable when the
+    // two vectors are close to parallel.
+    const Vec3 g_target(0.0, 0.0, -opts.gravity_magnitude);
+    const Vec3 g_est_unit = result.gravity_w.normalized();
+    const Vec3 g_tgt_unit = g_target.normalized();
+    const Vec3 cross = g_est_unit.cross(g_tgt_unit);
+    const double dot = g_est_unit.dot(g_tgt_unit);
+    Eigen::Matrix3d R_wn_w = Eigen::Matrix3d::Identity();
+    if (cross.norm() > 1e-8) {
+        Eigen::Matrix3d K;
+        K << 0.0, -cross.z(), cross.y(),
+             cross.z(), 0.0, -cross.x(),
+             -cross.y(), cross.x(), 0.0;
+        const double s = cross.norm();
+        R_wn_w = Eigen::Matrix3d::Identity() + K + K * K * ((1.0 - dot) / (s * s));
+    } else if (dot < 0.0) {
+        // Anti-parallel: flip about any axis orthogonal to g_est_unit.
+        Eigen::Vector3d axis = g_est_unit.unitOrthogonal();
+        R_wn_w = Eigen::AngleAxisd(M_PI, axis).toRotationMatrix();
+    }
+
+    const Sophus::SO3d R_wn_w_so3(Eigen::Quaterniond(R_wn_w).normalized());
+    const SE3 T_wn_w(R_wn_w_so3, Vec3::Zero());
+
+    const double s = result.scale;
+    if (!(std::isfinite(s) && s > 0.0)) {
+        std::cout << "Tracking: VI init returned invalid scale, skipping" << std::endl;
+        return;
+    }
+
+    // Rescale + rotate every KF pose and every landmark in the map.
+    // We rewrite the entire map (local BA may have already injected
+    // corrections for early KFs, but rotate+scale commutes with BA — we
+    // just apply the transform consistently). This block must run BEFORE
+    // the preintegration residual is enabled so the gravity vector we
+    // plug into VelocityPreintegrationError matches the new frame.
+    //
+    // Re-use the loop_correcting_ flag so the LocalMapping thread skips
+    // its BA step while we rewrite the map. The flag is checked inside
+    // LocalMapping::processPendingWork() (see backend/local_mapping.cc).
+    map_->loop_correcting_.store(true);
+    {
+        std::lock_guard<std::mutex> map_lock(map_->mutex_);
+        for (const auto& kv : map_->getAllKeyframes()) {
+            auto& kf = kv.second;
+            if (!kf) continue;
+            // T_cw' = T_cw * T_w_wn with w_wn = (T_wn_w * diag(s))^{-1}.
+            // For a uniform rescale + rotation in world, the closed-form
+            // update for a camera pose T_cw (world→cam) is:
+            //   p_wc' = s * R_wn_w * p_wc
+            //   R_cw' = R_cw * R_wn_w^T
+            // which gives a new T_cw' = [R_cw', -R_cw' * p_wc'].
+            const SE3 T_wc = kf->T_cw_.inverse();
+            const Vec3 p_wc = T_wc.translation();
+            const Sophus::SO3d R_wc = T_wc.so3();
+            const Vec3 p_wc_new = s * (R_wn_w_so3 * p_wc);
+            const Sophus::SO3d R_wc_new = R_wn_w_so3 * R_wc;
+            const SE3 T_wc_new(R_wc_new, p_wc_new);
+            kf->T_cw_ = T_wc_new.inverse();
+        }
+        for (const auto& kv : map_->getAllLandmarks()) {
+            auto& lm = kv.second;
+            if (!lm) continue;
+            const Vec3 p = lm->getPos();
+            if (!p.allFinite()) continue;
+            lm->setPos(s * (R_wn_w_so3 * p));
+        }
+    }
+    map_->loop_correcting_.store(false);
+
+    // Also fold the transform into current/last frames so the next call
+    // to track() uses pose references consistent with the re-scaled map.
+    auto rotate_frame_state = [&](Frame::Ptr& frame) {
+        if (!frame) return;
+        const SE3 T_wc = frame->getPose().inverse();
+        const SE3 T_wc_new(R_wn_w_so3 * T_wc.so3(), s * (R_wn_w_so3 * T_wc.translation()));
+        frame->setPose(T_wc_new.inverse());
+        if (frame->has_velocity_ && frame->velocity_.allFinite()) {
+            frame->velocity_ = R_wn_w_so3 * frame->velocity_;
+        }
+    };
+    rotate_frame_state(current_frame_);
+    if (last_frame_ && last_frame_ != current_frame_) {
+        rotate_frame_state(last_frame_);
+    }
+
+    // Motion model translation also scales. Rotation component rotates by
+    // R_wn_w (a similarity transform on the velocity SE3).
+    {
+        const Sophus::SO3d R_new = R_wn_w_so3 * velocity_.so3() * R_wn_w_so3.inverse();
+        const Vec3 t_new = s * (R_wn_w_so3 * velocity_.translation());
+        velocity_ = SE3(R_new, t_new);
+    }
+
+    // Write biases + velocities into the window KFs. Velocities rotate
+    // into the new world frame (they do not scale — already in m/s).
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+        auto& kf = ordered[i];
+        if (!kf) continue;
+        const Vec3 v_new = R_wn_w_so3 * result.velocities[i];
+        if (v_new.allFinite()) {
+            kf->velocity_ = v_new;
+            kf->has_velocity_ = true;
+        }
+        kf->accel_bias_ = result.accel_bias;
+        kf->gyro_bias_ = result.gyro_bias;
+    }
+
+    // Propagate the newly-estimated gyro bias into every span's delta_R
+    // via the first-order Forster correction. Without this, the BA
+    // rotation residual (Stage 0c.d) keeps enforcing the uncorrected
+    // delta_R path while poses adopt the new bias, and the mismatch
+    // amplifies the ATE — exactly the combined regression we measured
+    // on MH_01 (1.41 → 2.28 m) before this fix landed.
+    vi.applyGyroBiasCorrectionToSpans(ordered, result);
+
+    // For KFs beyond the init window we leave biases and velocities at
+    // their last values — the BA random-walk prior and reconcileVelocityWithVisual
+    // will pull them in quickly now that gravity + scale are metric.
+
+    vi_init_done_ = true;
+    vi_init_scale_ = s;
+    vi_init_gravity_w_ = g_target;  // canonical after rotation
+    gravity_aligned_ = true;        // future KFs skip the ad-hoc accel alignment
+
+    // Unblock the IMU preintegration residual in local BA. The loose
+    // velocity prior is kept as a fallback for pairs without a valid span.
+    Optimizer::setPreintegrationResidualEnabled(true);
+
+    std::cout << "Tracking: VI init SUCCESS (scale=" << s
+              << ", rot_rms=" << result.rotation_residual_rms
+              << ", lin_rms=" << result.linear_residual_rms
+              << ", |g|=" << opts.gravity_magnitude
+              << ", gyro_bias=[" << result.gyro_bias.transpose() << "]"
+              << ", window=" << ordered.size() << " KFs)"
+              << std::endl;
 }
 
 }

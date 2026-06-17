@@ -189,6 +189,7 @@ add_library(svslam_core
     src/io/map_io.cc
     src/tracking/tracking.cc
     src/tracking/initializer.cc
+    src/tracking/visual_inertial_initializer.cc
     src/backend/local_mapping.cc
     src/backend/optimizer.cc
     src/loop_closing/loop_closing.cc
@@ -266,6 +267,8 @@ if(BUILD_TESTS)
         tests/test_tum_pinhole_calibration.cc
         tests/test_tracking_pose_recompute.cc
         tests/test_tracking_run_statistics.cc
+        tests/test_imu_preintegrator.cc
+        tests/test_visual_inertial_initializer.cc
     )
     if(USE_DEPTH_DL)
         target_sources(svslam_tests PRIVATE tests/test_metric_depth_estimator.cc)

@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unistd.h>
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -14,9 +17,21 @@ using namespace svslam;
 
 namespace {
 
+// Build a temp path that is unique across concurrent ctest workers. Previously
+// relied on std::rand() (deterministic, seed-1 in every new process), which
+// caused intermittent collisions when ctest -j launched the same binary in
+// parallel. The PID + a process-local counter + a nanosecond timestamp slice
+// is more than sufficient for gtest's handful of fixture paths.
 std::filesystem::path make_temp_path(const std::string& suffix) {
-    return std::filesystem::temp_directory_path() /
-           ("svslam_euroc_test_" + std::to_string(std::rand()) + suffix);
+    static std::atomic<uint64_t> counter{0};
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    const auto id = counter.fetch_add(1);
+    std::string name = "svslam_euroc_test_" + std::to_string(getpid()) + "_" +
+                       std::to_string(id) + "_" + std::to_string(now_ns) +
+                       suffix;
+    return std::filesystem::temp_directory_path() / name;
 }
 
 void write_text_file(const std::filesystem::path& path, const std::string& content) {
@@ -118,6 +133,142 @@ TEST(EurocDatasetTest, LoadsStereoImagePairs) {
     EXPECT_DOUBLE_EQ(timestamp_sec, 2.0);
     EXPECT_EQ(left.at<unsigned char>(0, 0), 25);
     EXPECT_EQ(right.at<unsigned char>(0, 0), 101);
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST(EurocDatasetTest, LoadsImuDataWhenPresent) {
+    const auto root = make_temp_path("");
+    const auto cam0_data_dir = root / "mav0" / "cam0" / "data";
+    const auto imu_dir = root / "mav0" / "imu0";
+    std::filesystem::create_directories(cam0_data_dir);
+    std::filesystem::create_directories(imu_dir);
+
+    write_text_file(root / "mav0" / "cam0" / "sensor.yaml",
+                    "intrinsics: [50.0, 50.0, 4.0, 3.0]\n"
+                    "resolution: [8, 6]\n");
+    write_text_file(root / "mav0" / "cam0" / "data.csv",
+                    "#timestamp [ns],filename\n"
+                    "1000000000,1000000000.png\n");
+    write_gray_png(cam0_data_dir / "1000000000.png", 8, 6, 17);
+
+    write_text_file(imu_dir / "data.csv",
+                    "#timestamp [ns],w_x,w_y,w_z,a_x,a_y,a_z\n"
+                    "500000000,0.1,0.2,0.3,1.0,2.0,9.81\n"
+                    "1500000000,0.11,0.21,0.31,1.01,2.01,9.82\n"
+                    "2500000000,0.12,0.22,0.32,1.02,2.02,9.83\n");
+
+    EurocDataset dataset(root.string());
+    ASSERT_TRUE(dataset.isValid()) << dataset.error();
+    ASSERT_TRUE(dataset.hasImu());
+    ASSERT_EQ(dataset.allImu().size(), 3u);
+
+    const auto& first = dataset.allImu().front();
+    EXPECT_DOUBLE_EQ(first.timestamp_sec, 0.5);
+    EXPECT_DOUBLE_EQ(first.gyro.x(), 0.1);
+    EXPECT_DOUBLE_EQ(first.accel.z(), 9.81);
+
+    const auto between = dataset.getImuBetween(1.0, 2.0);
+    ASSERT_EQ(between.size(), 1u);
+    EXPECT_DOUBLE_EQ(between.front().timestamp_sec, 1.5);
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST(EurocDatasetTest, ParsesCam0FromImuExtrinsicFromSensorYaml) {
+    const auto root = make_temp_path("");
+    const auto cam0_data_dir = root / "mav0" / "cam0" / "data";
+    std::filesystem::create_directories(cam0_data_dir);
+
+    // EuRoC MH_01's actual cam0 T_BS (body=IMU): ~5 cm forward + 6 cm left,
+    // approximately 90 deg rotation about the IMU's X axis.
+    write_text_file(root / "mav0" / "cam0" / "sensor.yaml",
+                    "intrinsics: [50.0, 50.0, 4.0, 3.0]\n"
+                    "resolution: [8, 6]\n"
+                    "T_BS:\n"
+                    "  cols: 4\n"
+                    "  rows: 4\n"
+                    "  data: [0.0148655429818, -0.999880929698, 0.00414029679422, "
+                    "-0.0216401454975, 0.999557249008, 0.0149672133247, "
+                    "0.025715529948, -0.064676986768, -0.0257744366974, "
+                    "0.00375618835797, 0.999660727178, 0.00981073058949, "
+                    "0.0, 0.0, 0.0, 1.0]\n");
+    write_text_file(root / "mav0" / "cam0" / "data.csv",
+                    "#timestamp [ns],filename\n"
+                    "1000000000,1000000000.png\n");
+    write_gray_png(cam0_data_dir / "1000000000.png", 8, 6, 17);
+
+    EurocDataset dataset(root.string());
+    ASSERT_TRUE(dataset.isValid()) << dataset.error();
+    ASSERT_TRUE(dataset.hasCam0FromImuExtrinsic());
+
+    const SE3 T_cam_imu = dataset.cam0FromImuExtrinsic();
+    const Vec3 translation = T_cam_imu.translation();
+    EXPECT_NEAR(translation.x(), -0.0216401454975, 1e-9);
+    EXPECT_NEAR(translation.y(), -0.064676986768, 1e-9);
+    EXPECT_NEAR(translation.z(), 0.00981073058949, 1e-9);
+
+    // Rotation is re-orthonormalized via SVD; check it is still a proper SO(3).
+    const Mat33 R = T_cam_imu.rotationMatrix();
+    EXPECT_NEAR((R * R.transpose() - Mat33::Identity()).norm(), 0.0, 1e-9);
+    EXPECT_NEAR(R.determinant(), 1.0, 1e-9);
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST(EurocDatasetTest, ParsesMultiLineTBsArray) {
+    // Real EuRoC sensor.yaml wraps the 16 T_BS values across four lines.
+    const auto root = make_temp_path("");
+    const auto cam0_data_dir = root / "mav0" / "cam0" / "data";
+    std::filesystem::create_directories(cam0_data_dir);
+
+    write_text_file(root / "mav0" / "cam0" / "sensor.yaml",
+                    "intrinsics: [50.0, 50.0, 4.0, 3.0]\n"
+                    "resolution: [8, 6]\n"
+                    "T_BS:\n"
+                    "  cols: 4\n"
+                    "  rows: 4\n"
+                    "  data: [0.01486, -0.99988, 0.00414, -0.02164,\n"
+                    "         0.99956, 0.01497, 0.02572, -0.06468,\n"
+                    "        -0.02577, 0.00376, 0.99966, 0.00981,\n"
+                    "         0.0, 0.0, 0.0, 1.0]\n");
+    write_text_file(root / "mav0" / "cam0" / "data.csv",
+                    "#timestamp [ns],filename\n"
+                    "1000000000,1000000000.png\n");
+    write_gray_png(cam0_data_dir / "1000000000.png", 8, 6, 17);
+
+    EurocDataset dataset(root.string());
+    ASSERT_TRUE(dataset.isValid()) << dataset.error();
+    ASSERT_TRUE(dataset.hasCam0FromImuExtrinsic());
+    const Vec3 t = dataset.cam0FromImuExtrinsic().translation();
+    EXPECT_NEAR(t.x(), -0.02164, 1e-5);
+    EXPECT_NEAR(t.y(), -0.06468, 1e-5);
+    EXPECT_NEAR(t.z(), 0.00981, 1e-5);
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST(EurocDatasetTest, SilentlySkipsMissingImu) {
+    const auto root = make_temp_path("");
+    const auto cam0_data_dir = root / "mav0" / "cam0" / "data";
+    std::filesystem::create_directories(cam0_data_dir);
+
+    write_text_file(root / "mav0" / "cam0" / "sensor.yaml",
+                    "intrinsics: [50.0, 50.0, 4.0, 3.0]\n"
+                    "resolution: [8, 6]\n");
+    write_text_file(root / "mav0" / "cam0" / "data.csv",
+                    "#timestamp [ns],filename\n"
+                    "1000000000,1000000000.png\n");
+    write_gray_png(cam0_data_dir / "1000000000.png", 8, 6, 17);
+
+    EurocDataset dataset(root.string());
+    ASSERT_TRUE(dataset.isValid()) << dataset.error();
+    EXPECT_FALSE(dataset.hasImu());
+    EXPECT_TRUE(dataset.allImu().empty());
 
     std::error_code ec;
     std::filesystem::remove_all(root, ec);

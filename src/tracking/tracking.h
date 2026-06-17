@@ -10,8 +10,10 @@
 #include "core/map.h"
 #include "core/reference_keyframe_policy.h"
 #include "tracking/initializer.h"
+#include "tracking/visual_inertial_initializer.h"
 #include "backend/local_mapping.h"
 #include "io/tum_dataset.h"
+#include "sensors/imu.h"
 #include <memory>
 #include <mutex>
 
@@ -89,6 +91,30 @@ public:
     std::vector<AccelEntry> accel_buffer_;
     bool gravity_aligned_ = false;
 
+    // Full IMU (accel + gyro) buffer — populated when the dataset exposes
+    // imu0 (EuRoC). Stage 0b scaffolding: tracking still consults
+    // accel_buffer_ for gravity / stationary detection; imu_buffer_ is held
+    // here so a future VIO path (preintegration, velocity predict) can read
+    // it without threading more state through the call sites.
+    std::vector<ImuEntry> imu_buffer_;
+
+    // IMU→camera extrinsic (T_cam_imu: transforms IMU/body frame points into
+    // the camera frame). Defaults to identity for datasets without a known
+    // extrinsic (TUM, or EuRoC without sensor.yaml). Set from EurocDataset
+    // in run_mono before the first frame arrives.
+    SE3 T_cam_imu_;
+    bool has_cam_imu_extrinsic_ = false;
+
+    void setImuToCameraExtrinsic(const SE3& T_cam_imu) {
+        T_cam_imu_ = T_cam_imu;
+        has_cam_imu_extrinsic_ = true;
+    }
+
+    // Snapshot of the VI init state for monitoring / automation.
+    bool visualInertialInitCompleted() const { return vi_init_done_; }
+    double visualInertialInitScale() const { return vi_init_scale_; }
+    const Vec3& visualInertialInitGravity() const { return vi_init_gravity_w_; }
+
 private:
     struct RecoveryState {
         int lost_frame_count = 0;
@@ -123,6 +149,25 @@ private:
     bool reinitialize();  // Re-initialize from scratch when lost for too long
     void setReferenceKeyframe(Keyframe::Ptr kf);
     void setKeyframeGravity(Keyframe::Ptr kf);  // Set gravity from accel data
+    // Preintegrate imu_buffer_ between last_frame_ and current_frame_ and
+    // write an IMU-predicted world-frame velocity into current_frame_.
+    // No-op unless gravity_aligned_ and IMU samples span the interval.
+    void predictVelocityFromImu();
+    // Fold the post-tracking visual pose delta into current_frame_->velocity_
+    // so Keyframe::velocity_ (and therefore the BA velocity prior) reflects a
+    // visually-corrected IMU estimate instead of pure open-loop integration.
+    void reconcileVelocityWithVisual();
+    // Preintegrate imu_buffer_ from prev_kf's timestamp to kf's timestamp and
+    // attach the resulting span to kf->prev_imu_span_ for BA consumption.
+    void populateKeyframeImuSpan(const std::shared_ptr<Keyframe>& kf,
+                                 const std::shared_ptr<Keyframe>& prev_kf);
+    // Try to bootstrap the VIO estimate (scale, gravity, biases, velocities)
+    // by running VisualInertialInitializer on the first N KFs. On success
+    // the map is re-scaled + rotated so gravity aligns with world Z-up,
+    // biases and velocities are written back to the KFs, and
+    // vi_init_done_ flips to true so the BA preintegration residual is
+    // unblocked. No-op on TUM / datasets without an IMU stream.
+    void tryVisualInertialInit();
     static std::size_t countValidFrameLandmarks(const Frame::Ptr& frame);
 
     cv::Ptr<cv::DescriptorMatcher> matcher_;
@@ -147,6 +192,17 @@ private:
     static constexpr int reinit_trigger_frames_ = 20;  // Start re-init after this many lost frames
 
     TrackingRunStatistics run_stats_;
+
+    // Visual-Inertial Initialization (VIO Stage 0c.e). Once complete, the
+    // map is in metric scale with gravity along world -Z, per-KF biases +
+    // velocities are seeded, and downstream BA can tightly couple the
+    // preintegration residual. Before completion, BA should suppress the
+    // preintegration residual and fall back to the loose velocity prior.
+    bool vi_init_done_ = false;
+    int vi_init_attempts_ = 0;
+    double vi_init_scale_ = 1.0;
+    Vec3 vi_init_gravity_w_ = Vec3(0.0, 0.0, -9.81);
+    static int readVioMinInitKeyframes();
 };
 
 }
